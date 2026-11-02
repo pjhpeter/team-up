@@ -1,0 +1,13 @@
+# Herdr 交付流程的项目信息（提交入库，团队共用）。
+# 协议 ~/.hwf/PROTOCOL.md 里「项目专属」的值都从这里读；可以手改，改完不用重启。
+# 由 ~/.hwf/scripts/init-project.py 生成。
+gitlab:
+  host: {{HOST}}
+  project: {{PROJECT}}
+  registry_issue: {{REGISTRY}}   # 登记池 issue 编号：与需求无关的问题记在这里
+  board_id: {{BOARD}}            # 需求看板编号，给用户的链接要带 ?label_name[]=需求
+branches:
+  test: {{TEST_BRANCH}}          # 先合进来冒烟的测试分支；没有就写 null（冒烟这步改为问用户）
+  main: {{MAIN_BRANCH}}          # 上线分支
+smoke:                           # 测试分支部署成功后要打开冒烟的地址；为空时冒烟这步先问用户
+{{SMOKE}}

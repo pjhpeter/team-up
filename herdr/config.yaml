@@ -1,0 +1,80 @@
+# 机器级角色定义（hwf 全局插件配置层，最低优先级）。
+# 模型降级（用户 2026-10-17 指示）：Opus 额度于 15:02 耗尽、16:30 确认恢复；
+# 降级期间 scheduler/arch/reviewer 曾切到 jc-gpt/gpt-6-astra + thinking medium，
+# 恢复后已切回 devin/claude-opus-5-5。
+# 每次额度耗尽后的降级须用户确认；降级与恢复都记入 STATE。
+# 2026-10-20 用户指示：技术方案编写改由 gpt-6-astra 模型、thinking medium 承担；
+# 该职责固定使用 arch-lite，不再限于试点，也不再以 Opus 终审可用为前提。
+# arch（Opus）保留关键架构取舍、严重争议裁决与代码最终风险闸门，不编写技术方案。
+# 2026-10-20 用户指示：scheduler 不固定模型与思考档，按用户发起工作流时的当前会话
+# 模型运行；因此 scheduler 的 args 只保留权限参数，不写 --model / --thinking。
+# 合并顺序：本文件 → 仓库 .hwf/config.yaml → 仓库 .hwf/config.local.yaml；
+# 后者按“整条命名 entry”覆盖前者，所以仓库里定义同名 profile 会压过这里。
+# 目的：Herdr Issue 交付流程的角色（用什么 harness、什么模型、什么思考档）只跟机器走，不跟仓库走。
+#
+# 用户 2026-10-17 指示：所有成员一律 YOLO 权限，不再逐次审批。
+# omp 用 --approval-mode yolo；codex 用 --dangerously-bypass-approvals-and-sandbox；
+# pi 无审批门禁。审批授权不改变「禁止在远程服务器执行命令」等全局约束，后者仍由
+# PROTOCOL.md 与全局规则执行。
+profiles:
+  # 入口 `prefix+k` / `hwf run team-up` 新建调度者时用这个 profile。
+  # 需要无人值守执行 glab、herdr、git 并写任务记录，因此用 yolo。
+  # kind 选 omp：与本机实际运行的调度者一致，且 2026-10-17 实测 herdr 能把 omp 审批界面
+  # 判为 blocked（S11）。pi 可选：S9 只证明其 working 可识别；pi 的审批界面识别未实测，
+  # 启用 pi 作为调度者前必须补做 S11 同款探针。
+  # 2026-10-20 用户指示：不指定模型/思考档，按用户发起工作流时的当前会话模型运行。
+  # 身份只看登记名，与 kind 无关。
+  # 2026-10-28 用户同意：调度者加载 ~/.hwf/scheduler-omp.yml，约 20 万词元就压缩上下文
+  # （默认约 85 万才压缩），降低 8～9 小时长会话的词元消耗；不改模型/思考档。
+  scheduler:
+    kind: omp
+    args: ["--config", "/Users/pengjiahui/.hwf/scheduler-omp.yml", "--approval-mode", "yolo"]
+  # 架构师（2026-10-24 用户指示）：Claude Code + claude-opus-5-5 + effort medium。
+  # 只承担复杂度判定、关键架构裁决、严重争议拍板与代码最终风险闸门，不编写技术方案；
+  # 常规代码评审和回改由 code-review 承担。
+  # 2026-10-28 用户同意：Claude Code 角色加 --exclude-dynamic-system-prompt-sections，
+  # 把工作目录/git 状态移出系统提示，便于跨会话共用缓存（实测每会话约多共用 1.6k 词元）；不改启动目录。
+  arch:
+    kind: claude
+    args: ["--model", "claude-opus-5-5", "--effort", "medium", "--exclude-dynamic-system-prompt-sections", "--dangerously-skip-permissions"]
+  # 技术方案编写（arch-lite）：所有技术方案的初稿、逐文件改动、回滚与验证表、评审回改。
+  # 2026-10-24 用户指示：改为 omp + devin/claude-opus-5-5 + thinking medium。
+  # 不签发、不拍板、不评审自己的方案；编写会话不得兼任同一交付物的 precheck/reviewer/dev。
+  arch-lite:
+    kind: omp
+    args: ["--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
+  # 方案评审员（2026-10-24 用户指示）：Claude Code + claude-opus-5-5 + effort high。
+  # 结论写在终端最终回复，由调度者 agent read 取回落盘。
+  reviewer:
+    kind: claude
+    args: ["--model", "claude-opus-5-5", "--effort", "high", "--exclude-dynamic-system-prompt-sections", "--dangerously-skip-permissions"]
+  # 开发者：按 spec 与已评审用例实现、修复验证失败。
+  # 2026-10-20 用户指示：模型改为 jc-gpt/gpt-6.1-sol，思考强度 low。
+  # 按用户 2026-10-17 指示使用 YOLO（跳过审批与沙箱）。
+  # worktree cwd 由调度者通过 `pane split --cwd` 提供。
+  dev:
+    kind: omp
+    args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+  # 测试者：编写用例、代码评审通过后执行自动化测试。审批与 cwd 同 dev（YOLO）。
+  test:
+    kind: codex
+    args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=low", "--dangerously-bypass-approvals-and-sandbox"]
+  # 需要访问 herdr socket 的验证角色。codex 的 workspace-write 沙箱会拒绝 herdr socket
+  # （req-20261017-7a17bc93 实测 PermissionDenied），此时才可偏离 `test` 使用本 profile。
+  # 必须显式固定模型：pi 的默认模型是 deepseek-v4-pro，裸 `--kind pi` 会产生未预期的额度消费
+  # （2026-10-17 实测：56 turns ≈ $0.389）。任何成员都不得依赖执行体默认模型。
+  test-herdr:
+    kind: pi
+    args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low"]
+  # 双层评审的辅审（precheck）：承担机械阅读、取证、候选问题清单，不输出通过结论。
+  # 不计入 5/3/6 评审轮次；最终结论由阶段终审人签发（方案 reviewer、用例 code-review、代码 arch）。
+  # 2026-10-24 用户指示：改为 omp + devin/claude-opus-5-5 + thinking low。
+  precheck:
+    kind: omp
+    args: ["--model", "devin/claude-opus-5-5", "--thinking", "low", "--approval-mode", "yolo"]
+  # 代码评审（2026-10-24 用户指示）：omp + devin/claude-opus-5-5 + thinking medium。
+  # 承担完整代码评审、增量闭环与测试用例终审；最终风险签发仍归 arch。
+  code-review:
+    kind: omp
+    args: ["--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
+default_profile: scheduler

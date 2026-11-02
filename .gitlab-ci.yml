@@ -1,0 +1,6 @@
+# 每次推送跑一遍流程脚本的单元测试（只测脚本逻辑，不连 GitLab、不起 Herdr）
+test:
+  image: python:3.11-slim
+  script:
+    - pip install -q pyyaml
+    - python3 -m unittest discover -s tests -p 'test_*.py'

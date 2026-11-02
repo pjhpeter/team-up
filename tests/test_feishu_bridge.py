@@ -38,6 +38,7 @@ class World:
         self.broken_images: set[str] = set()
         self.downloads: list[tuple] = []
         self.thread_of: dict[str, str] = {}  # 被机器人在话题里回复过的消息 → thread_id
+        self.reply_failures = 0  # 接下来几次飞书回帖返回失败
 
     def __call__(self, cmd, input=None, env=None, cwd=None, **_):
         if cmd[0] == "lark-cli":
@@ -89,6 +90,9 @@ class World:
             return ok({"ok": True, "data": {"saved_path": str(out)}})
         if cmd[1:3] == ["im", "+messages-reply"]:
             to = cmd[cmd.index("--message-id") + 1]
+            if self.reply_failures:
+                self.reply_failures -= 1
+                return ok({"ok": False, "error": {"message": "temporary failure"}})
             if "--reply-in-thread" in cmd:
                 self.thread_of.setdefault(to, f"omt_{to}")
             self.replies.append({"to": to, "text": stdin, "in_thread": "--reply-in-thread" in cmd,
@@ -178,6 +182,34 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(len(new), 1)
         self.assertIn("已收到，已转给调度者", new[0]["text"])
         self.assertEqual(new[0]["to"], "om_1")
+
+    def test_failed_forward_is_retried_next_round_in_order(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.w.gitlab_comment(8, "第一条")
+        self.w.gitlab_comment(8, "第二条")
+        before = len(self.w.replies)
+        self.w.reply_failures = 1
+        self.b.poll_gitlab()
+        self.assertEqual(len(self.w.replies), before)  # 第一条发失败，第二条也不越过它
+        self.b.poll_gitlab()
+        self.b.poll_gitlab()
+        texts = [r["text"] for r in self.w.replies[before:]]
+        self.assertEqual(len(texts), 2)
+        self.assertIn("第一条", texts[0])
+        self.assertIn("第二条", texts[1])
+
+    def test_note_that_keeps_failing_becomes_link_and_does_not_block(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.w.gitlab_comment(8, "飞书不收的内容")
+        self.w.gitlab_comment(8, "后面的评论")
+        before = len(self.w.replies)
+        self.w.reply_failures = FB.NOTE_RETRIES
+        for _ in range(FB.NOTE_RETRIES + 1):
+            self.b.poll_gitlab()
+        texts = [r["text"] for r in self.w.replies[before:]]
+        self.assertEqual(len(texts), 2)
+        self.assertIn("没能搬过来", texts[0])
+        self.assertIn("后面的评论", texts[1])
 
     def test_long_comment_is_truncated_with_link(self) -> None:
         self.b.handle(msg("om_1", "需求：长内容"))

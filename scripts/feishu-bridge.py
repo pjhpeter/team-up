@@ -57,6 +57,7 @@ MEDIA_DIR = HWF_HOME / "state" / "feishu-media"  # 飞书图片下载的中转�
 CMD_TIMEOUT_S = 60
 SEEN_CAP = 2000
 HELP_COOLDOWN_S = 600
+NOTE_RETRIES = 3  # 一条评论连续发送失败几次后改发 GitLab 链接
 FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
 CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
 IMAGE_KEY_RE = re.compile(r"\[Image: (img_[^\]\s]+)\]")  # 飞书把图片渲染成「[Image: img_xxx]」
@@ -373,14 +374,35 @@ class Bridge:
             for n in sorted(notes, key=lambda x: x["id"]):
                 if n["id"] <= t.get("last_note", 0):
                     continue
+                if not n.get("system") and n["id"] not in self.state["posted_notes"]:
+                    if not self.forward_note(root, t, n):
+                        break  # 发送失败：水位停在这条之前，下一轮按原顺序重试
                 t["last_note"] = n["id"]
-                if n.get("system") or n["id"] in self.state["posted_notes"]:
-                    continue
-                self.reply(root, self.render_note(t, n), f"gl-{t['iid']}-{n['id']}")
+                t.pop("fails", None)
             issue = self.api(f"projects/{pid}/issues/{t['iid']}")
             if issue["state"] == "closed":
                 t["closed"] = True
                 self.reply(root, f"#{t['iid']} 已关闭，这个话题不再同步。", f"gl-closed-{t['iid']}-{root[-12:]}")
+
+    def forward_note(self, root: str, t: dict[str, Any], n: dict[str, Any]) -> bool:
+        """把一条 GitLab 评论发到飞书话题；成功（或已放弃）返回 True。幂等键保证重试不会重复发。"""
+        key = f"gl-{t['iid']}-{n['id']}"
+        try:
+            self.reply(root, self.render_note(t, n), key)
+            return True
+        except BridgeError as e:
+            t["fails"] = t.get("fails", 0) + 1
+            log(f"forward #{t['iid']} note {n['id']} failed ({t['fails']}/{NOTE_RETRIES}): {e}")
+            if t["fails"] < NOTE_RETRIES:
+                return False
+        # 连续失败多次（多半是内容飞书不收），改发一句带链接的短消息，不卡住后面的评论
+        url = f"{self.issue_url(t['project'], t['iid'])}#note_{n['id']}"
+        try:
+            self.reply(root, f"#{t['iid']} 有一条新评论没能搬过来，请到 [GitLab]({url}) 查看。", f"{key}-link")
+        except BridgeError as e:
+            log(f"forward #{t['iid']} note {n['id']} link failed: {e}")
+            return False
+        return True
 
     def render_note(self, t: dict[str, Any], n: dict[str, Any]) -> str:
         body = (n.get("body") or "").strip()

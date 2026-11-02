@@ -31,6 +31,8 @@ class World:
         self.next_note = 100
         self.replies: list[dict] = []   # 飞书回帖
         self.writes: list[tuple] = []   # GitLab 写操作 (method, path, fields, as_user)
+        self.history: dict[str, list] = {}  # chat_id → 聊天记录（补漏用）
+        self.unreadable_chats: set[str] = set()
 
     def __call__(self, cmd, input=None, env=None, **_):
         if cmd[0] == "lark-cli":
@@ -72,6 +74,13 @@ class World:
             self.replies.append({"to": cmd[cmd.index("--message-id") + 1], "text": stdin,
                                  "key": cmd[cmd.index("--idempotency-key") + 1] if "--idempotency-key" in cmd else None})
             return ok({"ok": True, "data": {"message_id": f"om_r{len(self.replies)}"}})
+        if cmd[1:3] == ["im", "+chat-messages-list"]:
+            chat = cmd[cmd.index("--chat-id") + 1]
+            if chat in self.unreadable_chats:
+                return ok({"ok": False, "error": {"code": 230027, "message": "access denied"}})
+            return ok({"ok": True, "data": {"messages": self.history.get(chat, [])}})
+        if cmd[1:3] == ["im", "+threads-messages-list"]:
+            return ok({"ok": True, "data": {"messages": []}})
         raise AssertionError(f"unexpected lark {cmd}")
 
     def gitlab_comment(self, iid: int, body: str, name: str = "交付调度者", system: bool = False) -> None:
@@ -84,8 +93,9 @@ def ok(data):
     return subprocess.CompletedProcess([], 0, json.dumps(data, ensure_ascii=False), "")
 
 
-def msg(mid: str, text: str, root: str = "", sender: str = ME, sender_type: str = "user", mentions=None):
-    return FB.normalize_event({"message_id": mid, "chat_id": "oc_1", "chat_type": "p2p", "sender_id": sender,
+def msg(mid: str, text: str, root: str = "", sender: str = ME, sender_type: str = "user", mentions=None,
+        chat: str = "oc_1", chat_type: str = "p2p"):
+    return FB.normalize_event({"message_id": mid, "chat_id": chat, "chat_type": chat_type, "sender_id": sender,
                                "sender_type": sender_type, "content": text, "root_id": root,
                                "create_time": "1793604428990", "mentions": mentions or []})
 
@@ -179,9 +189,33 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.w.writes, [])
 
     def test_group_mention_of_bot_is_stripped(self) -> None:
-        m = msg("om_1", "@_user_1 需求：群里提的", mentions=[{"key": "@_user_1", "id": BOT, "name": "交付助手"}])
-        self.b.handle(m)
-        self.assertEqual(self.w.writes[0][2]["title"], "群里提的")
+        # 原始接口格式：占位符 + 机器人 open_id
+        self.b.handle(msg("om_1", "@_user_1 需求：群里提的", mentions=[{"key": "@_user_1", "id": BOT, "name": "交付助手"}]))
+        # lark-cli 事件实际格式（2026-11-02 实测）：content 已渲染成名字，机器人 id 是应用 ID
+        self.b.handle(msg("om_2", "@交付助手-试点 需求：事件格式",
+                          mentions=[{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]))
+        titles = [w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")]
+        self.assertEqual(titles, ["群里提的", "事件格式"])
+
+    def test_other_people_mentioned_keep_their_name(self) -> None:
+        self.b.handle(msg("om_1", "需求：让 @_user_2 看下", mentions=[{"key": "@_user_2", "id": "ou_x", "name": "小王"}]))
+        self.assertEqual(self.w.writes[0][2]["title"], "让 @小王 看下")
+
+    def test_catch_up_skips_unreadable_group_and_unmentioned_group_messages(self) -> None:
+        self.b.handle(msg("om_g1", "@交付助手-试点 #7 看下", chat="oc_g", chat_type="group",
+                          mentions=[{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]))
+        self.state["chats"]["oc_g2"] = 1
+        self.state["group_chats"].append("oc_g2")
+        self.w.unreadable_chats.add("oc_g2")
+        sender = {"id": ME, "name": "彭嘉辉", "sender_type": "user"}
+        self.w.history["oc_g"] = [
+            {"message_id": "om_g2", "chat_id": "oc_g", "content": "群里闲聊", "sender": sender},
+            {"message_id": "om_g3", "chat_id": "oc_g", "content": "@交付助手-试点 需求：补漏到的", "sender": sender,
+             "mentions": [{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]}]
+        self.b.catch_up()  # oc_g2 读不到不应中断
+        titles = [w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")]
+        self.assertEqual(titles, ["补漏到的"])
+        self.assertFalse(any("用法" in r["text"] for r in self.w.replies))
 
     def test_reply_in_unknown_thread_asks_to_bind(self) -> None:
         self.b.handle(msg("om_2", "这是啥", root="om_unknown"))

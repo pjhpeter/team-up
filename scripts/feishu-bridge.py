@@ -61,7 +61,8 @@ HELP_TEXT = (
     "我是交付助手，用法：\n"
     "1. 发「需求：<要做的事>」→ 我在 GitLab 建 issue，Agent 先分析，结论会回到这条消息的话题里\n"
     "2. 发「#123 <补充>」→ 关联已有 issue，之后在话题里回复就会同步过去\n"
-    "3. 在话题里回复 /go 开工、/status 看进度、/new 让调度者重开会话"
+    "3. 在话题里回复 /go 开工、/status 看进度、/new 让调度者重开会话\n"
+    "在群里每句话（包括话题里的回复）都要 @我，我才收得到"
 )
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
@@ -105,6 +106,7 @@ class Bridge:
         state.setdefault("posted_notes", []) # 桥自己发到 GitLab 的评论 id（不再搬回飞书）
         state.setdefault("chats", {})        # chat_id → 上次看到消息的时间戳（毫秒），补漏用
         state.setdefault("help_sent", {})    # chat_id → 上次发用法说明的时间戳（秒）
+        state.setdefault("group_chats", [])  # 收到过群消息的 chat_id（补漏时群里只处理 @ 机器人的）
 
     # ---------- 外部命令 ----------
     def sh(self, cmd: list[str], stdin: Optional[str] = None, env: Optional[dict] = None) -> str:
@@ -149,6 +151,8 @@ class Bridge:
         chat = msg.get("chat_id", "")
         if chat:
             self.state["chats"][chat] = max(int(msg.get("create_ms") or 0), self.state["chats"].get(chat, 0))
+            if msg.get("chat_type") == "group" and chat not in self.state["group_chats"]:
+                self.state["group_chats"].append(chat)
         if msg.get("sender_type") != "user":
             return  # 机器人（含自己）发的不处理，避免来回刷屏
         user = self.users.get(msg.get("sender_id", ""))
@@ -177,12 +181,22 @@ class Bridge:
             self.reply(mid, HELP_TEXT, f"help-{mid}")
 
     def clean_text(self, msg: dict[str, Any]) -> str:
+        # 事件里的 content 已渲染成「@名字」，原始接口里是「@_user_1」占位符，两种都要处理；
+        # 机器人在 mentions 里可能是 open_id，也可能是应用 ID（cli_ 开头）
         text = msg.get("content") or ""
         for m in msg.get("mentions") or []:
             key, name = m.get("key") or "", m.get("name") or ""
-            if key:
-                text = text.replace(key, "" if m.get("id") == self.cfg.get("bot_open_id") else f"@{name}")
+            if self.is_bot_mention(m):
+                for token in (key, f"@{name}" if name else ""):
+                    if token:
+                        text = text.replace(token, "")
+            elif key:
+                text = text.replace(key, f"@{name}")
         return text.strip()
+
+    def is_bot_mention(self, m: dict[str, Any]) -> bool:
+        mid = m.get("id") or ""
+        return bool(mid) and (mid == self.cfg.get("bot_open_id") or mid.startswith("cli_"))
 
     def note_as_user(self, project: str, iid: int, body: str) -> int:
         note = self.api(f"projects/{quote(project, safe='')}/issues/{iid}/notes", "POST",
@@ -270,17 +284,29 @@ class Bridge:
     # ---------- 补漏 ----------
     def catch_up(self) -> None:
         """重启后按聊天记录补上停机期间的消息；第一次运行只记水位，不回放旧消息。"""
+        # 群聊整段记录要额外权限，读不到就跳过该会话（话题里的回复仍按下面的话题补）；一个失败不影响其他
         for chat, last_ms in list(self.state["chats"].items()):
             start = datetime.fromtimestamp(max(last_ms / 1000 - 120, 0)).astimezone().isoformat(timespec="seconds")
-            data = self.lark(["im", "+chat-messages-list", "--chat-id", chat, "--order", "asc",
-                              "--no-reactions", "--start", start, "--page-all", "--page-limit", "5"])
+            try:
+                data = self.lark(["im", "+chat-messages-list", "--chat-id", chat, "--order", "asc",
+                                  "--no-reactions", "--start", start, "--page-all", "--page-limit", "5"])
+            except BridgeError as e:
+                log(f"catch-up skip chat {chat}: {e}")
+                continue
             for item in (data.get("data") or {}).get("messages", []):
-                self.handle(normalize_history(item))
+                msg = normalize_history(item)
+                if chat in self.state["group_chats"] and not any(map(self.is_bot_mention, msg["mentions"])):
+                    continue  # 群里没 @ 机器人的话不是对它说的
+                self.handle(msg)
         for root, t in list(self.state["threads"].items()):
             if t.get("closed"):
                 continue
-            data = self.lark(["im", "+threads-messages-list", "--thread", root, "--order", "asc",
-                              "--no-reactions", "--page-all", "--page-limit", "5"])
+            try:
+                data = self.lark(["im", "+threads-messages-list", "--thread", root, "--order", "asc",
+                                  "--no-reactions", "--page-all", "--page-limit", "5"])
+            except BridgeError as e:
+                log(f"catch-up skip thread {root}: {e}")
+                continue
             for item in (data.get("data") or {}).get("messages", []):
                 self.handle(normalize_history(item, default_root=root))
 

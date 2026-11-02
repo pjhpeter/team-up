@@ -17,8 +17,8 @@
   其他顶层消息                       → 回一段用法说明（同一会话 10 分钟内只回一次）
 发到 GitLab 的内容用用户自己的 GitLab 令牌（钥匙串里取），这样收件箱才认得是用户本人在说话。
 
-依赖：lark-cli（`lark-cli config init` 建好机器人应用，只用机器人身份）、glab。
-配置：~/.hwf/feishu-bridge.local.json（本机，不入库；open_id 每个应用不同，所以整份放本机），例：
+依赖：lark-cli（首次使用按引导建好机器人应用，只用机器人身份）、glab。
+接入步骤见 Wiki「飞书接入」。配置：~/.hwf/feishu-bridge.local.json（本机，不入库；open_id 每个应用不同，所以整份放本机），例：
   {
     "default_project": "frontend/web-v1",
     "users": {"ou_xxx": "pengjh"},
@@ -58,7 +58,7 @@ FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
 CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
 BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)\S*)\s*")
 HELP_TEXT = (
-    "我是交付助手，用法：\n"
+    "用法：\n"
     "1. 发「需求：<要做的事>」→ 我在 GitLab 建 issue，Agent 先分析，结论会回到这条消息的话题里\n"
     "2. 发「#123 <补充>」→ 关联已有 issue，之后在话题里回复就会同步过去\n"
     "3. 在话题里回复 /go 开工、/status 看进度、/new 让调度者重开会话\n"

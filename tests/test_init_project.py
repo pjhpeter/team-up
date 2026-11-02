@@ -88,8 +88,9 @@ class InitProjectTest(unittest.TestCase):
         self.repo = self.tmp / "demo"
         self.repo.mkdir()
         (self.repo / "AGENTS.md").write_text("# 原有规则\n\n别删我\n")
-        self.inbox = self.tmp / "inbox.json"
-        self.inbox.write_text(json.dumps({"host": "git.example.com", "projects": {"a/b": "/x"}}))
+        self.inbox = self.tmp / "gitlab-inbox.config.json"
+        self.inbox.write_text(json.dumps({"host": "git.example.com", "projects": ["a/b"]}))
+        (self.tmp / "gitlab-inbox.local.json").write_text(json.dumps({"projects": {"a/b": "/x"}}))
         self.gl = FakeGitLab()
 
     def run_init(self, apply: bool, smoke=(("国内", "https://dev.example.com"),)) -> "INIT.Init":
@@ -104,6 +105,7 @@ class InitProjectTest(unittest.TestCase):
         self.assertGreater(init.todo, 0)
         self.assertFalse((self.repo / "docs").exists())
         self.assertNotIn("group/demo", self.inbox.read_text())
+        self.assertNotIn("group/demo", (self.tmp / "gitlab-inbox.local.json").read_text())
 
     def test_apply_then_rerun_is_noop(self) -> None:
         self.run_init(apply=True)
@@ -111,7 +113,9 @@ class InitProjectTest(unittest.TestCase):
         self.assertTrue({n for n, _, _ in INIT.LABELS} <= names)
         self.assertEqual([i["title"] for i in self.gl.issues], [INIT.REGISTRY_TITLE])
         self.assertEqual([l["label"]["name"] for l in self.gl.boards[0]["lists"]], INIT.STATUS_LABELS)
-        self.assertEqual(json.loads(self.inbox.read_text())["projects"]["group/demo"], str(self.repo))
+        self.assertEqual(json.loads(self.inbox.read_text())["projects"], ["a/b", "group/demo"])
+        local = json.loads((self.tmp / "gitlab-inbox.local.json").read_text())
+        self.assertEqual(local["projects"], {"a/b": "/x", "group/demo": str(self.repo)})
 
         cfg = yaml.safe_load((self.repo / "docs/agents/herdr-project.yaml").read_text())
         self.assertEqual(cfg["gitlab"], {"host": "git.example.com", "project": "group/demo",

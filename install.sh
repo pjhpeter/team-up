@@ -9,12 +9,12 @@ here=$(cd "$(dirname "$0")" && pwd)
 
 mkdir -p "$HWF/state"
 
-# 1. 收件箱配置：本机文件，不入库
-if [ ! -f "$HWF/gitlab-inbox.config.json" ]; then
-  cp "$HWF/gitlab-inbox.config.example.json" "$HWF/gitlab-inbox.config.json"
-  echo "[已新建] gitlab-inbox.config.json：请把 projects 改成你本机的仓库路径（或对每个仓库跑 init-project.py --apply）"
+# 1. 收件箱：共用配置 gitlab-inbox.config.json 已入库；本机只需 gitlab-inbox.local.json 写仓库路径
+if [ ! -f "$HWF/gitlab-inbox.local.json" ]; then
+  printf '{\n  "projects": {}\n}\n' > "$HWF/gitlab-inbox.local.json"
+  echo "[已新建] gitlab-inbox.local.json：对每个仓库跑 init-project.py --apply 会自动填上本机路径"
 else
-  echo "[已有]   gitlab-inbox.config.json"
+  echo "[已有]   gitlab-inbox.local.json"
 fi
 
 # 2. Herdr 插件的角色配置：指向仓库里的 herdr/config.yaml

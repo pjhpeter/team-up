@@ -2,5 +2,5 @@
 state/
 *.bak-*
 __pycache__/
-# 本机收件箱配置（含本地仓库路径），入库的是 gitlab-inbox.config.example.json
-gitlab-inbox.config.json
+# 收件箱的本机部分（GitLab 项目 → 本机仓库路径）；共用部分 gitlab-inbox.config.json 入库
+gitlab-inbox.local.json

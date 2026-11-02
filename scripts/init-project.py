@@ -8,7 +8,7 @@
 
 做的事（缺什么补什么）：
   GitLab：9 个标签、登记池 issue、需求看板（6 列进度）；
-  本机：在 ~/.hwf/gitlab-inbox.config.json 登记项目（收件箱要重启才生效）；
+  收件箱：在入库的 ~/.hwf/gitlab-inbox.config.json 登记项目，在本机 gitlab-inbox.local.json 写仓库路径（重启收件箱生效）；
   仓库：docs/agents/herdr-project.yaml、docs/agents/issue-tracker.md、docs/agents/triage-labels.md、
         .gitignore 加 .hwf/tmp/、AGENTS.md 加交付流程段落、没有 CLAUDE.md 时建一个引用 AGENTS.md。
 仓库里已存在的文件只检查不覆盖；GitLab 上多出来的旧标签只列出、不删。
@@ -196,7 +196,9 @@ class Init:
 
     # ---------- 本机 ----------
     def inbox(self) -> None:
+        """入库的 gitlab-inbox.config.json 登记项目；本机的 gitlab-inbox.local.json 写仓库路径。"""
         cfg_path = self.inbox_config
+        local_path = cfg_path.with_name("gitlab-inbox.local.json")
         if not cfg_path.exists():
             self.warn(f"没有收件箱配置 {cfg_path}，跳过登记")
             return
@@ -204,16 +206,27 @@ class Init:
         if cfg.get("host") != self.host:
             self.warn(f"收件箱只盯 {cfg.get('host')}，本项目在 {self.host}，不能登记")
             return
-        if self.project in cfg.get("projects", {}):
-            self.have(f"收件箱登记 {self.project}")
-            return
+        local = json.loads(local_path.read_text()) if local_path.exists() else {}
 
-        def write() -> None:
-            cfg.setdefault("projects", {})[self.project] = str(self.repo)
-            # 原地写回（不 mv 覆盖），保持文件本身不变
-            with open(cfg_path, "w") as f:
-                f.write(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
-        self.do(f"收件箱登记 {self.project} → {self.repo}（要重启收件箱 pane 才生效）", write)
+        def dump(path: Path, data: Any) -> None:
+            with open(path, "w") as f:  # 原地写回（不 mv 覆盖）
+                f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+
+        if self.project in cfg.get("projects", []):
+            self.have(f"收件箱登记 {self.project}（入库配置）")
+        else:
+            def add_shared() -> None:
+                cfg["projects"] = sorted(set(cfg.get("projects", [])) | {self.project})
+                dump(cfg_path, cfg)
+            self.do(f"收件箱登记 {self.project}（改的是入库的 gitlab-inbox.config.json，记得在 ~/.hwf 提交 MR）", add_shared)
+
+        if local.get("projects", {}).get(self.project) == str(self.repo):
+            self.have(f"收件箱本机路径 {self.project} → {self.repo}")
+        else:
+            def add_local() -> None:
+                local.setdefault("projects", {})[self.project] = str(self.repo)
+                dump(local_path, local)
+            self.do(f"收件箱本机路径 {self.project} → {self.repo}（要重启收件箱 pane 才生效）", add_local)
 
     # ---------- 仓库文件 ----------
     def render(self, name: str, **values: str) -> str:

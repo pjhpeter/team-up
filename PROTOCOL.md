@@ -656,7 +656,7 @@ scheduler 回收实际输出并核验：每条验收有运行证据、测试 HEA
 
 ## GitLab 收件箱
 
-`~/.hwf/scripts/gitlab-inbox.py` 常驻在一个 Herdr pane 里轮询本机 glab 账号（配置 `~/.hwf/gitlab-inbox.config.json`，状态 `~/.hwf/state/gitlab-inbox.json`），把 GitLab 上的用户动作转成入口调用或调度者消息。白名单、登记项目与开关标签以配置为准（2026-10-22：`pengjh`、`frontend/web-v1`、`herdr-auto`）。
+`~/.hwf/scripts/gitlab-inbox.py` 常驻在一个 Herdr pane 里轮询本机 glab 账号（配置：共用部分 `~/.hwf/gitlab-inbox.config.json` 入库，本机仓库路径在 `~/.hwf/gitlab-inbox.local.json`；状态 `~/.hwf/state/gitlab-inbox.json`），把 GitLab 上的用户动作转成入口调用或调度者消息。白名单、登记项目与开关标签以配置为准（2026-10-22：`pengjh`、`frontend/web-v1`、`herdr-auto`）。
 
 - **发起**：白名单用户把带开关标签的 issue 指派给本账号 → 收件箱执行 `hwf run team-up`，需求文本标明「GitLab 收件箱」「发起 issue」与发起人。该 issue 即**发起 issue**；STATE 记录发起 issue URL 与发起人账号。本账号把交付中拆出的 issue 指派给自己不会触发，这些 issue 按本协议在原交付里推进。
 - **对话模式：调度者只派人分析（2026-10-30 用户指示，取代 10-22 的「调度者只读答疑」）**：指派后默认是**对话模式**，需求或消息以「【对话模式】」开头或注明「对话模式」。用户在这个阶段常常只想先看分析结论再决定下一步，所以：

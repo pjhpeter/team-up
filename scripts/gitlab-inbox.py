@@ -6,7 +6,10 @@
     python3 ~/.hwf/scripts/gitlab-inbox.py            # 每 interval_seconds 轮询一次
     python3 ~/.hwf/scripts/gitlab-inbox.py --once     # 只跑一轮（调试）
 
-配置 ~/.hwf/gitlab-inbox.config.json：host、allowed_users、label、projects（GitLab 路径 → 本地仓库）。
+配置分两份（2026-11-02 起，共用的入库、本机的不入库）：
+  ~/.hwf/gitlab-inbox.config.json（入库）：host、allowed_users、label、interval_seconds、projects（要盯的 GitLab 项目路径列表）；
+  ~/.hwf/gitlab-inbox.local.json（本机）：projects（GitLab 路径 → 本机仓库路径），其余键可覆盖入库值。
+  只盯两边都有的项目；入库登记了、本机没配路径的项目跳过并记日志。
 状态 ~/.hwf/state/gitlab-inbox.json：已发起的 issue、每个发起 issue 已转交到的评论 id、已转交的评论 id。
 
 三类事件（只认 allowed_users 的操作；其他人的待办原样留着，不碰）：
@@ -46,6 +49,7 @@ from urllib.parse import quote
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 CONFIG_PATH = HWF_HOME / "gitlab-inbox.config.json"
+LOCAL_CONFIG_PATH = HWF_HOME / "gitlab-inbox.local.json"
 STATE_PATH = HWF_HOME / "state" / "gitlab-inbox.json"
 FIND_SCHEDULER = HWF_HOME / "scripts" / "find-scheduler.py"
 RESET_SESSION = HWF_HOME / "scripts" / "reset-session.py"
@@ -565,6 +569,25 @@ def load_json(path: Path, default: Any) -> Any:
     return json.loads(path.read_text()) if path.exists() else default
 
 
+def load_config(shared_path: Path = CONFIG_PATH, local_path: Path = LOCAL_CONFIG_PATH) -> dict[str, Any] | None:
+    """合并入库配置与本机配置；projects 取入库列表里本机配了路径的项目。"""
+    shared = load_json(shared_path, None)
+    if shared is None:
+        return None
+    local = load_json(local_path, {})
+    paths = dict(local.get("projects", {}))
+    wanted = shared.get("projects", [])
+    if isinstance(wanted, dict):  # 旧格式：入库文件里直接写了路径
+        paths = {**wanted, **paths}
+        wanted = list(wanted)
+    merged = {**shared, **{k: v for k, v in local.items() if k != "projects"}}
+    merged["projects"] = {p: paths[p] for p in wanted if p in paths}
+    for p in wanted:
+        if p not in paths:
+            log(f"skip {p}: no local repo path in {local_path.name}")
+    return merged
+
+
 def save_state(state: Mapping[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp = STATE_PATH.with_suffix(".tmp")
@@ -579,7 +602,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if os.environ.get("HERDR_ENV") != "1":
         print("gitlab-inbox must run inside a Herdr-managed pane", file=sys.stderr)
         return 1
-    config = load_json(CONFIG_PATH, None)
+    config = load_config()
     if config is None:
         print(f"missing config {CONFIG_PATH}", file=sys.stderr)
         return 1

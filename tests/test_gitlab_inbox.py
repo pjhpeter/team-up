@@ -579,3 +579,33 @@ class InboxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LoadConfigTest(unittest.TestCase):
+    """入库配置 + 本机配置合并：只盯两边都有的项目，本机可覆盖其余键，旧格式照常可用。"""
+
+    def setUp(self) -> None:
+        import tempfile
+        self.dir = Path(tempfile.mkdtemp(prefix="hwf-inbox-cfg-"))
+        self.shared, self.local = self.dir / "shared.json", self.dir / "local.json"
+
+    def load(self, shared, local=None):
+        self.shared.write_text(json.dumps(shared))
+        if local is not None:
+            self.local.write_text(json.dumps(local))
+        return INBOX.load_config(self.shared, self.local)
+
+    def test_merges_and_skips_projects_without_local_path(self) -> None:
+        cfg = self.load({"host": "h", "allowed_users": ["u"], "label": "l", "projects": ["a/b", "c/d"]},
+                        {"projects": {"a/b": "/r/ab", "x/y": "/r/xy"}, "allowed_users": ["v"]})
+        self.assertEqual(cfg["projects"], {"a/b": "/r/ab"})
+        self.assertEqual(cfg["allowed_users"], ["v"])
+        self.assertEqual(cfg["host"], "h")
+
+    def test_old_single_file_format_still_works(self) -> None:
+        cfg = self.load({"host": "h", "allowed_users": ["u"], "label": "l", "projects": {"a/b": "/r/ab"}})
+        self.assertEqual(cfg["projects"], {"a/b": "/r/ab"})
+
+    def test_missing_shared_config_returns_none(self) -> None:
+        self.assertIsNone(INBOX.load_config(self.dir / "nope.json", self.local))
+

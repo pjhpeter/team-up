@@ -26,8 +26,11 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `scripts/` | 收件箱、找调度者、成员收尾、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
+| `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔 |
 
-不入库（每台电脑自己的）：`state/`（运行状态）、`gitlab-inbox.config.json`（本机仓库路径，模板见 `gitlab-inbox.config.example.json`）。
+不入库（每台电脑自己的）：`state/`（运行状态）、`gitlab-inbox.local.json`（每个项目在本机的仓库路径，也可覆盖共用配置里的其他值，比如换成你自己的白名单账号）。
+
+收件箱要常驻在一个 Herdr 窗格里：`python3 ~/.hwf/scripts/gitlab-inbox.py`；改了配置或脚本后，在那个窗格按 Ctrl+C 再重新运行。
 
 ## 怎么改
 

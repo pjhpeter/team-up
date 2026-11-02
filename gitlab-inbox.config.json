@@ -4,8 +4,8 @@
     "pengjh"
   ],
   "label": "herdr-auto",
-  "projects": {
-    "frontend/web-v1": "/Users/<你>/code/web-v1"
-  },
-  "interval_seconds": 60
+  "interval_seconds": 60,
+  "projects": [
+    "frontend/web-v1"
+  ]
 }

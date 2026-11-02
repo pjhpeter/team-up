@@ -8,6 +8,7 @@ import re
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from urllib.parse import unquote
 
@@ -33,10 +34,15 @@ class World:
         self.writes: list[tuple] = []   # GitLab 写操作 (method, path, fields, as_user)
         self.history: dict[str, list] = {}  # chat_id → 聊天记录（补漏用）
         self.unreadable_chats: set[str] = set()
+        self.messages: dict[str, str] = {}  # message_id → 渲染后的 content（给 mget 用）
+        self.broken_images: set[str] = set()
+        self.downloads: list[tuple] = []
+        self.thread_of: dict[str, str] = {}  # 被机器人在话题里回复过的消息 → thread_id
+        self.reply_failures = 0  # 接下来几次飞书回帖返回失败
 
-    def __call__(self, cmd, input=None, env=None, **_):
+    def __call__(self, cmd, input=None, env=None, cwd=None, **_):
         if cmd[0] == "lark-cli":
-            return self.lark(cmd, input)
+            return self.lark(cmd, input, cwd)
         method, path = cmd[cmd.index("-X") + 1], unquote(cmd[cmd.index("-X") + 2])
         fields = dict(cmd[i + 1].split("=", 1) for i, c in enumerate(cmd) if c == "-f")
         as_user = bool(env and env.get("GITLAB_TOKEN") == "tok")
@@ -69,9 +75,27 @@ class World:
             return ok({k: v for k, v in issue.items() if k != "notes"})
         raise AssertionError(f"unexpected {method} {path}")
 
-    def lark(self, cmd, stdin):
+    def lark(self, cmd, stdin, cwd=None):
+        if cmd[1:3] == ["im", "+messages-mget"]:
+            mid = cmd[cmd.index("--message-ids") + 1]
+            return ok({"ok": True, "data": {"messages": [{"message_id": mid, "content": self.messages.get(mid, ""),
+                                                          "thread_id": self.thread_of.get(mid, "")}]}})
+        if cmd[1:3] == ["im", "+messages-resources-download"]:
+            mid, key = cmd[cmd.index("--message-id") + 1], cmd[cmd.index("--file-key") + 1]
+            if key in self.broken_images:
+                return ok({"ok": False, "error": {"message": "resource gone"}})
+            out = Path(cwd) / f"{cmd[cmd.index('--output') + 1]}.jpg"
+            out.write_bytes(b"jpg")
+            self.downloads.append((mid, key))
+            return ok({"ok": True, "data": {"saved_path": str(out)}})
         if cmd[1:3] == ["im", "+messages-reply"]:
-            self.replies.append({"to": cmd[cmd.index("--message-id") + 1], "text": stdin,
+            to = cmd[cmd.index("--message-id") + 1]
+            if self.reply_failures:
+                self.reply_failures -= 1
+                return ok({"ok": False, "error": {"message": "temporary failure"}})
+            if "--reply-in-thread" in cmd:
+                self.thread_of.setdefault(to, f"omt_{to}")
+            self.replies.append({"to": to, "text": stdin, "in_thread": "--reply-in-thread" in cmd,
                                  "key": cmd[cmd.index("--idempotency-key") + 1] if "--idempotency-key" in cmd else None})
             return ok({"ok": True, "data": {"message_id": f"om_r{len(self.replies)}"}})
         if cmd[1:3] == ["im", "+chat-messages-list"]:
@@ -94,10 +118,11 @@ def ok(data):
 
 
 def msg(mid: str, text: str, root: str = "", sender: str = ME, sender_type: str = "user", mentions=None,
-        chat: str = "oc_1", chat_type: str = "p2p"):
+        chat: str = "oc_1", chat_type: str = "p2p", thread: str = "", reply_to: str = ""):
     return FB.normalize_event({"message_id": mid, "chat_id": chat, "chat_type": chat_type, "sender_id": sender,
                                "sender_type": sender_type, "content": text, "root_id": root,
-                               "create_time": "1793604428990", "mentions": mentions or []})
+                               "create_time": "1793604428990", "mentions": mentions or [],
+                               "thread_id": thread, "reply_to": reply_to})
 
 
 class BridgeTest(unittest.TestCase):
@@ -106,7 +131,14 @@ class BridgeTest(unittest.TestCase):
         self.state: dict = {}
         cfg = {"gitlab_host": "git.example.com", "default_project": "frontend/web-v1",
                "users": {ME: "pengjh"}, "bot_open_id": BOT}
-        self.b = FB.Bridge(cfg, self.state, run=self.w, user_token="tok", now=lambda: 1_000_000.0)
+        self.uploads: list[tuple] = []
+        self.b = FB.Bridge(cfg, self.state, run=self.w, user_token="tok", now=lambda: 1_000_000.0,
+                           upload=self.fake_upload, media_dir=Path(tempfile.mkdtemp(prefix="fb-media-")))
+
+    def fake_upload(self, project: str, path: Path) -> str:
+        self.assertTrue(path.exists())
+        self.uploads.append((project, path.name))
+        return f"![{path.name}](/uploads/x/{path.name})"
 
     def test_create_issue_as_user_assigned_to_agent_and_reply_link(self) -> None:
         self.b.handle(msg("om_1", "需求：画布最近列表缺旧画布\n详细描述"))
@@ -150,6 +182,34 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(len(new), 1)
         self.assertIn("已收到，已转给调度者", new[0]["text"])
         self.assertEqual(new[0]["to"], "om_1")
+
+    def test_failed_forward_is_retried_next_round_in_order(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.w.gitlab_comment(8, "第一条")
+        self.w.gitlab_comment(8, "第二条")
+        before = len(self.w.replies)
+        self.w.reply_failures = 1
+        self.b.poll_gitlab()
+        self.assertEqual(len(self.w.replies), before)  # 第一条发失败，第二条也不越过它
+        self.b.poll_gitlab()
+        self.b.poll_gitlab()
+        texts = [r["text"] for r in self.w.replies[before:]]
+        self.assertEqual(len(texts), 2)
+        self.assertIn("第一条", texts[0])
+        self.assertIn("第二条", texts[1])
+
+    def test_note_that_keeps_failing_becomes_link_and_does_not_block(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.w.gitlab_comment(8, "飞书不收的内容")
+        self.w.gitlab_comment(8, "后面的评论")
+        before = len(self.w.replies)
+        self.w.reply_failures = FB.NOTE_RETRIES
+        for _ in range(FB.NOTE_RETRIES + 1):
+            self.b.poll_gitlab()
+        texts = [r["text"] for r in self.w.replies[before:]]
+        self.assertEqual(len(texts), 2)
+        self.assertIn("没能搬过来", texts[0])
+        self.assertIn("后面的评论", texts[1])
 
     def test_long_comment_is_truncated_with_link(self) -> None:
         self.b.handle(msg("om_1", "需求：长内容"))
@@ -218,8 +278,55 @@ class BridgeTest(unittest.TestCase):
         self.assertFalse(any("用法" in r["text"] for r in self.w.replies))
 
     def test_reply_in_unknown_thread_asks_to_bind(self) -> None:
-        self.b.handle(msg("om_2", "这是啥", root="om_unknown"))
+        self.b.handle(msg("om_2", "这是啥", root="om_unknown", thread="omt_unknown"))
         self.assertIn("还没关联 issue", self.w.replies[0]["text"])
+
+    def test_quote_reply_to_image_makes_one_thread_with_image(self) -> None:
+        # 2026-11-02 实测：先单独发图，再对图「回复」（主对话里的引用回复）写「需求：…」
+        self.w.messages["om_img"] = "[Image: img_v3_abc-1]"
+        self.b.handle(msg("om_img", "[Image: img_v3_abc-1]"))
+        hint = self.w.replies[-1]
+        self.assertIn("接着发「需求", hint["text"])
+        self.assertFalse(hint["in_thread"])  # 提示不开话题
+        self.b.handle(msg("om_req", "需求：测试环境报这个错，帮忙排查", root="om_img", reply_to="om_img"))
+        create = [w for w in self.w.writes if w[1].endswith("/issues")][0]
+        self.assertEqual(create[2]["title"], "测试环境报这个错，帮忙排查")
+        self.assertIn("![img_v3_abc-1.jpg](/uploads/x/img_v3_abc-1.jpg)", create[2]["description"])
+        self.assertEqual(len(self.w.downloads), 1)  # 待用图和被回复的图是同一张，只搬一次
+        self.assertEqual(self.state["thread_ids"], {"omt_om_req": "om_req"})
+        # 话题里的后续消息（root 可能指向图片）按 thread_id 找回 #8
+        self.b.handle(msg("om_more", "补充：只在测试环境", root="om_img", thread="omt_om_req"))
+        self.assertEqual(self.w.writes[-1][2]["body"], "补充：只在测试环境\n\n_（来自飞书）_")
+        self.w.gitlab_comment(8, "看了，是权限问题")
+        self.b.poll_gitlab()
+        self.assertEqual(self.w.replies[-1]["to"], "om_req")  # Agent 回复和 issue 链接在同一个话题
+
+    def test_lone_image_is_attached_to_next_requirement_within_ten_minutes(self) -> None:
+        clock = [1_000_000.0]
+        self.b.now = lambda: clock[0]
+        self.b.handle(msg("om_img", "[Image: img_v3_a]"))
+        self.b.handle(msg("om_req", "需求：看下这个报错"))
+        desc = [w for w in self.w.writes if w[1].endswith("/issues")][-1][2]["description"]
+        self.assertIn("img_v3_a.jpg", desc)
+        self.b.handle(msg("om_img2", "[Image: img_v3_b]"))
+        clock[0] += 601
+        self.b.handle(msg("om_req2", "需求：另一件事"))
+        desc = [w for w in self.w.writes if w[1].endswith("/issues")][-1][2]["description"]
+        self.assertNotIn("img_v3_b", desc)
+
+    def test_image_reply_in_linked_thread_becomes_comment_with_image(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.b.handle(msg("om_2", "[Image: img_v3_zz]", root="om_1"))
+        body = self.w.writes[-1][2]["body"]
+        self.assertTrue(body.startswith("![img_v3_zz.jpg]"))
+        self.assertNotIn("[Image:", body)
+
+    def test_image_download_failure_still_creates_issue(self) -> None:
+        self.w.broken_images.add("img_v3_bad")
+        self.b.handle(msg("om_1", "需求：看图 [Image: img_v3_bad]"))
+        desc = [w for w in self.w.writes if w[1].endswith("/issues")][0][2]["description"]
+        self.assertIn("没搬过来", desc)
+        self.assertEqual(self.uploads, [])
 
     def test_history_normalization(self) -> None:
         item = {"message_id": "om_9", "chat_id": "oc_1", "content": "hi", "create_time": "2026-11-02 15:34",

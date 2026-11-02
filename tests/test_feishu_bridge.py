@@ -1,0 +1,200 @@
+"""聚焦验证飞书桥：建单/关联/话题回复同步到 GitLab，GitLab 新评论回帖到飞书，防刷屏与白名单。"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+from urllib.parse import unquote
+
+SPEC = importlib.util.spec_from_file_location(
+    "feishu_bridge", Path(__file__).resolve().parents[1] / "scripts/feishu-bridge.py")
+assert SPEC is not None and SPEC.loader is not None
+FB = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = FB
+SPEC.loader.exec_module(FB)
+
+ME = "ou_me"
+BOT = "ou_bot"
+
+
+class World:
+    """假 GitLab + 假 lark-cli，记录所有写操作。"""
+
+    def __init__(self) -> None:
+        self.issues: dict[int, dict] = {7: {"iid": 7, "title": "旧单", "state": "opened", "notes": [
+            {"id": 70, "body": "很早的评论", "system": False, "author": {"name": "某人"}}]}}
+        self.next_note = 100
+        self.replies: list[dict] = []   # 飞书回帖
+        self.writes: list[tuple] = []   # GitLab 写操作 (method, path, fields, as_user)
+
+    def __call__(self, cmd, input=None, env=None, **_):
+        if cmd[0] == "lark-cli":
+            return self.lark(cmd, input)
+        method, path = cmd[cmd.index("-X") + 1], unquote(cmd[cmd.index("-X") + 2])
+        fields = dict(cmd[i + 1].split("=", 1) for i, c in enumerate(cmd) if c == "-f")
+        as_user = bool(env and env.get("GITLAB_TOKEN") == "tok")
+        base = path.split("?")[0]
+        if method != "GET":
+            self.writes.append((method, base, fields, as_user))
+        if base == "user":
+            return ok({"username": "pengjh" if as_user else "pjhagent"})
+        if base == "users":
+            return ok([{"id": 42, "username": "pjhagent"}])
+        if base == "projects/frontend/web-v1/issues" and method == "POST":
+            iid = max(self.issues) + 1
+            self.issues[iid] = {"iid": iid, "title": fields["title"], "state": "opened", "notes": []}
+            return ok({"iid": iid})
+        parts = base.split("/")
+        if len(parts) >= 5 and parts[3] == "issues":
+            iid = int(parts[4])
+            if iid not in self.issues:
+                return subprocess.CompletedProcess([], 1, "", "404 Not Found")
+            issue = self.issues[iid]
+            if base.endswith("/notes") and method == "POST":
+                self.next_note += 1
+                note = {"id": self.next_note, "body": fields["body"], "system": False,
+                        "author": {"name": "彭嘉辉"}}
+                issue["notes"].append(note)
+                return ok(note)
+            if base.endswith("/notes"):
+                notes = sorted(issue["notes"], key=lambda n: n["id"], reverse="sort=desc" in path)
+                return ok(notes[:1] if re.search(r"per_page=1(&|$)", path) else notes)
+            return ok({k: v for k, v in issue.items() if k != "notes"})
+        raise AssertionError(f"unexpected {method} {path}")
+
+    def lark(self, cmd, stdin):
+        if cmd[1:3] == ["im", "+messages-reply"]:
+            self.replies.append({"to": cmd[cmd.index("--message-id") + 1], "text": stdin,
+                                 "key": cmd[cmd.index("--idempotency-key") + 1] if "--idempotency-key" in cmd else None})
+            return ok({"ok": True, "data": {"message_id": f"om_r{len(self.replies)}"}})
+        raise AssertionError(f"unexpected lark {cmd}")
+
+    def gitlab_comment(self, iid: int, body: str, name: str = "交付调度者", system: bool = False) -> None:
+        self.next_note += 1
+        self.issues[iid]["notes"].append({"id": self.next_note, "body": body, "system": system,
+                                          "author": {"name": name}})
+
+
+def ok(data):
+    return subprocess.CompletedProcess([], 0, json.dumps(data, ensure_ascii=False), "")
+
+
+def msg(mid: str, text: str, root: str = "", sender: str = ME, sender_type: str = "user", mentions=None):
+    return FB.normalize_event({"message_id": mid, "chat_id": "oc_1", "chat_type": "p2p", "sender_id": sender,
+                               "sender_type": sender_type, "content": text, "root_id": root,
+                               "create_time": "1793604428990", "mentions": mentions or []})
+
+
+class BridgeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.w = World()
+        self.state: dict = {}
+        cfg = {"gitlab_host": "git.example.com", "default_project": "frontend/web-v1",
+               "users": {ME: "pengjh"}, "bot_open_id": BOT}
+        self.b = FB.Bridge(cfg, self.state, run=self.w, user_token="tok", now=lambda: 1_000_000.0)
+
+    def test_create_issue_as_user_assigned_to_agent_and_reply_link(self) -> None:
+        self.b.handle(msg("om_1", "需求：画布最近列表缺旧画布\n详细描述"))
+        method, path, fields, as_user = self.w.writes[0]
+        self.assertEqual((method, path, as_user), ("POST", "projects/frontend/web-v1/issues", True))
+        self.assertEqual(fields["title"], "画布最近列表缺旧画布")
+        self.assertEqual(fields["labels"], "herdr-auto")
+        self.assertEqual(fields["assignee_id"], "42")
+        self.assertIn("来自飞书", fields["description"])
+        self.assertEqual(self.state["threads"]["om_1"]["iid"], 8)
+        self.assertEqual(self.w.replies[0]["to"], "om_1")
+        self.assertIn("#8", self.w.replies[0]["text"])
+
+    def test_thread_reply_becomes_user_comment_and_command_stays_bare(self) -> None:
+        self.b.handle(msg("om_1", "/需求 修个按钮"))
+        self.b.handle(msg("om_2", "按钮在右上角", root="om_1"))
+        self.b.handle(msg("om_3", "/go", root="om_1"))
+        notes = [w for w in self.w.writes if w[1].endswith("/notes")]
+        self.assertEqual([n[2]["body"] for n in notes], ["按钮在右上角\n\n_（来自飞书）_", "/go"])
+        self.assertTrue(all(n[3] for n in notes))
+
+    def test_bind_existing_issue_mentions_agent_and_skips_old_notes(self) -> None:
+        self.b.handle(msg("om_1", "#7 帮忙看下进度"))
+        t = self.state["threads"]["om_1"]
+        self.assertEqual((t["iid"], t["last_note"], t["bound"]), (7, 70, True))
+        self.assertEqual(self.w.writes[-1][2]["body"], "@pjhagent 帮忙看下进度\n\n_（来自飞书）_")
+        self.b.handle(msg("om_2", "/status", root="om_1"))
+        self.assertEqual(self.w.writes[-1][2]["body"], "@pjhagent /status")
+        self.b.poll_gitlab()
+        self.assertFalse(any("很早的评论" in r["text"] for r in self.w.replies))
+
+    def test_gitlab_comments_flow_back_once_without_echo(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.b.handle(msg("om_2", "补充一句", root="om_1"))  # 桥自己发的评论
+        self.w.gitlab_comment(8, "已收到，已转给调度者")
+        self.w.gitlab_comment(8, "added label", system=True)
+        before = len(self.w.replies)
+        self.b.poll_gitlab()
+        self.b.poll_gitlab()  # 第二轮不重复
+        new = self.w.replies[before:]
+        self.assertEqual(len(new), 1)
+        self.assertIn("已收到，已转给调度者", new[0]["text"])
+        self.assertEqual(new[0]["to"], "om_1")
+
+    def test_long_comment_is_truncated_with_link(self) -> None:
+        self.b.handle(msg("om_1", "需求：长内容"))
+        self.w.gitlab_comment(8, "字" * 5000)
+        self.b.poll_gitlab()
+        text = self.w.replies[-1]["text"]
+        self.assertLess(len(text), 2700)
+        self.assertIn("全文见", text)
+
+    def test_closed_issue_notifies_once_and_rejects_replies(self) -> None:
+        self.b.handle(msg("om_1", "需求：会被关掉"))
+        self.w.issues[8]["state"] = "closed"
+        self.b.poll_gitlab()
+        self.b.poll_gitlab()
+        self.assertEqual(sum("已关闭" in r["text"] for r in self.w.replies), 1)
+        self.b.handle(msg("om_2", "还有个问题", root="om_1"))
+        self.assertIn("已关闭", self.w.replies[-1]["text"])
+        self.assertFalse([w for w in self.w.writes if w[1].endswith("/notes")])
+
+    def test_bot_and_duplicate_messages_are_ignored(self) -> None:
+        self.b.handle(msg("om_1", "需求：一次", sender=BOT, sender_type="bot"))
+        self.b.handle(msg("om_2", "需求：一次"))
+        self.b.handle(msg("om_2", "需求：一次"))  # 补漏重复拿到
+        creates = [w for w in self.w.writes if w[1].endswith("/issues")]
+        self.assertEqual(len(creates), 1)
+
+    def test_stranger_is_refused_and_nothing_written(self) -> None:
+        self.b.handle(msg("om_1", "需求：我也要", sender="ou_other"))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("没有使用权限", self.w.replies[0]["text"])
+
+    def test_small_talk_gets_help_once_per_cooldown(self) -> None:
+        self.b.handle(msg("om_1", "你叫什么名字？"))
+        self.b.handle(msg("om_2", "在吗"))
+        self.assertEqual(len(self.w.replies), 1)
+        self.assertIn("用法", self.w.replies[0]["text"])
+        self.assertEqual(self.w.writes, [])
+
+    def test_group_mention_of_bot_is_stripped(self) -> None:
+        m = msg("om_1", "@_user_1 需求：群里提的", mentions=[{"key": "@_user_1", "id": BOT, "name": "交付助手"}])
+        self.b.handle(m)
+        self.assertEqual(self.w.writes[0][2]["title"], "群里提的")
+
+    def test_reply_in_unknown_thread_asks_to_bind(self) -> None:
+        self.b.handle(msg("om_2", "这是啥", root="om_unknown"))
+        self.assertIn("还没关联 issue", self.w.replies[0]["text"])
+
+    def test_history_normalization(self) -> None:
+        item = {"message_id": "om_9", "chat_id": "oc_1", "content": "hi", "create_time": "2026-11-02 15:34",
+                "sender": {"id": ME, "name": "彭嘉辉", "sender_type": "user"}}
+        n = FB.normalize_history(item, default_root="om_1")
+        self.assertEqual((n["sender_type"], n["root_id"], n["sender_name"]), ("user", "om_1", "彭嘉辉"))
+        bot = FB.normalize_history({"message_id": "om_8", "sender": {"id": "cli_x", "id_type": "app_id"}})
+        self.assertEqual(bot["sender_type"], "bot")
+
+
+if __name__ == "__main__":
+    unittest.main()

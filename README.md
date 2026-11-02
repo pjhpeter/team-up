@@ -23,7 +23,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `workflows/team-up.yaml` | Herdr 启动团队的入口 |
 | `herdr/config.yaml` | 各角色用什么工具、什么模型（install.sh 把 Herdr 插件配置链接到这里） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱、找调度者、成员收尾、清理临时目录、新项目接入等脚本 |
+| `scripts/` | 收件箱、飞书桥、找调度者、成员收尾、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
 | `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔 |
@@ -31,6 +31,30 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 不入库（每台电脑自己的）：`state/`（运行状态）、`gitlab-inbox.local.json`（每个项目在本机的仓库路径，也可覆盖共用配置里的其他值，比如换成你自己的白名单账号）。
 
 收件箱要常驻在一个 Herdr 窗格里：`python3 ~/.hwf/scripts/gitlab-inbox.py`；改了配置或脚本后，在那个窗格按 Ctrl+C 再重新运行。
+
+## 从飞书提需求（可选）
+
+接上之后，在飞书里私聊自己的机器人（或在群里 @它），就能建 issue、和 Agent 对话；Agent 在 issue 里的评论会回到同一个飞书话题。Agent 团队仍只看 GitLab，飞书桥只负责来回搬消息。
+
+| 在飞书里发 | 结果 |
+| --- | --- |
+| `需求：<内容>` 或 `/需求 <内容>` | 建 issue（打 `herdr-auto`、指派给 Agent），回帖 issue 链接 |
+| `#123 <内容>` 或贴 issue 链接 | 把这个话题关联到已有 issue，内容写成评论 |
+| 在上面的话题里回复 | 写成该 issue 的评论；`/go`、`/status` 等指令照常生效 |
+
+每人一套（每人一个飞书自建应用，桥跑在自己电脑上）：
+
+1. 在飞书开放平台建自建应用并开启机器人；权限开 `im:message.p2p_msg:readonly`、`im:message.group_at_msg:readonly`、`im:message:send_as_bot`；事件订阅选「长连接」并添加 `im.message.receive_v1`；发布版本。
+2. 本机 `lark-cli config init` 填这个应用（只用机器人身份，不用 `auth login`）。
+3. 在 GitLab 建一个**你本人账号**的个人访问令牌（权限 `api`），在自己的终端存进钥匙串（不要贴进聊天）：
+   `security add-generic-password -s hwf-feishu-bridge -a <你的 GitLab 用户名> -w`
+   之所以要本人令牌：收件箱只认白名单里的人，用 Agent 账号发的评论会被当成 Agent 自己说的话跳过。
+4. 写 `~/.hwf/feishu-bridge.local.json`（不入库；`users` 的 open_id 是你在这个应用下的 ID，先给机器人发一句话，在桥的日志或 `lark-cli event consume` 里能看到）：
+   ```json
+   {"default_project": "<组>/<项目>", "users": {"ou_xxx": "<你的 GitLab 用户名>"},
+    "gitlab_token_keychain": {"service": "hwf-feishu-bridge", "account": "<你的 GitLab 用户名>"}}
+   ```
+5. `python3 ~/.hwf/scripts/feishu-bridge.py --check` 全部有值即可；然后常驻在一个 Herdr 窗格里：`python3 ~/.hwf/scripts/feishu-bridge.py`。
 
 ## 怎么改
 

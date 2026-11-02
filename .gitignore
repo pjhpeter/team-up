@@ -4,3 +4,4 @@ state/
 __pycache__/
 # 收件箱的本机部分（GitLab 项目 → 本机仓库路径）；共用部分 gitlab-inbox.config.json 入库
 gitlab-inbox.local.json
+feishu-bridge.local.json

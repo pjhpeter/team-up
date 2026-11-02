@@ -55,6 +55,15 @@ profiles:
   dev:
     kind: omp
     args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+  # 2026-11-02 用户指示：开发者分前后端，需求前后端都改时两人并行（见 PROTOCOL「前后端并行开发」）。
+  # dev-fe 只写前端仓库、dev-be 只写后端仓库；模型暂与 dev 相同，需要时各自改。
+  # dev 保留给不分前后端的仓库。
+  dev-fe:
+    kind: omp
+    args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+  dev-be:
+    kind: omp
+    args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
   # 测试者：编写用例、代码评审通过后执行自动化测试。审批与 cwd 同 dev（YOLO）。
   test:
     kind: codex

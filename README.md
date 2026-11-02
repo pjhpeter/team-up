@@ -42,6 +42,8 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `#123 <内容>` 或贴 issue 链接 | 把这个话题关联到已有 issue，内容写成评论 |
 | 在上面的话题里回复 | 写成该 issue 的评论；`/go`、`/status` 等指令照常生效 |
 
+群里使用时，每句话（包括话题里的回复）都要 @机器人，它才收得到；私聊不用。
+
 每人一套（每人一个飞书自建应用，桥跑在自己电脑上）：
 
 1. 在飞书开放平台建自建应用并开启机器人；权限开 `im:message.p2p_msg:readonly`、`im:message.group_at_msg:readonly`、`im:message:send_as_bot`；事件订阅选「长连接」并添加 `im.message.receive_v1`；发布版本。

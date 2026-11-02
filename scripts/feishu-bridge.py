@@ -45,17 +45,22 @@ import threading
 import time
 from typing import Any, Callable, Optional
 from urllib.parse import quote
+import urllib.request
+import uuid
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 CONFIG_PATH = HWF_HOME / "feishu-bridge.local.json"
 INBOX_CONFIG_PATH = HWF_HOME / "gitlab-inbox.config.json"
 STATE_PATH = HWF_HOME / "state" / "feishu-bridge.json"
+MEDIA_DIR = HWF_HOME / "state" / "feishu-media"  # 飞书图片下载的中转目录（lark-cli 只许写到当前目录下）
 
 CMD_TIMEOUT_S = 60
 SEEN_CAP = 2000
 HELP_COOLDOWN_S = 600
 FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
 CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
+IMAGE_KEY_RE = re.compile(r"\[Image: (img_[^\]\s]+)\]")  # 飞书把图片渲染成「[Image: img_xxx]」
+IMAGE_HINT = "收到图片。要让 Agent 看这张图：在图上点「回复」，写「需求：<要做的事>」或「#编号」。"
 BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)\S*)\s*")
 HELP_TEXT = (
     "用法：\n"
@@ -66,6 +71,7 @@ HELP_TEXT = (
 )
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
+Uploader = Callable[[str, Path], str]  # (project, 本地文件) → 可直接放进评论的 Markdown
 
 
 class BridgeError(Exception):
@@ -93,8 +99,11 @@ def cap_list(items: list, cap: int = SEEN_CAP) -> list:
 
 class Bridge:
     def __init__(self, config: dict[str, Any], state: dict[str, Any], run: Runner = subprocess.run,
-                 user_token: str = "", now: Callable[[], float] = time.time):
+                 user_token: str = "", now: Callable[[], float] = time.time,
+                 upload: Optional[Uploader] = None, media_dir: Path = MEDIA_DIR):
         self.cfg, self.state, self.run, self.now = config, state, run, now
+        self.upload = upload or self.http_upload
+        self.media_dir = media_dir
         self.host: str = config["gitlab_host"]
         self.project: str = config["default_project"]
         self.label: str = config.get("label", "herdr-auto")
@@ -109,8 +118,9 @@ class Bridge:
         state.setdefault("group_chats", [])  # 收到过群消息的 chat_id（补漏时群里只处理 @ 机器人的）
 
     # ---------- 外部命令 ----------
-    def sh(self, cmd: list[str], stdin: Optional[str] = None, env: Optional[dict] = None) -> str:
-        r = self.run(cmd, input=stdin, capture_output=True, text=True, timeout=CMD_TIMEOUT_S, env=env)
+    def sh(self, cmd: list[str], stdin: Optional[str] = None, env: Optional[dict] = None,
+           cwd: Optional[Path] = None) -> str:
+        r = self.run(cmd, input=stdin, capture_output=True, text=True, timeout=CMD_TIMEOUT_S, env=env, cwd=cwd)
         if r.returncode != 0:
             raise BridgeError(f"{' '.join(cmd[:4])} 失败：{(r.stderr or r.stdout).strip()[:300]}")
         return r.stdout
@@ -128,8 +138,8 @@ class Bridge:
         out = self.sh(cmd, env=env)
         return json.loads(out) if out.strip() else None
 
-    def lark(self, args: list[str], stdin: Optional[str] = None) -> Any:
-        out = self.sh(["lark-cli", *args, "--as", "bot"], stdin=stdin)
+    def lark(self, args: list[str], stdin: Optional[str] = None, cwd: Optional[Path] = None) -> Any:
+        out = self.sh(["lark-cli", *args, "--as", "bot"], stdin=stdin, cwd=cwd)
         data = json.loads(out) if out.strip() else {}
         if isinstance(data, dict) and data.get("ok") is False:
             raise BridgeError(f"lark-cli {args[:2]} 失败：{data.get('error')}")
@@ -140,6 +150,50 @@ class Bridge:
         if key:
             args += ["--idempotency-key", key[:50]]
         self.lark(args, stdin=markdown)
+
+    def http_upload(self, project: str, path: Path) -> str:
+        """以用户身份把文件传到 GitLab 项目附件（glab api 不支持上传文件），返回 Markdown。"""
+        if not self.user_token:
+            raise BridgeError("没有用户 GitLab 令牌，不能上传图片")
+        boundary = uuid.uuid4().hex
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{path.name}\"\r\n"
+                "Content-Type: application/octet-stream\r\n\r\n").encode() + path.read_bytes() + \
+            f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            f"https://{self.host}/api/v4/projects/{quote(project, safe='')}/uploads", data=body, method="POST",
+            headers={"PRIVATE-TOKEN": self.user_token, "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(req, timeout=CMD_TIMEOUT_S) as r:
+                return json.loads(r.read())["markdown"]
+        except (OSError, ValueError, KeyError) as e:
+            raise BridgeError(f"上传图片失败：{e}") from e
+
+    def images_markdown(self, msg: dict[str, Any], project: str) -> str:
+        """把这条消息、以及它所回复的那条消息里的图片搬到 GitLab，返回要附在正文后的 Markdown。"""
+        sources = [(msg["message_id"], IMAGE_KEY_RE.findall(msg.get("content") or ""))]
+        parent = msg.get("reply_to") or ""
+        if parent and parent != msg["message_id"]:
+            try:
+                items = (self.lark(["im", "+messages-mget", "--message-ids", parent]).get("data") or {}).get("messages")
+                sources.append((parent, IMAGE_KEY_RE.findall((items or [{}])[0].get("content") or "")))
+            except BridgeError as e:
+                log(f"read parent {parent} failed: {e}")
+        self.media_dir.mkdir(parents=True, exist_ok=True)
+        parts = []
+        for mid, keys in sources:
+            for key in keys:
+                try:
+                    data = self.lark(["im", "+messages-resources-download", "--message-id", mid, "--file-key", key,
+                                      "--type", "image", "--output", key], cwd=self.media_dir)
+                    path = Path((data.get("data") or {}).get("saved_path") or "")
+                    if not path.is_absolute():
+                        path = self.media_dir / path
+                    parts.append(self.upload(project, path))
+                    path.unlink(missing_ok=True)
+                except BridgeError as e:
+                    log(f"image {key} of {mid} failed: {e}")
+                    parts.append(f"_（有一张图片没搬过来：{e}）_")
+        return "\n\n".join(parts)
 
     # ---------- 飞书 → GitLab ----------
     def handle(self, msg: dict[str, Any]) -> None:
@@ -162,18 +216,23 @@ class Bridge:
         text = self.clean_text(msg)
         root = msg.get("root_id") or ""
         if root and root != mid and root in self.state["threads"]:
-            self.follow_up(root, mid, text)
+            self.follow_up(root, msg, text)
             return
-        if root and root != mid:
-            self.reply(mid, "这条话题还没关联 issue。要新建请在主对话发「需求：…」，要关联请发「#编号」。", f"orphan-{mid}")
-            return
+        # 在没关联的话题里（例如对一张图点「回复」）发「需求：」/「#编号」也认：整个话题挂到这张 issue 上
+        key = root if root and root != mid else mid
         m = BIND_RE.match(text)
         if m:
-            self.bind(mid, chat, int(m.group(1) or m.group(2)), text[m.end():].strip(), user)
+            self.bind(mid, chat, int(m.group(1) or m.group(2)), text[m.end():].strip(), user, key, msg)
             return
         m = CREATE_RE.match(text)
         if m and text[m.end():].strip():
-            self.create(mid, chat, text[m.end():].strip(), user, msg.get("sender_name") or user)
+            self.create(mid, chat, text[m.end():].strip(), user, msg.get("sender_name") or user, key, msg)
+            return
+        if key != mid:
+            self.reply(mid, "这条话题还没关联 issue。在这里发「需求：…」新建，或发「#编号」关联已有 issue。", f"orphan-{mid}")
+            return
+        if IMAGE_KEY_RE.fullmatch(text.strip()):
+            self.reply(mid, IMAGE_HINT, f"img-hint-{mid}")
             return
         last = self.state["help_sent"].get(chat, 0)
         if self.now() - last >= HELP_COOLDOWN_S:
@@ -194,6 +253,10 @@ class Bridge:
                 text = text.replace(key, f"@{name}")
         return text.strip()
 
+    @staticmethod
+    def strip_images(text: str) -> str:
+        return IMAGE_KEY_RE.sub("", text).strip()
+
     def is_bot_mention(self, m: dict[str, Any]) -> bool:
         mid = m.get("id") or ""
         return bool(mid) and (mid == self.cfg.get("bot_open_id") or mid.startswith("cli_"))
@@ -207,24 +270,28 @@ class Bridge:
     def issue_url(self, project: str, iid: int) -> str:
         return f"https://{self.host}/{project}/-/issues/{iid}"
 
-    def create(self, mid: str, chat: str, text: str, user: str, name: str) -> None:
+    def create(self, mid: str, chat: str, text: str, user: str, name: str,
+               key: Optional[str] = None, msg: Optional[dict[str, Any]] = None) -> None:
+        images = self.images_markdown(msg, self.project) if msg else ""
+        text = self.strip_images(text) or "（见图）"
         title = text.splitlines()[0].strip()
         title = title[:60] + ("…" if len(title) > 60 else "")
         agent_id = self.api(f"users?username={quote(self.agent)}")[0]["id"]
-        desc = (f"{text}\n\n---\n来自飞书（{name}，{datetime.fromtimestamp(self.now()):%Y-%m-%d %H:%M}）。"
+        desc = (f"{text}\n\n{images + chr(10) + chr(10) if images else ''}---\n来自飞书（{name}，{datetime.fromtimestamp(self.now()):%Y-%m-%d %H:%M}）。"
                 "在飞书话题里回复会同步成这里的评论，这里的评论也会同步回飞书。")
         issue = self.api(f"projects/{quote(self.project, safe='')}/issues", "POST", {
             "title": title, "description": desc, "labels": self.label, "assignee_id": str(agent_id)},
             as_user=True)
         iid = issue["iid"]
-        self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
-                                      "last_note": 0, "closed": False}
+        self.state["threads"][key or mid] = {"project": self.project, "iid": iid, "chat_id": chat,
+                                             "last_note": 0, "closed": False}
         self.reply(mid, f"已建 [#{iid}]({self.issue_url(self.project, iid)})：{title}\n"
                         "Agent 会先只读分析，结论会回到这个话题；在这里回复「/go」或说「开工」才正式交付。",
                    f"created-{mid}")
         log(f"created {self.project}#{iid} from {mid} by {user}")
 
-    def bind(self, mid: str, chat: str, iid: int, rest: str, user: str) -> None:
+    def bind(self, mid: str, chat: str, iid: int, rest: str, user: str,
+             key: Optional[str] = None, msg: Optional[dict[str, Any]] = None) -> None:
         pid = quote(self.project, safe="")
         try:
             issue = self.api(f"projects/{pid}/issues/{iid}")
@@ -232,23 +299,33 @@ class Bridge:
             self.reply(mid, f"没找到 #{iid}（只能关联 {self.project} 里的 issue）。", f"bind-miss-{mid}")
             return
         notes = self.api(f"projects/{pid}/issues/{iid}/notes?sort=desc&per_page=1")
-        self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
-                                      "last_note": notes[0]["id"] if notes else 0,
-                                      "closed": issue["state"] == "closed", "bound": True}
-        if rest:
+        self.state["threads"][key or mid] = {"project": self.project, "iid": iid, "chat_id": chat,
+                                             "last_note": notes[0]["id"] if notes else 0,
+                                             "closed": issue["state"] == "closed", "bound": True}
+        images = self.images_markdown(msg, self.project) if msg else ""
+        rest = self.strip_images(rest)
+        if rest or images:
             # 已有 issue 未必在收件箱跟踪范围内，@Agent 保证转交。
-            self.note_as_user(self.project, iid, f"@{self.agent} {rest}\n\n_（来自飞书）_")
+            body = "\n\n".join(x for x in (rest, images) if x)
+            self.note_as_user(self.project, iid, f"@{self.agent} {body}\n\n_（来自飞书）_")
         self.reply(mid, f"已关联 [#{iid}]({self.issue_url(self.project, iid)})：{issue['title']}\n"
                         "之后在这个话题里回复会同步成评论，issue 里的新评论也会发到这里。", f"bound-{mid}")
         log(f"bound {mid} → {self.project}#{iid} by {user}")
 
-    def follow_up(self, root: str, mid: str, text: str) -> None:
+    def follow_up(self, root: str, msg: dict[str, Any], text: str) -> None:
+        mid = msg["message_id"]
         t = self.state["threads"][root]
         if t.get("closed"):
             self.reply(mid, "这张 issue 已关闭。要继续请发新的「需求：…」，或「#编号」关联别的 issue。", f"closed-{mid}")
             return
         # /go、/status、/new 这类指令要整条只有指令，收件箱才认得，所以不加尾注。
-        body = text if text.startswith("/") else f"{text}\n\n_（来自飞书）_"
+        if text.startswith("/"):
+            body = text
+        else:
+            # 话题里的回复，回复对象就是话题内的消息，只搬这条自己带的图，不重复搬根消息的图
+            images = self.images_markdown({**msg, "reply_to": ""}, t["project"])
+            text = self.strip_images(text)
+            body = "\n\n".join(x for x in (text, images) if x) + "\n\n_（来自飞书）_"
         if t.get("bound"):
             body = f"@{self.agent} {body}"
         self.note_as_user(t["project"], t["iid"], body)
@@ -316,6 +393,7 @@ def normalize_event(e: dict[str, Any]) -> dict[str, Any]:
             "chat_type": e.get("chat_type"), "sender_id": e.get("sender_id"),
             "sender_type": e.get("sender_type"), "content": e.get("content") or "",
             "mentions": e.get("mentions") or [], "root_id": e.get("root_id") or "",
+            "reply_to": e.get("reply_to") or "", "message_type": e.get("message_type") or "",
             "create_ms": int(e.get("create_time") or 0)}
 
 
@@ -331,7 +409,8 @@ def normalize_history(m: dict[str, Any], default_root: str = "") -> dict[str, An
             "sender_id": sender.get("id"), "sender_name": sender.get("name"),
             "sender_type": "user" if sender.get("sender_type") == "user" else "bot",
             "content": m.get("content") or "", "mentions": m.get("mentions") or [],
-            "root_id": root, "create_ms": ms}
+            "root_id": root, "reply_to": m.get("parent_id") or m.get("reply_to") or "",
+            "message_type": m.get("msg_type") or "", "create_ms": ms}
 
 
 # ---------- 运行 ----------

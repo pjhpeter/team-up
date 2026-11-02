@@ -37,6 +37,7 @@ class World:
         self.messages: dict[str, str] = {}  # message_id → 渲染后的 content（给 mget 用）
         self.broken_images: set[str] = set()
         self.downloads: list[tuple] = []
+        self.thread_of: dict[str, str] = {}  # 被机器人在话题里回复过的消息 → thread_id
 
     def __call__(self, cmd, input=None, env=None, cwd=None, **_):
         if cmd[0] == "lark-cli":
@@ -76,7 +77,8 @@ class World:
     def lark(self, cmd, stdin, cwd=None):
         if cmd[1:3] == ["im", "+messages-mget"]:
             mid = cmd[cmd.index("--message-ids") + 1]
-            return ok({"ok": True, "data": {"messages": [{"message_id": mid, "content": self.messages.get(mid, "")}]}})
+            return ok({"ok": True, "data": {"messages": [{"message_id": mid, "content": self.messages.get(mid, ""),
+                                                          "thread_id": self.thread_of.get(mid, "")}]}})
         if cmd[1:3] == ["im", "+messages-resources-download"]:
             mid, key = cmd[cmd.index("--message-id") + 1], cmd[cmd.index("--file-key") + 1]
             if key in self.broken_images:
@@ -86,7 +88,10 @@ class World:
             self.downloads.append((mid, key))
             return ok({"ok": True, "data": {"saved_path": str(out)}})
         if cmd[1:3] == ["im", "+messages-reply"]:
-            self.replies.append({"to": cmd[cmd.index("--message-id") + 1], "text": stdin,
+            to = cmd[cmd.index("--message-id") + 1]
+            if "--reply-in-thread" in cmd:
+                self.thread_of.setdefault(to, f"omt_{to}")
+            self.replies.append({"to": to, "text": stdin, "in_thread": "--reply-in-thread" in cmd,
                                  "key": cmd[cmd.index("--idempotency-key") + 1] if "--idempotency-key" in cmd else None})
             return ok({"ok": True, "data": {"message_id": f"om_r{len(self.replies)}"}})
         if cmd[1:3] == ["im", "+chat-messages-list"]:
@@ -109,10 +114,11 @@ def ok(data):
 
 
 def msg(mid: str, text: str, root: str = "", sender: str = ME, sender_type: str = "user", mentions=None,
-        chat: str = "oc_1", chat_type: str = "p2p"):
+        chat: str = "oc_1", chat_type: str = "p2p", thread: str = "", reply_to: str = ""):
     return FB.normalize_event({"message_id": mid, "chat_id": chat, "chat_type": chat_type, "sender_id": sender,
                                "sender_type": sender_type, "content": text, "root_id": root,
-                               "create_time": "1793604428990", "mentions": mentions or []})
+                               "create_time": "1793604428990", "mentions": mentions or [],
+                               "thread_id": thread, "reply_to": reply_to})
 
 
 class BridgeTest(unittest.TestCase):
@@ -240,24 +246,41 @@ class BridgeTest(unittest.TestCase):
         self.assertFalse(any("用法" in r["text"] for r in self.w.replies))
 
     def test_reply_in_unknown_thread_asks_to_bind(self) -> None:
-        self.b.handle(msg("om_2", "这是啥", root="om_unknown"))
+        self.b.handle(msg("om_2", "这是啥", root="om_unknown", thread="omt_unknown"))
         self.assertIn("还没关联 issue", self.w.replies[0]["text"])
 
-    def test_reply_to_image_with_requirement_creates_issue_with_image(self) -> None:
-        # 2026-11-02 实测：先单独发图，再对图点「回复」写「需求：…」
+    def test_quote_reply_to_image_makes_one_thread_with_image(self) -> None:
+        # 2026-11-02 实测：先单独发图，再对图「回复」（主对话里的引用回复）写「需求：…」
         self.w.messages["om_img"] = "[Image: img_v3_abc-1]"
         self.b.handle(msg("om_img", "[Image: img_v3_abc-1]"))
-        self.assertIn("在图上点「回复」", self.w.replies[-1]["text"])
-        m = msg("om_req", "需求：测试环境报这个错，帮忙排查", root="om_img")
-        m["reply_to"] = "om_img"
-        self.b.handle(m)
+        hint = self.w.replies[-1]
+        self.assertIn("接着发「需求", hint["text"])
+        self.assertFalse(hint["in_thread"])  # 提示不开话题
+        self.b.handle(msg("om_req", "需求：测试环境报这个错，帮忙排查", root="om_img", reply_to="om_img"))
         create = [w for w in self.w.writes if w[1].endswith("/issues")][0]
         self.assertEqual(create[2]["title"], "测试环境报这个错，帮忙排查")
         self.assertIn("![img_v3_abc-1.jpg](/uploads/x/img_v3_abc-1.jpg)", create[2]["description"])
-        self.assertEqual(self.w.downloads, [("om_img", "img_v3_abc-1")])
-        self.assertEqual(self.state["threads"]["om_img"]["iid"], 8)  # 整个话题挂到新 issue
-        self.b.handle(msg("om_more", "补充：只在测试环境", root="om_img"))
+        self.assertEqual(len(self.w.downloads), 1)  # 待用图和被回复的图是同一张，只搬一次
+        self.assertEqual(self.state["thread_ids"], {"omt_om_req": "om_req"})
+        # 话题里的后续消息（root 可能指向图片）按 thread_id 找回 #8
+        self.b.handle(msg("om_more", "补充：只在测试环境", root="om_img", thread="omt_om_req"))
         self.assertEqual(self.w.writes[-1][2]["body"], "补充：只在测试环境\n\n_（来自飞书）_")
+        self.w.gitlab_comment(8, "看了，是权限问题")
+        self.b.poll_gitlab()
+        self.assertEqual(self.w.replies[-1]["to"], "om_req")  # Agent 回复和 issue 链接在同一个话题
+
+    def test_lone_image_is_attached_to_next_requirement_within_ten_minutes(self) -> None:
+        clock = [1_000_000.0]
+        self.b.now = lambda: clock[0]
+        self.b.handle(msg("om_img", "[Image: img_v3_a]"))
+        self.b.handle(msg("om_req", "需求：看下这个报错"))
+        desc = [w for w in self.w.writes if w[1].endswith("/issues")][-1][2]["description"]
+        self.assertIn("img_v3_a.jpg", desc)
+        self.b.handle(msg("om_img2", "[Image: img_v3_b]"))
+        clock[0] += 601
+        self.b.handle(msg("om_req2", "需求：另一件事"))
+        desc = [w for w in self.w.writes if w[1].endswith("/issues")][-1][2]["description"]
+        self.assertNotIn("img_v3_b", desc)
 
     def test_image_reply_in_linked_thread_becomes_comment_with_image(self) -> None:
         self.b.handle(msg("om_1", "需求：做个东西"))

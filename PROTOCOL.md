@@ -185,7 +185,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 问题：代码散落在 develop、各功能分支和临时回移分支里，issue 关闭后没人说得清哪些代码能上线、哪些还没合。规则：**每个根 issue 有且只有一个远端汇总分支，名为 `release-<根 issue 编号>`（如 `release-403`），它就是这个需求“已验收、可上线”代码的唯一出处。**
 
 - **根 issue**：交付的最上层 issue。复杂路径是 spec issue；简单/中等路径是那个唯一的 issue；GitLab 收件箱的发起 issue 本身是根。子、孙 issue 没有自己的汇总分支，一律汇入根的分支。
-- **何时创建**：scheduler 在第一次派 dev 前创建，基于 `origin/main`（当前线上代码）：`git push origin origin/main:refs/heads/release-<编号>`，回读 `git ls-remote origin release-<编号>` 确认存在，把分支名、基线 SHA 写入根 issue 评论与 STATE。已存在时复用，不重建、不改名、不 force push。同一时机按「issue 数量与进度标签」在根 issue 描述末尾建好调度者维护区（「进度」与「上线清单」两段），不另建上线清单 issue。
+- **何时创建**：scheduler 在第一次派 dev 前创建，基于 `origin/main`（当前线上代码）：`git push origin origin/main:refs/heads/release-<编号>`，回读 `git ls-remote origin release-<编号>` 确认存在，把分支名、基线 SHA 写入根 issue 评论与 STATE。已存在时复用，不重建、不改名、不 force push。同一时机按「issue 数量与进度标签」在根 issue 描述最上面建好调度者维护区（「进度」与「上线清单」两段），不另建上线清单 issue。
 - **开发分支**：每个根/子/孙 issue 的开发分支都从 `release-<根编号>` 的最新提交切出，命名 `feat|fix/issue-<本 issue 编号>-<简述>`；不得从 develop 切出（否则会把 develop 上其他未上线的代码带进来）。基于 main 缺少依赖代码时，dev 停下报告 scheduler，由 arch 判定是把依赖的那个 issue 一并纳入本根，还是向用户确认，不得私自整段合入 develop。
 - **合并顺序（2026-10-25 用户指示）**：某个 issue 通过 §7 代码评审（含 arch 放行）和 §8 自动化测试后：① scheduler 先提 MR 把该 issue 的开发分支合入 **develop**（可立即合并），等 develop 流水线部署成功后在测试环境冒烟（见 §9）；② 冒烟通过后，再提 MR 把**同一个开发分支**合入 `release-<根编号>`：回读目标分支、源 SHA 与 diff，确认源 SHA 与合入 develop、冒烟通过的是同一个 SHA，diff 只含本 issue 改动后立即合并，回读 `release-<根编号>` 已包含该 SHA。冒烟不通过或冒烟后又改了代码的，回到 dev 修复并重走评审、测试、develop、冒烟，不得把未冒烟的 SHA 合入汇总分支。禁止把 develop 合入 `release-<根编号>`。develop 只是测试环境，不作为“可上线”的依据。
 - **不进汇总分支的情况**：issue 最终不上线（被替代、作废、只在 develop 做实验）时，必须在根 issue 写明原因并取得用户确认，不得默认“只进 develop”。
@@ -523,11 +523,10 @@ scheduler 回收实际输出并核验：每条验收有运行证据、测试 HEA
 
 **3. 根 issue 维护区（进度 + 上线清单）**
 
-第一次派 dev 前，scheduler 在根 issue 描述**末尾**追加维护区；用户写的原文一字不改，只改维护区。格式：
+第一次派 dev 前，scheduler 在根 issue 描述**最上面**插入维护区（2026-11-02 用户指示：放在末尾要翻过整段需求描述才看得到上线清单，不能一目了然）；用户写的原文一字不改、整体放在维护区下面，只改维护区。已有维护区在末尾的根 issue，下次更新时整块挪到最上面。格式：
 
 ```markdown
 <!-- hwf:start 以下由交付流程维护 -->
----
 ## 进度
 - [x] 1. 积分接口接入（已在 release-432）
 - [ ] 2. 积分明细页改版　Blocked by 1
@@ -536,6 +535,8 @@ scheduler 回收实际输出并核验：每条验收有运行证据、测试 HEA
 ## 上线清单
 | 仓库 | release 分支 | 改了什么 | 有没有数据库改动 |
 | --- | --- | --- | --- |
+
+---
 <!-- hwf:end -->
 ```
 
@@ -597,7 +598,7 @@ scheduler 回收实际输出并核验：每条验收有运行证据、测试 HEA
 
 ### 上线清单（2026-10-25 统一维护；2026-10-28 改为三列表格；2026-10-31 加「release 分支」列、仓库写成项目首页链接；2026-11-02 用户指示改回写在根 issue 描述里，不再单独建 issue）
 
-**上线清单写在根 issue 描述维护区的 `## 上线清单` 段落里，不单独建上线清单 issue；子 issue 不写上线清单。** 由 scheduler 维护：
+**上线清单写在根 issue 描述最上面维护区的 `## 上线清单` 段落里，不单独建上线清单 issue；子 issue 不写上线清单。** 由 scheduler 维护：
 
 - **何时建**：与 `release-<根编号>` 同一时机（第一次派 dev 前），随维护区一起建好表头。
 - **回读**：每次修改后回读根 issue 描述，确认表格已写入、用户原文没有变。

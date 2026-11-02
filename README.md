@@ -44,19 +44,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 群里使用时，每句话（包括话题里的回复）都要 @机器人，它才收得到；私聊不用。
 
-每人一套（每人一个飞书自建应用，桥跑在自己电脑上）：
-
-1. 在飞书开放平台建自建应用并开启机器人；权限开 `im:message.p2p_msg:readonly`、`im:message.group_at_msg:readonly`、`im:message:send_as_bot`；事件订阅选「长连接」并添加 `im.message.receive_v1`；发布版本。
-2. 本机 `lark-cli config init` 填这个应用（只用机器人身份，不用 `auth login`）。
-3. 在 GitLab 建一个**你本人账号**的个人访问令牌（权限 `api`），在自己的终端存进钥匙串（不要贴进聊天）：
-   `security add-generic-password -s hwf-feishu-bridge -a <你的 GitLab 用户名> -w`
-   之所以要本人令牌：收件箱只认白名单里的人，用 Agent 账号发的评论会被当成 Agent 自己说的话跳过。
-4. 写 `~/.hwf/feishu-bridge.local.json`（不入库；`users` 的 open_id 是你在这个应用下的 ID，先给机器人发一句话，在桥的日志或 `lark-cli event consume` 里能看到）：
-   ```json
-   {"default_project": "<组>/<项目>", "users": {"ou_xxx": "<你的 GitLab 用户名>"},
-    "gitlab_token_keychain": {"service": "hwf-feishu-bridge", "account": "<你的 GitLab 用户名>"}}
-   ```
-5. `python3 ~/.hwf/scripts/feishu-bridge.py --check` 全部有值即可；然后常驻在一个 Herdr 窗格里：`python3 ~/.hwf/scripts/feishu-bridge.py`。
+每人接一套：用 lark-cli 建好机器人应用、存一个本人 GitLab 令牌、写本机配置 `~/.hwf/feishu-bridge.local.json`，然后在一个 Herdr 窗格里常驻 `python3 ~/.hwf/scripts/feishu-bridge.py`。完整步骤、用法和排查见 Wiki [飞书接入](https://git.bootingai.net/ai-hub/skills/workflow/team-up/-/wikis/飞书接入)。
 
 ## 怎么改
 

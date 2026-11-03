@@ -170,6 +170,12 @@ class BridgeTest(unittest.TestCase):
         self.b.poll_gitlab()
         self.assertFalse(any("很早的评论" in r["text"] for r in self.w.replies))
 
+    def test_demand_prefix_with_existing_link_binds_instead_of_creating(self) -> None:
+        self.b.handle(msg("om_1", "需求：https://git.example.com/frontend/web-v1/-/work_items/7，处理这个 issue，只做前端"))
+        self.assertFalse(any(w[1] == "projects/frontend/web-v1/issues" for w in self.w.writes))
+        self.assertEqual(self.state["threads"]["om_1"]["iid"], 7)
+        self.assertEqual(self.w.writes[-1][2]["body"], "@pjhagent 处理这个 issue，只做前端\n\n_（来自飞书）_")
+
     def test_gitlab_comments_flow_back_once_without_echo(self) -> None:
         self.b.handle(msg("om_1", "需求：做个东西"))
         self.b.handle(msg("om_2", "补充一句", root="om_1"))  # 桥自己发的评论

@@ -63,7 +63,8 @@ CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
 IMAGE_KEY_RE = re.compile(r"\[Image: (img_[^\]\s]+)\]")  # 飞书把图片渲染成「[Image: img_xxx]」
 PENDING_IMAGE_S = 600  # 单独发的图在这段时间内会自动带进下一条「需求：」/「#编号」
 IMAGE_HINT = "收到图片。10 分钟内接着发「需求：<要做的事>」或「#编号」，我会把图一起带上。"
-BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)\S*)\s*")
+# 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉
+BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*")
 HELP_TEXT = (
     "用法：\n"
     "1. 发「需求：<要做的事>」→ 我在 GitLab 建 issue，Agent 先分析，结论会回到这条消息的话题里\n"
@@ -236,9 +237,11 @@ class Bridge:
             self.follow_up(linked, msg, text)
             return
         # 引用回复（主对话里的「回复 xxx」）不算话题，按普通消息处理；真在话题里但还没关联的，发「需求：」也认
-        m = BIND_RE.match(text)
+        # 「需求：」后面紧跟已有 issue 的链接或 #编号，是让 Agent 处理那张单，关联它而不是新建
+        c = CREATE_RE.match(text)
+        m = BIND_RE.match(text[c.end():] if c else text)
         if m:
-            self.bind(mid, chat, int(m.group(1) or m.group(2)), text[m.end():].strip(), user, msg)
+            self.bind(mid, chat, int(m.group(1) or m.group(2)), m.string[m.end():].strip(), user, msg)
             return
         m = CREATE_RE.match(text)
         if m and text[m.end():].strip():

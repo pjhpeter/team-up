@@ -4,3 +4,8 @@
 compaction:
   thresholdTokens: 200000
   keepRecentTokens: 30000
+
+# 2026-11-03 用户指示：调度者不在终端弹提问框（ask 工具）。弹框会让调度者停在 blocked，用户不在电脑旁时
+# 在飞书/GitLab 里答不了；需要用户拍板时按 PROTOCOL「需要用户确认」发评论列编号选项，结束回合等答复。
+ask:
+  enabled: false

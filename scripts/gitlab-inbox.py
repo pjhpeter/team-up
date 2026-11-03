@@ -526,7 +526,8 @@ class Inbox:
             _, pane = self.owner(origin["repo"], url)
             if pane:
                 self.prompt(pane, f"[GitLab 收件箱] 用户已关闭发起 issue {url}：把 INDEX 中该任务状态改为 "
-                                  "closed（若还不是收尾状态），停止推进并完成收尾。")
+                                  "closed（若还不是收尾状态），停止推进，并按 ~/.hwf/PROTOCOL.md §9「成员收尾与收尾回执」"
+                                  "关闭测试服务、成员 pane 与 worktree，在发起 issue 发收尾回执。")
             closed: dict[str, Any] = self.state["closed_origins"]
             closed[url] = self.state["origins"].pop(url)  # 保留水位：用户重开后接着处理关闭后的评论。
             for stale in list(closed)[:-CLOSED_CAP]:

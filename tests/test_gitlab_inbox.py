@@ -62,6 +62,9 @@ class FakeWorld:
         self.issue_queries: list[str] = []
         self.reset_rc = 0
         self.agent_status = "working"  # herdr agent get 返回的调度者状态
+        self.screen = ""  # herdr agent read 返回的屏幕
+        self.keys: list[list[str]] = []  # 每次 send-keys 发的键
+        self.after_keys: str | None = "working"  # 按键后调度者变成的状态（None = 不变）
         self.resets: list[str] = []
         self.comments: list[str] = []
         self.launched: list[str] = []
@@ -114,6 +117,12 @@ class FakeWorld:
         elif argv[:3] == ["herdr", "agent", "prompt"]:
             rc = self.prompt_rc
             self.prompts.append(argv[4])
+        elif argv[:3] == ["herdr", "agent", "read"]:
+            out = self.screen
+        elif argv[:3] == ["herdr", "agent", "send-keys"]:
+            self.keys.append(argv[4:])
+            if self.after_keys is not None:
+                self.agent_status = self.after_keys
         return subprocess.CompletedProcess(argv, rc, out if rc == 0 else "", out if rc else "")
 
 
@@ -579,6 +588,146 @@ class InboxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# 2026-11-03 #452 调度者实际卡住的 omp 提问框（herdr agent read --source visible 截取）。
+OMP_ASK = """
+ ⎋ Asking how to unblock arch
+╭─ Ask ─────────────────────────────────────────────────────────────╮
+│ Claude Code 登录失效，arch 起不来。怎么继续？                       │
+├───────────────────────────────────────────────────────────────────┤
+│ ❯ ○ 我去 /login，完成后你重派 arch (Recommended)                   │
+│       你在任意终端执行 claude → 输入 /login 完成登录，回一句「好了」。 │
+│   ○ 换 omp + devin/claude-opus-5-5 顶上                            │
+│       我立刻用 omp 执行体起一个分析会话，不用你动终端。              │
+│   ○ 按额度降级用 jc-gpt/gpt-6-astra                                 │
+│       用 jc-gpt/gpt-6-astra + thinking medium 起新的独立会话。       │
+│   ○ Other (type your own)                                          │
+├───────────────────────────────────────────────────────────────────┤
+│ ⏎ select · n note · ↑/↓ move · ⎋ cancel · ⌥H hide                  │
+╰───────────────────────────────────────────────────────────────────╯
+"""
+
+CLAUDE_PERMISSION = """
+⏺ Bash(rm -rf build)
+╭──────────────────────────────────────────╮
+│ Bash command                             │
+│                                          │
+│   rm -rf build                           │
+│                                          │
+│ Do you want to proceed?                  │
+│   1. Yes                                 │
+│ ❯ 2. Yes, and don't ask again            │
+│   3. No, and tell Claude what to do differently (esc) │
+╰──────────────────────────────────────────╯
+"""
+
+
+class ParseDialogTest(unittest.TestCase):
+    def test_omp_ask_box(self) -> None:
+        dialog = INBOX.parse_dialog(OMP_ASK)
+        assert dialog is not None
+        self.assertEqual(dialog["question"], "Claude Code 登录失效，arch 起不来。怎么继续？")
+        self.assertEqual([o["label"] for o in dialog["options"]][:2],
+                         ["我去 /login，完成后你重派 arch (Recommended)", "换 omp + devin/claude-opus-5-5 顶上"])
+        self.assertIn("回一句「好了」", dialog["options"][0]["detail"])
+        self.assertEqual([o["typing"] for o in dialog["options"]], [False, False, False, True])
+        self.assertEqual(dialog["cursor"], 0)
+
+    def test_claude_numbered_prompt_tracks_cursor(self) -> None:
+        dialog = INBOX.parse_dialog(CLAUDE_PERMISSION)
+        assert dialog is not None
+        self.assertEqual(dialog["question"], "Do you want to proceed?")
+        self.assertEqual(len(dialog["options"]), 3)
+        self.assertEqual(dialog["cursor"], 1)
+        self.assertTrue(dialog["options"][2]["typing"])
+
+    def test_unreadable_screens_are_left_to_the_user(self) -> None:
+        self.assertIsNone(INBOX.parse_dialog("just some output\n"))
+        self.assertIsNone(INBOX.parse_dialog("Pick one\n❯ ○ only option\n"))
+        self.assertIsNone(INBOX.parse_dialog("Pick\n1. a\n3. b\n"))
+        self.assertIsNone(INBOX.parse_dialog("Pick\n❯ 1. [ ] a\n  2. [x] b\n"))
+
+
+class RemoteChoiceTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="hwf-inbox-")
+        patcher = patch.object(INBOX, "STATE_PATH", Path(tmp) / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.state = {"origins": {URL: {"project": "frontend/web-v1", "project_id": 10, "iid": 7,
+                                        "repo": REPO, "initiator": "pengjh", "last_note_id": 5}}}
+        self.world = FakeWorld([], notes=[note(5)])
+        self.world.agent_status = "blocked"
+        self.world.screen = OMP_ASK
+        self.inbox = make(self.world, self.state)
+        self.inbox.sleep = lambda _: None
+
+    def reply(self, note_id: int, body: str, author: str = "pengjh") -> None:
+        self.world.notes.append(note(note_id, author=author, body=body))
+        self.inbox.poll()
+
+    def test_blocked_dialog_is_posted_with_numbered_options_once(self) -> None:
+        self.inbox.poll()
+        self.inbox.poll()
+        self.assertEqual(len(self.world.comments), 1)
+        posted = self.world.comments[0]
+        self.assertIn("@pengjh", posted)
+        self.assertIn("1. 我去 /login", posted)
+        self.assertIn("4. Other (type your own)（要打字，只能到电脑上选）", posted)
+
+    def test_number_reply_from_feishu_presses_keys_and_reports(self) -> None:
+        self.inbox.poll()
+        self.reply(6, "3\n\n_（来自飞书）_")
+        self.assertEqual(self.world.keys, [["down", "down", "enter"]])
+        self.assertEqual(self.world.prompts, [])  # 数字是作答，不转交调度者
+        self.assertIn("已替你选了第 3 项", self.world.comments[-1])
+        self.assertNotIn("blocked_dialog", self.state["origins"][URL])
+        self.assertEqual(self.state["origins"][URL]["last_note_id"], 6)
+
+    def test_first_option_is_just_enter_and_words_are_accepted(self) -> None:
+        self.inbox.poll()
+        self.reply(6, "选 1")
+        self.assertEqual(self.world.keys, [["enter"]])
+
+    def test_changed_dialog_is_not_answered(self) -> None:
+        self.inbox.poll()
+        self.world.screen = OMP_ASK.replace("怎么继续？", "要重试吗？")
+        self.reply(6, "1")
+        self.assertEqual(self.world.keys, [])
+        self.assertIn("题目已经换了", self.world.comments[-1])
+        self.assertIn("要重试吗？", self.world.comments[-1])
+        self.reply(7, "2")  # 按新题目作答
+        self.assertEqual(self.world.keys, [["down", "enter"]])
+
+    def test_typing_option_and_out_of_range_are_refused(self) -> None:
+        self.inbox.poll()
+        self.reply(6, "4")
+        self.reply(7, "9")
+        self.assertEqual(self.world.keys, [])
+        self.assertIn("要打字回答", self.world.comments[-2])
+        self.assertIn("没有第 9 项", self.world.comments[-1])
+
+    def test_still_blocked_on_same_question_is_reported(self) -> None:
+        self.world.after_keys = None
+        self.inbox.poll()
+        self.reply(6, "2")
+        self.assertIn("可能没生效", self.world.comments[-1])
+
+    def test_number_after_scheduler_moved_on_presses_nothing(self) -> None:
+        self.inbox.poll()
+        self.world.agent_status = "working"
+        self.world.notes.append(note(6, body="1"))
+        self.inbox.handle_note(URL, REPO, self.world.notes[-1], self.state["origins"][URL])
+        self.assertEqual(self.world.keys, [])
+        self.assertIn("已经不在选择界面", self.world.comments[-1])
+
+    def test_unreadable_blocked_screen_keeps_old_reminder(self) -> None:
+        self.world.screen = "Allow tool? weird ui"
+        self.inbox.poll()
+        self.reply(6, "1")
+        self.assertEqual(self.world.keys, [])
+        self.assertIn("请到电脑上打开它的窗口处理", self.world.comments[0])
 
 
 class LoadConfigTest(unittest.TestCase):

@@ -23,6 +23,8 @@
      评论正文只有 `/new` 或 `/clear` 时是清空指令：收件箱让该调度者开新会话，再让它按 INDEX/STATE 接续本任务。
      任何 issue 里只有 `/status` 的评论由收件箱直接回复进度，不打扰调度者。
   每条转交的评论都会立即得到回执（转给谁、它在不在干活、在做什么）；调度者卡在确认界面时在发起 issue @发起人一次。
+  卡住时能读出界面上的单选题，就把题目和编号选项贴出来；发起人回复一个数字（如 `1`、`选 2`），收件箱核对界面
+  没变后替他按键选中，并回帖结果（2026-11-03 用户指示：不在电脑旁也能在飞书里作答）。
   3. 任意 issue 里 @本账号 的评论 → 转交调度者。
   4. 本账号参与的其他 issue 的新评论（不要求 @）→ 转交调度者。参与 = 本账号建的 issue（交付拆出的子 issue
      等），或用户在里面 @ 过本账号的 issue。用户常直接在 Agent 的评论下回复而忘了 @（2026-10-27 #422）。
@@ -78,6 +80,14 @@ STATUS_RECORD_CAP = 160  # 进度回复里 INDEX 状态的最大字数，详细�
 TITLE_PREFIX = re.compile(r"^[π\s>\u2800-\u28ff]+")  # omp 标题前缀与转圈字符，如 "π ⠹ " / "π > "
 # 发起 issue 描述里指定调度者参数的行：`/model jc-gpt/gpt-6.1-sol`、`/thinking high`（2026-10-22 用户指示）。
 PARAM_LINE = re.compile(r"^\s*/(model|thinking)\s+(\S+)\s*$", re.IGNORECASE)
+# 卡住界面的单选题：选项行是「编号.」或「○ ●」开头，光标行前有「❯」等标记；外框「│」先去掉。
+DIALOG_OPTION = re.compile(r"^(?P<cursor>[❯›▸➤>]\s*)?(?:(?P<num>\d{1,2})[.)]|[○●◯◉])\s+(?P<label>\S.*?)\s*$")
+DIALOG_CHECKBOX = re.compile(r"^(?:[❯›▸➤>]\s*)?(?:\d{1,2}[.)]\s*)?(?:[☐☑☒]|\[[ xX✓✔]\])\s")  # 多选题，不远程作答
+DIALOG_RULE = re.compile(r"^[─━═├┤╭╮╰╯┌┐└┘]")  # 分隔线、外框的上下边（可带标题，如「╭─ Ask ─╮」）
+DIALOG_TYPING = re.compile(r"type your own|type something|tell claude what to do|自己输入|其他.*输入", re.IGNORECASE)
+CHOICE_REPLY = re.compile(r"^(?:选(?:择)?\s*)?(?:第\s*)?(\d{1,2})\s*(?:项|个)?$")
+FEISHU_SUFFIX = "_（来自飞书）_"
+CHOICE_SETTLE_S = 3  # 按键后等界面刷新再读屏核对
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")  # omp --thinking 可选值
 
 
@@ -103,6 +113,7 @@ class Inbox:
         state.setdefault("bad_params_notified", [])  # 已提示过模型参数写错的 issue，避免每轮重复评论
         state.setdefault("followed", {})     # 用户 @ 过本账号的 issue URL → {project, iid}
         self.run = run
+        self.sleep: Callable[[float], None] = time.sleep
         self.me: str = ""
 
     # ---- 外部命令 ----
@@ -324,6 +335,10 @@ class Inbox:
         if self.is_command(note["body"], STATUS_COMMANDS):
             self.comment(where, f"@{note['author']['username']} {self.status_text(repo, url)}")
             return True
+        if origin is not None and origin.get("blocked_dialog") and note["author"]["username"] == origin["initiator"]:
+            number = self.choice_of(note["body"])
+            if number is not None:
+                return self.handle_choice(url, origin, note, number)
         words = self.words(note["body"])
         if words and words[0].lower() in GO_COMMANDS:
             return self.handle_go(url, repo, note, where)
@@ -522,20 +537,104 @@ class Inbox:
         self.watch_blocked(url, origin)
 
     def watch_blocked(self, url: str, origin: dict[str, Any]) -> None:
-        """调度者卡在审批/提问界面时，它自己无法发评论，由收件箱在发起 issue @发起人一次。
+        """调度者卡在审批/提问界面时，它自己无法发评论，由收件箱在发起 issue @发起人。
 
-        同一次卡住只提醒一次（origin["blocked_notified"]）；恢复后清除，下次卡住再提醒。
+        读得出单选题就贴出题目和编号选项，发起人回数字即可远程作答；题目换了（同一次卡住里出了下一题）再贴一次。
+        读不出就只提醒一次去电脑上处理。恢复后清除，下次卡住再提醒。
         """
         _, pane = self.owner(origin["repo"], url)
         status = self.agent_state(pane)[0] if pane else ""
-        if status == "blocked" and not origin.get("blocked_notified"):
+        if status != "blocked":
+            if origin.get("blocked_notified") or origin.get("blocked_dialog"):
+                origin["blocked_notified"] = False
+                origin.pop("blocked_dialog", None)
+                save_state(self.state)
+            return
+        dialog = parse_dialog(self.read_screen(pane)) if pane else None
+        if dialog is not None:
+            known = origin.get("blocked_dialog") or {}
+            if known.get("fingerprint") != dialog["fingerprint"]:
+                self.comment(origin, f"@{origin['initiator']} ⚠️ 调度者在等你选择，选好之前它收不到新评论。\n\n"
+                                     + self.dialog_text(dialog))
+                origin["blocked_dialog"] = dialog
+                origin["blocked_notified"] = True
+                save_state(self.state)
+            return
+        if not origin.get("blocked_notified"):
             self.comment(origin, f"@{origin['initiator']} ⚠️ 调度者停在一个需要人工确认的界面，自己没法继续，"
                                  "也收不到新评论。请到电脑上打开它的窗口处理。")
             origin["blocked_notified"] = True
             save_state(self.state)
-        elif status != "blocked" and origin.get("blocked_notified"):
-            origin["blocked_notified"] = False
+
+    @staticmethod
+    def dialog_text(dialog: Mapping[str, Any]) -> str:
+        lines = [f"**{dialog['question']}**", ""] if dialog["question"] else []
+        for i, option in enumerate(dialog["options"], 1):
+            typing = "（要打字，只能到电脑上选）" if option["typing"] else ""
+            lines.append(f"{i}. {option['label']}{typing}")
+            if option["detail"]:
+                lines.append(f"   {option['detail']}")
+        lines += ["", "直接回复编号（例如 `1`）就会替你选上。"]
+        return "\n".join(lines)
+
+    def read_screen(self, pane: str) -> str:
+        result = self._exec(["herdr", "agent", "read", pane, "--source", "visible"])
+        return result.stdout if result.returncode == 0 else ""
+
+    def choice_of(self, body: str) -> int | None:
+        """评论是不是「选第几项」：只有一个数字（可带「选」「第」「项」，可带 @本账号 与飞书来源尾巴）。"""
+        text = " ".join(self.words(body.replace(FEISHU_SUFFIX, "")))
+        match = CHOICE_REPLY.match(text.strip())
+        return int(match.group(1)) if match else None
+
+    def handle_choice(self, url: str, origin: dict[str, Any], note: Mapping[str, Any], number: int) -> bool:
+        """发起人回数字：核对调度者仍卡在同一道题，再按方向键移到该项并回车；结果回帖。不重试按键。"""
+        user = note["author"]["username"]
+        _, pane = self.owner(origin["repo"], url)
+        if not pane or self.agent_state(pane)[0] != "blocked":
+            origin.pop("blocked_dialog", None)
             save_state(self.state)
+            self.comment(origin, f"@{user} 调度者已经不在选择界面了，这次没有按键。要它做什么请直接说。")
+            return True
+        dialog = parse_dialog(self.read_screen(pane))
+        known = origin.get("blocked_dialog") or {}
+        if dialog is None or dialog["fingerprint"] != known.get("fingerprint"):
+            if dialog is None:
+                self.comment(origin, f"@{user} 界面变了，读不出选项，这次没有按键。请到电脑上处理。")
+                origin.pop("blocked_dialog", None)
+            else:
+                self.comment(origin, f"@{user} 界面上的题目已经换了，这次没有按键。新的题目：\n\n" + self.dialog_text(dialog))
+                origin["blocked_dialog"] = dialog
+            origin["blocked_notified"] = True
+            save_state(self.state)
+            return True
+        options = dialog["options"]
+        if not 1 <= number <= len(options):
+            self.comment(origin, f"@{user} 没有第 {number} 项，请回复 1 到 {len(options)} 之间的数字。")
+            return True
+        option = options[number - 1]
+        if option["typing"]:
+            self.comment(origin, f"@{user} 「{option['label']}」要打字回答，只能到电脑上选。")
+            return True
+        steps = number - 1 - dialog["cursor"]
+        keys = ["down"] * steps if steps > 0 else ["up"] * -steps
+        result = self._exec(["herdr", "agent", "send-keys", pane, *keys, "enter"])
+        if result.returncode != 0:
+            log(f"send-keys to {pane} failed: {result.stderr.strip()}")
+            self.comment(origin, f"@{user} 按键没发出去（{result.stderr.strip()[:100]}），请到电脑上选。")
+            return True
+        log(f"{url}: chose option {number} for {user} on {pane}")
+        self.sleep(CHOICE_SETTLE_S)
+        still = self.agent_state(pane)[0] == "blocked" and (parse_dialog(self.read_screen(pane)) or {}).get(
+            "fingerprint") == dialog["fingerprint"]
+        if still:
+            self.comment(origin, f"@{user} 已按第 {number} 项「{option['label']}」，但界面还停在这道题上，"
+                                 "可能没生效，请到电脑上看看。")
+            return True
+        origin.pop("blocked_dialog", None)
+        save_state(self.state)
+        self.comment(origin, f"@{user} 已替你选了第 {number} 项：{option['label']}。")
+        return True
 
     # ---- 一轮 ----
 
@@ -558,6 +657,51 @@ class Inbox:
         for url, origin in list(self.state["origins"].items()):
             self.poll_origin(url, origin)
         self.poll_followed()
+
+
+def parse_dialog(screen: str) -> dict[str, Any] | None:
+    """从屏幕文字读出最下面那道单选题：{question, options[{label, detail, typing}], cursor, fingerprint}。
+
+    认 omp 的 Ask 框（「○」选项、外框「│」）和 Claude Code 的编号选项（「1. Yes」）；光标行带「❯」。
+    读不出、少于两个选项、编号不连续或是多选题时返回 None，交给人到电脑上处理，不猜。
+    """
+    lines = [line.strip().strip("│┃").strip() for line in screen.splitlines()]
+    last = next((i for i in range(len(lines) - 1, -1, -1) if DIALOG_OPTION.match(lines[i])), None)
+    if last is None:
+        return None
+    start = last  # 往上找到这一组的顶：遇到空行或分隔线为止
+    while start > 0 and lines[start - 1] and not DIALOG_RULE.match(lines[start - 1]):
+        start -= 1
+    block = lines[start:last + 1]
+    if any(DIALOG_CHECKBOX.match(line) for line in block):
+        return None
+    first = next(i for i, line in enumerate(block) if DIALOG_OPTION.match(line))
+    question = block[:first]
+    if not question:  # omp：题目在分隔线上面
+        top = start - 1
+        while top > 0 and lines[top] and DIALOG_RULE.match(lines[top]):
+            top -= 1
+        while top >= 0 and lines[top] and not DIALOG_RULE.match(lines[top]) and len(question) < 4:
+            question.insert(0, lines[top])
+            top -= 1
+    options: list[dict[str, Any]] = []
+    cursor, numbers = 0, []
+    for line in block[first:]:
+        match = DIALOG_OPTION.match(line)
+        if match:
+            if match.group("cursor"):
+                cursor = len(options)
+            if match.group("num"):
+                numbers.append(int(match.group("num")))
+            label = match.group("label")
+            options.append({"label": label, "detail": "", "typing": bool(DIALOG_TYPING.search(label))})
+        else:
+            options[-1]["detail"] = f"{options[-1]['detail']} {line}".strip()
+    if len(options) < 2 or (numbers and numbers != list(range(1, len(options) + 1))):
+        return None
+    text = " ".join(question)
+    fingerprint = json.dumps([text, [o["label"] for o in options]], ensure_ascii=False)
+    return {"question": text, "options": options, "cursor": cursor, "fingerprint": fingerprint}
 
 
 def parse_time(text: str) -> float:

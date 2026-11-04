@@ -33,11 +33,13 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timedelta
+import html
 import json
 import os
 from pathlib import Path
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -52,17 +54,25 @@ HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 CONFIG_PATH = HWF_HOME / "feishu-bridge.local.json"
 INBOX_CONFIG_PATH = HWF_HOME / "gitlab-inbox.config.json"
 STATE_PATH = HWF_HOME / "state" / "feishu-bridge.json"
-MEDIA_DIR = HWF_HOME / "state" / "feishu-media"  # 飞书图片下载的中转目录（lark-cli 只许写到当前目录下）
+MEDIA_DIR = HWF_HOME / "state" / "feishu-media"  # 飞书图片/文件下载的中转目录（lark-cli 只许写到当前目录下）
 
 CMD_TIMEOUT_S = 60
+TRANSFER_TIMEOUT_S = 300  # 下载/上传附件可能是几十 MB 的文件，单独放宽
 SEEN_CAP = 2000
 HELP_COOLDOWN_S = 600
 NOTE_RETRIES = 3  # 一条评论连续发送失败几次后改发 GitLab 链接
 FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
 CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
-IMAGE_KEY_RE = re.compile(r"\[Image: (img_[^\]\s]+)\]")  # 飞书把图片渲染成「[Image: img_xxx]」
-PENDING_IMAGE_S = 600  # 单独发的图在这段时间内会自动带进下一条「需求：」/「#编号」
-IMAGE_HINT = "收到图片。10 分钟内接着发「需求：<要做的事>」或「#编号」，我会把图一起带上。"
+# lark-cli 把消息里的附件渲染成这些标记（见 lark-im 文档 messages-resources-download）：
+#   图片：实时事件「[Image: img_xxx]」，历史记录「![Image](img_xxx)」→ 下载用 --type image
+#   文件/视频/音频：「<file key="file_xxx" name="a.zip"/>」「<video key=… name=…/>」「<audio key=… duration=…/>」→ --type file
+#   文件夹：「<folder key=… name=…>」里展开一层子文件（子项也是 <file …/>），文件夹标签本身只去掉不下载
+IMAGE_KEY_RE = re.compile(r"\[Image: (img_[^\]\s]+)\]|!\[Image\]\((img_[^)\s]+)\)")
+FILE_TAG_RE = re.compile(r"<(?:file|video|audio)\b[^>]*?\bkey=\"([^\"]+)\"[^>]*?/?>")
+NAME_ATTR_RE = re.compile(r"\bname=\"([^\"]*)\"")
+FOLDER_TAG_RE = re.compile(r"</?folder\b[^>]*>")
+PENDING_IMAGE_S = 600  # 单独发的图片/文件在这段时间内会自动带进下一条「需求：」/「#编号」
+IMAGE_HINT = "收到附件。10 分钟内接着发「需求：<要做的事>」或「#编号」，我会把它一起带上。"
 # 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉
 BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*")
 HELP_TEXT = (
@@ -100,6 +110,28 @@ def cap_list(items: list, cap: int = SEEN_CAP) -> list:
     return items[-cap:]
 
 
+def find_attachments(text: str) -> list[dict[str, str]]:
+    """按出现顺序列出消息里的附件：{key, kind: image|file, name}（图片没有文件名）。"""
+    found: list[tuple[int, dict[str, str]]] = []
+    for m in IMAGE_KEY_RE.finditer(text):
+        found.append((m.start(), {"key": m.group(1) or m.group(2), "kind": "image", "name": ""}))
+    for m in FILE_TAG_RE.finditer(text):
+        name = NAME_ATTR_RE.search(m.group(0))
+        found.append((m.start(), {"key": m.group(1), "kind": "file",
+                                  "name": html.unescape(name.group(1)) if name else ""}))
+    return [a for _, a in sorted(found, key=lambda x: x[0])]
+
+
+def strip_attachments(text: str) -> str:
+    return FOLDER_TAG_RE.sub("", FILE_TAG_RE.sub("", IMAGE_KEY_RE.sub("", text))).strip()
+
+
+def safe_filename(name: str, fallback: str) -> str:
+    """飞书里的文件名可能带路径分隔符或以点开头，落盘前只保留最后一段。"""
+    name = name.replace("\\", "/").split("/")[-1].strip().lstrip(".")
+    return name or fallback
+
+
 class Bridge:
     def __init__(self, config: dict[str, Any], state: dict[str, Any], run: Runner = subprocess.run,
                  user_token: str = "", now: Callable[[], float] = time.time,
@@ -120,12 +152,12 @@ class Bridge:
         state.setdefault("help_sent", {})    # chat_id → 上次发用法说明的时间戳（秒）
         state.setdefault("group_chats", [])  # 收到过群消息的 chat_id（补漏时群里只处理 @ 机器人的）
         state.setdefault("thread_ids", {})   # 飞书话题 thread_id → threads 的键（话题里任何一条消息都带 thread_id）
-        state.setdefault("pending_images", {})  # chat_id → [{mid, key, ts}] 单独发、还没用上的图
+        state.setdefault("pending_images", {})  # chat_id → [{mid, key, kind, name, ts}] 单独发、还没用上的图片/文件
 
     # ---------- 外部命令 ----------
     def sh(self, cmd: list[str], stdin: Optional[str] = None, env: Optional[dict] = None,
-           cwd: Optional[Path] = None) -> str:
-        r = self.run(cmd, input=stdin, capture_output=True, text=True, timeout=CMD_TIMEOUT_S, env=env, cwd=cwd)
+           cwd: Optional[Path] = None, timeout: int = CMD_TIMEOUT_S) -> str:
+        r = self.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
         if r.returncode != 0:
             raise BridgeError(f"{' '.join(cmd[:4])} 失败：{(r.stderr or r.stdout).strip()[:300]}")
         return r.stdout
@@ -143,8 +175,9 @@ class Bridge:
         out = self.sh(cmd, env=env)
         return json.loads(out) if out.strip() else None
 
-    def lark(self, args: list[str], stdin: Optional[str] = None, cwd: Optional[Path] = None) -> Any:
-        out = self.sh(["lark-cli", *args, "--as", "bot"], stdin=stdin, cwd=cwd)
+    def lark(self, args: list[str], stdin: Optional[str] = None, cwd: Optional[Path] = None,
+             timeout: int = CMD_TIMEOUT_S) -> Any:
+        out = self.sh(["lark-cli", *args, "--as", "bot"], stdin=stdin, cwd=cwd, timeout=timeout)
         data = json.loads(out) if out.strip() else {}
         if isinstance(data, dict) and data.get("ok") is False:
             raise BridgeError(f"lark-cli {args[:2]} 失败：{data.get('error')}")
@@ -161,54 +194,68 @@ class Bridge:
     def http_upload(self, project: str, path: Path) -> str:
         """以用户身份把文件传到 GitLab 项目附件（glab api 不支持上传文件），返回 Markdown。"""
         if not self.user_token:
-            raise BridgeError("没有用户 GitLab 令牌，不能上传图片")
+            raise BridgeError("没有用户 GitLab 令牌，不能上传附件")
         boundary = uuid.uuid4().hex
-        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{path.name}\"\r\n"
+        filename = path.name.replace('"', "'")
+        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n"
                 "Content-Type: application/octet-stream\r\n\r\n").encode() + path.read_bytes() + \
             f"\r\n--{boundary}--\r\n".encode()
         req = urllib.request.Request(
             f"https://{self.host}/api/v4/projects/{quote(project, safe='')}/uploads", data=body, method="POST",
             headers={"PRIVATE-TOKEN": self.user_token, "Content-Type": f"multipart/form-data; boundary={boundary}"})
         try:
-            with urllib.request.urlopen(req, timeout=CMD_TIMEOUT_S) as r:
+            with urllib.request.urlopen(req, timeout=TRANSFER_TIMEOUT_S) as r:
                 return json.loads(r.read())["markdown"]
         except (OSError, ValueError, KeyError) as e:
-            raise BridgeError(f"上传图片失败：{e}") from e
+            raise BridgeError(f"上传附件失败：{e}") from e
 
-    def take_pending_images(self, chat: str) -> list[tuple[str, list[str]]]:
+    def take_pending_images(self, chat: str) -> list[tuple[str, list[dict[str, str]]]]:
+        """取出这个会话里 10 分钟内单独发的附件（图片或文件）。旧状态里只有图片，没有 kind。"""
         fresh = [p for p in self.state["pending_images"].pop(chat, []) if self.now() - p["ts"] <= PENDING_IMAGE_S]
-        return [(p["mid"], [p["key"]]) for p in fresh]
+        return [(p["mid"], [{"key": p["key"], "kind": p.get("kind", "image"), "name": p.get("name", "")}])
+                for p in fresh]
 
     def images_markdown(self, msg: dict[str, Any], project: str,
-                        extra: Optional[list[tuple[str, list[str]]]] = None) -> str:
-        """把这条消息、它所回复的那条消息、以及之前单独发的图搬到 GitLab，返回要附在正文后的 Markdown。"""
-        sources = [(msg["message_id"], IMAGE_KEY_RE.findall(msg.get("content") or ""))] + (extra or [])
-        parent = msg.get("reply_to") or ""
-        if parent and parent != msg["message_id"]:
+                        extra: Optional[list[tuple[str, list[dict[str, str]]]]] = None) -> str:
+        """把这条消息、它所回复的消息、话题根消息、以及之前单独发的图片和文件搬到 GitLab，返回要附在正文后的 Markdown。"""
+        sources = [(msg["message_id"], find_attachments(msg.get("content") or ""))] + (extra or [])
+        # 在文件下面「回复话题」时 root_id 是文件那条；引用回复时 reply_to 是被引用那条，两个都要看
+        for related in dict.fromkeys((msg.get("reply_to") or "", msg.get("root_id") or "")):
+            if not related or related == msg["message_id"]:
+                continue
             try:
-                items = (self.lark(["im", "+messages-mget", "--message-ids", parent]).get("data") or {}).get("messages")
-                sources.append((parent, IMAGE_KEY_RE.findall((items or [{}])[0].get("content") or "")))
+                items = (self.lark(["im", "+messages-mget", "--message-ids", related]).get("data") or {}).get("messages")
+                sources.append((related, find_attachments((items or [{}])[0].get("content") or "")))
             except BridgeError as e:
-                log(f"read parent {parent} failed: {e}")
-        self.media_dir.mkdir(parents=True, exist_ok=True)
+                log(f"read related {related} failed: {e}")
         parts, done = [], set()
-        for mid, keys in sources:
-            for key in keys:
-                if key in done:
+        for mid, items in sources:
+            for a in items:
+                if a["key"] in done:
                     continue
-                done.add(key)
-                try:
-                    data = self.lark(["im", "+messages-resources-download", "--message-id", mid, "--file-key", key,
-                                      "--type", "image", "--output", key], cwd=self.media_dir)
-                    path = Path((data.get("data") or {}).get("saved_path") or "")
-                    if not path.is_absolute():
-                        path = self.media_dir / path
-                    parts.append(self.upload(project, path))
-                    path.unlink(missing_ok=True)
-                except BridgeError as e:
-                    log(f"image {key} of {mid} failed: {e}")
-                    parts.append(f"_（有一张图片没搬过来：{e}）_")
+                done.add(a["key"])
+                parts.append(self.transfer(project, mid, a))
         return "\n\n".join(parts)
+
+    def transfer(self, project: str, mid: str, a: dict[str, str]) -> str:
+        """下载一个飞书附件再传到 GitLab；失败时返回一句说明，不影响建单/评论。"""
+        # 每个附件一个子目录，文件按原名落盘，GitLab 里显示的就是原文件名
+        workdir = self.media_dir / a["key"]
+        try:
+            workdir.mkdir(parents=True, exist_ok=True)
+            out = a["key"] if a["kind"] == "image" else safe_filename(a["name"], a["key"])
+            data = self.lark(["im", "+messages-resources-download", "--message-id", mid, "--file-key", a["key"],
+                              "--type", a["kind"], "--output", out], cwd=workdir, timeout=TRANSFER_TIMEOUT_S)
+            path = Path((data.get("data") or {}).get("saved_path") or "")
+            if not path.is_absolute():
+                path = workdir / path
+            return self.upload(project, path)
+        except BridgeError as e:
+            log(f"{a['kind']} {a['key']} of {mid} failed: {e}")
+            what = "张图片" if a["kind"] == "image" else f"个文件{'「' + a['name'] + '」' if a['name'] else ''}"
+            return f"_（有一{what}没搬过来：{e}）_"
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
 
     # ---------- 飞书 → GitLab ----------
     def handle(self, msg: dict[str, Any]) -> None:
@@ -250,11 +297,11 @@ class Bridge:
         if tid:
             self.reply(mid, "这条话题还没关联 issue。在这里发「需求：…」新建，或发「#编号」关联已有 issue。", f"orphan-{mid}")
             return
-        image_keys = IMAGE_KEY_RE.findall(text)
-        if image_keys and not self.strip_images(text):
-            # 单独发图：记下来等下一条需求带上；提示用引用回复，不开话题，免得多出一个空话题
+        attachments = find_attachments(text)
+        if attachments and not self.strip_images(text):
+            # 单独发图片/文件：记下来等下一条需求带上；提示用引用回复，不开话题，免得多出一个空话题
             self.state["pending_images"].setdefault(chat, []).extend(
-                {"mid": mid, "key": k, "ts": self.now()} for k in image_keys)
+                {"mid": mid, "ts": self.now(), **a} for a in attachments)
             self.reply(mid, IMAGE_HINT, f"img-hint-{mid}", in_thread=False)
             return
         last = self.state["help_sent"].get(chat, 0)
@@ -278,7 +325,7 @@ class Bridge:
 
     @staticmethod
     def strip_images(text: str) -> str:
-        return IMAGE_KEY_RE.sub("", text).strip()
+        return strip_attachments(text)
 
     def is_bot_mention(self, m: dict[str, Any]) -> bool:
         mid = m.get("id") or ""
@@ -307,7 +354,7 @@ class Bridge:
     def create(self, mid: str, chat: str, text: str, user: str, name: str,
                msg: Optional[dict[str, Any]] = None) -> None:
         images = self.images_markdown(msg, self.project, self.take_pending_images(chat)) if msg else ""
-        text = self.strip_images(text) or "（见图）"
+        text = self.strip_images(text) or "（见附件）"
         title = text.splitlines()[0].strip()
         title = title[:60] + ("…" if len(title) > 60 else "")
         agent_id = self.api(f"users?username={quote(self.agent)}")[0]["id"]
@@ -358,8 +405,8 @@ class Bridge:
         if text.startswith("/"):
             body = text
         else:
-            # 话题里的回复，回复对象就是话题内的消息，只搬这条自己带的图，不重复搬根消息的图
-            images = self.images_markdown({**msg, "reply_to": ""}, t["project"])
+            # 话题里的回复，回复对象就是话题内的消息，只搬这条自己带的附件，不重复搬根消息的
+            images = self.images_markdown({**msg, "reply_to": "", "root_id": ""}, t["project"])
             text = self.strip_images(text)
             body = "\n\n".join(x for x in (text, images) if x) + "\n\n_（来自飞书）_"
         if t.get("bound"):

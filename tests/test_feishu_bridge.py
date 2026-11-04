@@ -84,9 +84,11 @@ class World:
             mid, key = cmd[cmd.index("--message-id") + 1], cmd[cmd.index("--file-key") + 1]
             if key in self.broken_images:
                 return ok({"ok": False, "error": {"message": "resource gone"}})
-            out = Path(cwd) / f"{cmd[cmd.index('--output') + 1]}.jpg"
-            out.write_bytes(b"jpg")
-            self.downloads.append((mid, key))
+            name = cmd[cmd.index('--output') + 1]
+            kind = cmd[cmd.index("--type") + 1]
+            out = Path(cwd) / (f"{name}.jpg" if kind == "image" else name)  # 图片由 lark-cli 补扩展名
+            out.write_bytes(b"data")
+            self.downloads.append((mid, key) if kind == "image" else (mid, key, kind, name))
             return ok({"ok": True, "data": {"saved_path": str(out)}})
         if cmd[1:3] == ["im", "+messages-reply"]:
             to = cmd[cmd.index("--message-id") + 1]
@@ -333,6 +335,49 @@ class BridgeTest(unittest.TestCase):
         desc = [w for w in self.w.writes if w[1].endswith("/issues")][0][2]["description"]
         self.assertIn("没搬过来", desc)
         self.assertEqual(self.uploads, [])
+
+    def test_file_root_then_demand_in_its_thread_carries_the_file(self) -> None:
+        # 2026-11-04 实测（#459）：先单独发 zip，再在这条文件下面「回复话题」写「需求：…」，zip 曾被丢掉
+        zip_tag = '<file key="file_v3_00174_zip" name="历史面板 · 可交互-html.zip"/>'
+        self.w.messages["om_zip"] = zip_tag
+        self.b.handle(msg("om_zip", zip_tag))
+        hint = self.w.replies[-1]
+        self.assertIn("收到附件", hint["text"])
+        self.assertFalse(hint["in_thread"])
+        self.b.handle(msg("om_req", "需求：按照交互设计优化画布快照交互效果", root="om_zip", thread="omt_zip"))
+        create = [w for w in self.w.writes if w[1].endswith("/issues")][0]
+        self.assertEqual(create[2]["title"], "按照交互设计优化画布快照交互效果")
+        self.assertIn("历史面板 · 可交互-html.zip", create[2]["description"])
+        self.assertEqual(self.w.downloads, [("om_zip", "file_v3_00174_zip", "file", "历史面板 · 可交互-html.zip")])
+        self.assertEqual(self.uploads, [("frontend/web-v1", "历史面板 · 可交互-html.zip")])
+        self.assertEqual(list(self.b.media_dir.iterdir()), [])  # 中转文件搬完就删
+
+    def test_any_file_kind_in_thread_reply_becomes_comment(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        text = ('设计稿 <file key="file_a" name="a&amp;b.fig"/> 录屏 <video key="file_v" name="demo.mp4"/> '
+                '<audio key="file_s" duration="3s"/>')
+        self.b.handle(msg("om_2", text, root="om_1"))
+        body = self.w.writes[-1][2]["body"]
+        self.assertTrue(body.startswith("设计稿  录屏"))
+        self.assertNotIn("<file", body)
+        self.assertEqual([u[1] for u in self.uploads], ["a&b.fig", "demo.mp4", "file_s"])
+        self.assertEqual({d[2] for d in self.w.downloads}, {"file"})
+
+    def test_file_download_failure_names_the_file(self) -> None:
+        self.w.broken_images.add("file_bad")
+        self.b.handle(msg("om_1", '需求：看附件 <file key="file_bad" name="稿子.zip"/>'))
+        desc = [w for w in self.w.writes if w[1].endswith("/issues")][0][2]["description"]
+        self.assertIn("有一个文件「稿子.zip」没搬过来", desc)
+        self.assertTrue(desc.startswith("看附件"))
+
+    def test_attachment_parsing(self) -> None:
+        text = ('![Image](img_v3_h) <folder key="file_d" name="assets" child_count="1">'
+                '<file key="file_c" name="../x/.env"/></folder> [Image: img_v3_e]')
+        self.assertEqual([(a["key"], a["kind"]) for a in FB.find_attachments(text)],
+                         [("img_v3_h", "image"), ("file_c", "file"), ("img_v3_e", "image")])
+        self.assertEqual(FB.strip_attachments(text), "")
+        self.assertEqual(FB.safe_filename("../x/.env", "k"), "env")
+        self.assertEqual(FB.safe_filename("", "k"), "k")
 
     def test_history_normalization(self) -> None:
         item = {"message_id": "om_9", "chat_id": "oc_1", "content": "hi", "create_time": "2026-11-02 15:34",

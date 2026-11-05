@@ -157,7 +157,13 @@ class Bridge:
     # ---------- 外部命令 ----------
     def sh(self, cmd: list[str], stdin: Optional[str] = None, env: Optional[dict] = None,
            cwd: Optional[Path] = None, timeout: int = CMD_TIMEOUT_S) -> str:
-        r = self.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+        # 卡住或起不来和返回非 0 一样算一次普通失败：记日志、下一轮再试，不能让常驻进程退出
+        try:
+            r = self.run(cmd, input=stdin, capture_output=True, text=True, timeout=timeout, env=env, cwd=cwd)
+        except subprocess.TimeoutExpired as e:
+            raise BridgeError(f"{' '.join(cmd[:4])} 超时（{timeout} 秒没返回）") from e
+        except OSError as e:
+            raise BridgeError(f"{' '.join(cmd[:4])} 启动失败：{e}") from e
         if r.returncode != 0:
             raise BridgeError(f"{' '.join(cmd[:4])} 失败：{(r.stderr or r.stdout).strip()[:300]}")
         return r.stdout

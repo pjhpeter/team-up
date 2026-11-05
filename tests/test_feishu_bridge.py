@@ -206,6 +206,21 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("第一条", texts[0])
         self.assertIn("第二条", texts[1])
 
+    def test_stuck_or_missing_command_is_a_bridge_error_and_next_round_recovers(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.w.gitlab_comment(8, "卡住时写的评论")
+        before = len(self.w.replies)
+        real_run = self.b.run
+        for failure in (subprocess.TimeoutExpired(["glab"], FB.CMD_TIMEOUT_S), FileNotFoundError("glab")):
+            def broken(*_a, _e=failure, **_k):
+                raise _e
+            self.b.run = broken
+            with self.assertRaises(FB.BridgeError):  # 主循环只接 BridgeError 这类错误，不能让桥退出
+                self.b.poll_gitlab()
+        self.b.run = real_run
+        self.b.poll_gitlab()
+        self.assertIn("卡住时写的评论", self.w.replies[before]["text"])
+
     def test_note_that_keeps_failing_becomes_link_and_does_not_block(self) -> None:
         self.b.handle(msg("om_1", "需求：做个东西"))
         self.w.gitlab_comment(8, "飞书不收的内容")

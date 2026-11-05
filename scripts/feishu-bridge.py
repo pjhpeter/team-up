@@ -62,6 +62,7 @@ SEEN_CAP = 2000
 HELP_COOLDOWN_S = 600
 NOTE_RETRIES = 3  # 一条评论连续发送失败几次后改发 GitLab 链接
 FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
+FOLDED = re.compile(r"<details>.*?</details>", re.S)  # 评论里折叠的全文
 CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
 # lark-cli 把消息里的附件渲染成这些标记（见 lark-im 文档 messages-resources-download）：
 #   图片：实时事件「[Image: img_xxx]」，历史记录「![Image](img_xxx)」→ 下载用 --type image
@@ -492,6 +493,8 @@ class Bridge:
     def render_note(self, t: dict[str, Any], n: dict[str, Any]) -> str:
         body = (n.get("body") or "").strip()
         url = f"{self.issue_url(t['project'], t['iid'])}#note_{n['id']}"
+        # 飞书不认折叠标签，会把全文连同标签一起显示；这里只留摘要，全文给链接
+        body = FOLDED.sub(f"[查看完整内容]({url})", body)
         if len(body) > FEISHU_TEXT_CAP:
             body = body[:FEISHU_TEXT_CAP].rstrip() + f"\n\n…内容较长，全文见 [GitLab]({url})"
         who = n.get("author", {}).get("name") or n.get("author", {}).get("username", "?")

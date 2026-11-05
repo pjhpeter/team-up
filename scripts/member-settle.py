@@ -9,6 +9,7 @@
 <落盘文件>（如 reviews/plan-r1.md）优先写成员最后一条回复的原始 Markdown（从成员的会话记录取）。
 屏幕上的文字已被终端折行、去掉加粗和标题、表格变字符画，转贴到 GitLab 会很难看，所以只作退路；
 完整读屏另存到 <落盘文件>.screen。取不到原文时 <落盘文件> 退回读屏，并打印 format: screen 与原因。
+回复里有「## 给用户的摘要」时，另外生成 <落盘文件>.comment.md：摘要在前、完整内容折叠，直接当 issue 评论正文。
 终端只打印状态、结论行与末尾几行，调度者不必把成员输出抄进自己的上下文。
 状态为 blocked 时额外打印 detection 读屏，供调度者通知用户；本脚本不按任何键、不发 prompt。
 它只在后台 agent wait 返回后调用一次，不是轮询工具。
@@ -27,6 +28,9 @@ import time
 
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 VERDICT = re.compile(r"^\s*(通过|需修改|常规评审通过|预审完成|待澄清)\s*$")
+SUMMARY_HEAD = "## 给用户的摘要"
+FULL_HEAD = "## 完整内容"
+SUMMARY_MAX_LINES = 15
 
 
 def run(*args: str) -> str:
@@ -143,6 +147,28 @@ def read_reply(info: dict, screen: str) -> tuple[str | None, str]:
     return reply, path
 
 
+def text_lines(text: str) -> int:
+    return sum(1 for line in text.split("\n") if line.strip())
+
+
+def comment_body(reply: str) -> tuple[str | None, str]:
+    """把成员回复变成给用户的评论：摘要在前，完整内容折叠。返回 (评论正文, 说明)，不合要求时正文为 None。"""
+    lines = reply.strip().split("\n")
+    heads = [i for i, line in enumerate(lines) if line.strip() == SUMMARY_HEAD]
+    fulls = [i for i, line in enumerate(lines) if line.strip() == FULL_HEAD]
+    if heads and fulls and heads[0] < fulls[0]:
+        summary = "\n".join(lines[heads[0] + 1:fulls[0]]).strip()
+        full = "\n".join(lines[fulls[0] + 1:]).strip()
+        if not summary:
+            return None, "摘要是空的"
+        if text_lines(summary) > SUMMARY_MAX_LINES:
+            return None, f"摘要超过 {SUMMARY_MAX_LINES} 行"
+        return f"{summary}\n\n<details><summary>完整内容</summary>\n\n{full}\n\n</details>\n", "摘要 + 折叠全文"
+    if text_lines(reply) <= SUMMARY_MAX_LINES:
+        return reply.strip() + "\n", "回复够短，不用折叠"
+    return None, f"回复超过 {SUMMARY_MAX_LINES} 行，却没有「{SUMMARY_HEAD}」和「{FULL_HEAD}」两段"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("target")
@@ -179,6 +205,13 @@ def main() -> int:
     print(f"saved: {opts.outfile} ({result.count(chr(10))} lines)")
     if reply is not None:
         print(f"format: markdown（成员原文，来自 {source}）")
+        comment, why = comment_body(reply)
+        if comment is None:
+            print(f"comment: none（{why}）")
+        else:
+            with open(f"{opts.outfile}.comment.md", "w", encoding="utf-8") as handle:
+                handle.write(comment)
+            print(f"comment: {opts.outfile}.comment.md（{why}）")
     else:
         print(f"format: screen（屏幕文字，排版已损坏，转贴时要注明）| 原因：{source}")
     print(f"verdict line: {verdicts[-1] if verdicts else 'none'}")

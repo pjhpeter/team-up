@@ -75,6 +75,7 @@ PENDING_IMAGE_S = 600  # 单独发的图片/文件在这段时间内会自动带
 IMAGE_HINT = "收到附件。10 分钟内接着发「需求：<要做的事>」或「#编号」，我会把它一起带上。"
 # 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉
 BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*")
+FAILED_TEXT = "这条没处理成功，请重发。"
 HELP_TEXT = (
     "用法：\n"
     "1. 发「需求：<要做的事>」→ 我在 GitLab 建 issue，Agent 先分析，结论会回到这条消息的话题里\n"
@@ -270,6 +271,33 @@ class Bridge:
         if mid in self.state["seen"]:
             return
         self.state["seen"] = cap_list(self.state["seen"] + [mid])
+        pending = list(self.state["pending_images"].get(msg.get("chat_id", ""), []))
+        try:
+            self.dispatch(msg)
+        except Exception as e:  # 消息已记为处理过，不会自动重试，无论什么错都要让发消息的人知道
+            log(f"handle {mid} failed: {e!r}")
+            self.report_failure(msg, pending)
+
+    def report_failure(self, msg: dict[str, Any], pending: list[dict[str, Any]]) -> None:
+        """告诉发消息的人结果。话题已记录说明事情办成了，只是回帖失败，这时重发会多建一张单。"""
+        mid, chat = msg["message_id"], msg.get("chat_id", "")
+        t = self.state["threads"].get(mid)
+        if not t:  # 没办成：把单独发的附件放回去，重发时还能带上
+            if pending:
+                self.state["pending_images"][chat] = pending
+            else:
+                self.state["pending_images"].pop(chat, None)
+        if msg.get("sender_type") != "user" or msg.get("sender_id") not in self.users:
+            return
+        text = f"[#{t['iid']}]({self.issue_url(t['project'], t['iid'])}) 已经弄好了，不用重发。" if t else FAILED_TEXT
+        in_thread = bool(t or msg.get("root_id") or msg.get("thread_id"))
+        try:
+            self.reply(mid, text, f"failed-{mid}", in_thread=in_thread)
+        except (BridgeError, ValueError) as e:
+            log(f"tell failure of {mid} failed: {e}")
+
+    def dispatch(self, msg: dict[str, Any]) -> None:
+        mid = msg["message_id"]
         chat = msg.get("chat_id", "")
         if chat:
             self.state["chats"][chat] = max(int(msg.get("create_ms") or 0), self.state["chats"].get(chat, 0))
@@ -387,15 +415,16 @@ class Bridge:
             self.reply(mid, f"没找到 #{iid}（只能关联 {self.project} 里的 issue）。", f"bind-miss-{mid}")
             return
         notes = self.api(f"projects/{pid}/issues/{iid}/notes?sort=desc&per_page=1")
-        self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
-                                      "last_note": notes[0]["id"] if notes else 0,
-                                      "closed": issue["state"] == "closed", "bound": True}
         images = self.images_markdown(msg, self.project, self.take_pending_images(chat)) if msg else ""
         rest = self.strip_images(rest)
         if rest or images:
             # 已有 issue 未必在收件箱跟踪范围内，@Agent 保证转交。
             body = "\n\n".join(x for x in (rest, images) if x)
             self.note_as_user(self.project, iid, f"@{self.agent} {body}\n\n_（来自飞书）_")
+        # 评论发出去才算关联成功：失败时要用户重发，不能留一个半截的话题
+        self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
+                                      "last_note": notes[0]["id"] if notes else 0,
+                                      "closed": issue["state"] == "closed", "bound": True}
         self.reply(mid, f"已关联 [#{iid}]({self.issue_url(self.project, iid)})：{issue['title']}\n"
                         "之后在这个话题里回复会同步成评论，issue 里的新评论也会发到这里。", f"bound-{mid}")
         self.link_thread(mid, mid)

@@ -221,6 +221,87 @@ class BridgeTest(unittest.TestCase):
         self.b.poll_gitlab()
         self.assertIn("卡住时写的评论", self.w.replies[before]["text"])
 
+    def break_gitlab_writes(self):
+        """GitLab 写请求一律卡住；返回恢复函数。"""
+        real_run = self.b.run
+
+        def broken(cmd, **kwargs):
+            if cmd[0] == "glab" and "POST" in cmd:
+                raise subprocess.TimeoutExpired(cmd, FB.CMD_TIMEOUT_S)
+            return real_run(cmd, **kwargs)
+        self.b.run = broken
+        return lambda: setattr(self.b, "run", real_run)
+
+    def test_failed_create_asks_user_to_resend_and_keeps_pending_attachment(self) -> None:
+        self.b.handle(msg("om_img", "[Image: img_v3_abc-1]"))
+        before = len(self.w.replies)
+        restore = self.break_gitlab_writes()
+        self.b.handle(msg("om_req", "需求：做个东西"))
+        self.assertEqual(self.w.replies[before:], [{"to": "om_req", "text": FB.FAILED_TEXT, "in_thread": False,
+                                                    "key": "failed-om_req"}])
+        self.assertNotIn("om_req", self.state["threads"])
+        restore()
+        self.b.handle(msg("om_req2", "需求：做个东西"))  # 重发是新消息；之前单独发的图还在
+        self.assertEqual(self.state["threads"]["om_req2"]["iid"], 8)
+        self.assertEqual(self.uploads[-1][1], "img_v3_abc-1.jpg")
+
+    def test_failed_reply_after_issue_created_says_no_need_to_resend(self) -> None:
+        self.w.reply_failures = 1  # 单已建好，只是「已建」这条回帖没发出去
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.assertEqual(sum(1 for w in self.w.writes if w[1].endswith("/issues")), 1)
+        self.assertEqual(len(self.w.replies), 1)
+        self.assertIn("#8", self.w.replies[0]["text"])
+        self.assertIn("不用重发", self.w.replies[0]["text"])
+        self.assertNotIn(FB.FAILED_TEXT, self.w.replies[0]["text"])
+
+    def test_failed_bind_note_does_not_link_and_asks_to_resend(self) -> None:
+        restore = self.break_gitlab_writes()
+        self.b.handle(msg("om_1", "#7 帮忙看下"))
+        self.assertNotIn("om_1", self.state["threads"])
+        self.assertEqual(self.w.replies[-1]["text"], FB.FAILED_TEXT)
+        restore()
+        self.b.handle(msg("om_2", "#7 帮忙看下"))
+        self.assertEqual(self.state["threads"]["om_2"]["iid"], 7)
+        self.assertEqual(self.w.writes[-1][0:2], ("POST", "projects/frontend/web-v1/issues/7/notes"))
+
+    def test_failed_thread_reply_asks_to_resend_inside_the_thread(self) -> None:
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        restore = self.break_gitlab_writes()
+        self.b.handle(msg("om_2", "补充一句", root="om_1"))
+        restore()
+        self.assertEqual(self.w.replies[-1], {"to": "om_2", "text": FB.FAILED_TEXT, "in_thread": True,
+                                              "key": "failed-om_2"})
+
+    def test_failure_notice_failing_too_does_not_raise(self) -> None:
+        self.w.reply_failures = 2  # 飞书也发不出去
+        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.assertEqual(self.w.replies, [])
+        self.assertEqual(self.state["threads"]["om_1"]["iid"], 8)
+
+    def test_stranger_gets_no_resend_prompt(self) -> None:
+        self.w.reply_failures = 1
+        self.b.handle(msg("om_1", "需求：做个东西", sender="ou_stranger"))
+        self.assertEqual(self.w.replies, [])
+
+    def test_one_failed_message_does_not_stop_catch_up(self) -> None:
+        self.state["chats"]["oc_1"] = 1
+        self.w.history["oc_1"] = [
+            {"message_id": "om_a", "sender": {"id": ME, "sender_type": "user"}, "content": "需求：第一条", "create_time": "1"},
+            {"message_id": "om_b", "sender": {"id": ME, "sender_type": "user"}, "content": "需求：第二条", "create_time": "2"}]
+        real_run = self.b.run
+        calls = {"n": 0}
+
+        def first_post_stuck(cmd, **kwargs):
+            if cmd[0] == "glab" and "POST" in cmd:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise subprocess.TimeoutExpired(cmd, FB.CMD_TIMEOUT_S)
+            return real_run(cmd, **kwargs)
+        self.b.run = first_post_stuck
+        self.b.catch_up()
+        self.assertNotIn("om_a", self.state["threads"])
+        self.assertIn("om_b", self.state["threads"])
+
     def test_note_that_keeps_failing_becomes_link_and_does_not_block(self) -> None:
         self.b.handle(msg("om_1", "需求：做个东西"))
         self.w.gitlab_comment(8, "飞书不收的内容")

@@ -142,6 +142,16 @@ class BridgeTest(unittest.TestCase):
         self.uploads.append((project, path.name))
         return f"![{path.name}](/uploads/x/{path.name})"
 
+    def test_folded_full_text_becomes_link_in_feishu(self) -> None:
+        body = "能做，选 A。\n\n<details><summary>完整内容</summary>\n\n很长的全文\n\n</details>\n"
+        text = self.b.render_note({"project": "frontend/web-v1", "iid": 7},
+                                  {"id": 9, "body": body, "author": {"name": "agent"}})
+        self.assertIn("能做，选 A。", text)
+        self.assertNotIn("很长的全文", text)
+        self.assertNotIn("<details>", text)
+        self.assertIn("[查看完整内容](", text)
+        self.assertIn("#note_9", text)
+
     def test_create_issue_as_user_assigned_to_agent_and_reply_link(self) -> None:
         self.b.handle(msg("om_1", "需求：画布最近列表缺旧画布\n详细描述"))
         method, path, fields, as_user = self.w.writes[0]

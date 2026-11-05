@@ -102,6 +102,24 @@ class OnScreenTest(unittest.TestCase):
         self.assertTrue(SETTLE.on_screen("| a | b |\n|---|---|\n| 1 | 2 |", "┌──┐\n"))
 
 
+class CommentBodyTest(unittest.TestCase):
+    def test_summary_first_and_full_folded(self) -> None:
+        body, _ = SETTLE.comment_body("## 给用户的摘要\n\n能做，选 A。\n\n## 完整内容\n\n| a |\n|---|\n\n完成\n")
+        self.assertEqual(body, "能做，选 A。\n\n<details><summary>完整内容</summary>\n\n| a |\n|---|\n\n完成\n\n</details>\n")
+
+    def test_short_reply_used_as_is(self) -> None:
+        self.assertEqual(SETTLE.comment_body("一句话结论\n\n完成")[0], "一句话结论\n\n完成\n")
+
+    def test_long_reply_without_summary_is_refused(self) -> None:
+        body, why = SETTLE.comment_body("\n".join(f"第 {i} 行" for i in range(16)))
+        self.assertIsNone(body)
+        self.assertIn("给用户的摘要", why)
+
+    def test_too_long_summary_is_refused(self) -> None:
+        summary = "\n".join(f"第 {i} 行" for i in range(16))
+        self.assertIsNone(SETTLE.comment_body(f"## 给用户的摘要\n{summary}\n## 完整内容\n全文")[0])
+
+
 class MainTest(SessionCase):
     def settle(self, session: object, screen: str) -> tuple[str, Path]:
         info = {"agent_status": "idle"}
@@ -125,6 +143,7 @@ class MainTest(SessionCase):
         self.assertEqual(Path(f"{out}.screen").read_text(encoding="utf-8"), "⏺ 结论写在这一行\n通过\n")
         self.assertIn("format: markdown", printed)
         self.assertIn("verdict line: 通过", printed)
+        self.assertEqual(Path(f"{out}.comment.md").read_text(encoding="utf-8"), out.read_text(encoding="utf-8"))
 
     def test_falls_back_to_screen_and_says_why(self) -> None:
         for session in (None, {"agent": "omp", "kind": "path", "value": str(self.dir / "无")}):

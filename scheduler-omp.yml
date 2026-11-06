@@ -9,3 +9,8 @@ compaction:
 # 在飞书/GitLab 里答不了；需要用户拍板时按 PROTOCOL「需要用户确认」发评论列编号选项，结束回合等答复。
 ask:
   enabled: false
+
+# 2026-11-06 用户指示：调度者不得用子代理干活，活只派给 herdr 成员（见 PROTOCOL「角色与职责」）。
+# 这里停用 omp 自带的全部子代理；omp 升级新增子代理时要补进来（查看：omp agents unpack --dir <新目录>）。
+task:
+  disabledAgents: [reviewer, scout, seance, security-reviewer, sonic, task]

@@ -78,6 +78,8 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 **`scheduler` 绝对不得亲自做实际工作**（2026-10-21 用户指示）：方案编写、开发、测试、评审、取证、浏览器验收等成员职责范围内的工作，一律领取或创建对应角色并派活；scheduler 只做调度、阶段推进、任务记录、GitLab issue 管理、通知与验收，不得以“更快”“更省”“成员忙”或“顺手改一下”为由代做。除协议明确分配给 scheduler 的 spec、issue、任务记录和通知外，不得亲自产出交付物。
 
+**`scheduler` 绝对不得使用子代理（subagent）干活或监听**（2026-11-06 用户指示）：成员的工作只能派给 herdr 里的成员。调度者不得调用 `task`、`Agent`、`spawn_agent` 等任何子代理工具，也不得用 `omp -p`、`claude -p`、`codex exec` 等命令临时另起 Agent；取证、查资料、读源码、核对分支这类“小事”同样不例外。成员忙或没有合适角色时，按「调度者初始化与角色复用」新建成员，不得以任何理由改用子代理。等待成员只用后台 `herdr agent wait`，不用子代理监听。已经用了子代理：立刻停止，其结果不算交付物，不写入证据，重新派给对应成员，并在 STATE 记一笔。
+
 **`scheduler` 不固定模型与思考档**：按用户发起工作流时的当前会话模型运行，配置中不得写死 `--model` / `--thinking`（2026-10-20 用户指示）。其余成员**必须显式传入模型参数，不得依赖执行体默认模型**。2026-10-17 实测：裸 `--kind pi` 会使用 `deepseek-v4-pro`，产生未预期额度消费（56 turns ≈ $0.389）。验证必须访问 herdr socket 时，使用全局配置的 `test-herdr` profile（`pi` + 固定模型），不得直接以裸 `pi` 启动。
 
 **所有成员一律以 YOLO 权限启动**（用户 2026-10-17 指示）：omp 用 `--approval-mode yolo`，claude 用 `--dangerously-skip-permissions`，codex 用 `--dangerously-bypass-approvals-and-sandbox`，pi 无审批门禁；不再逐次审批。该授权不改变「禁止在远程服务器执行命令」等全局约束，后者继续由全局规则执行。

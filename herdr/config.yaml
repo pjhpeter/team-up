@@ -42,7 +42,7 @@ profiles:
   # 不签发、不拍板、不评审自己的方案；编写会话不得兼任同一交付物的 precheck/reviewer/dev。
   arch-lite:
     kind: omp
-    args: ["--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
   # 方案评审员（2026-10-24 用户指示）：Claude Code + claude-opus-5-5 + effort high。
   # 结论写在终端最终回复，由调度者 agent read 取回落盘。
   reviewer:
@@ -54,20 +54,25 @@ profiles:
   # worktree cwd 由调度者通过 `pane split --cwd` 提供。
   dev:
     kind: omp
-    args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
   # 2026-11-02 用户指示：开发者分前后端，需求前后端都改时两人并行（见 PROTOCOL「前后端并行开发」）。
   # dev-fe 只写前端仓库、dev-be 只写后端仓库；模型暂与 dev 相同，需要时各自改。
   # dev 保留给不分前后端的仓库。
   dev-fe:
     kind: omp
-    args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
   dev-be:
     kind: omp
-    args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
-  # 测试者：编写用例、代码评审通过后执行自动化测试。审批与 cwd 同 dev（YOLO）。
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+  # 测试者：编写用例、代码评审通过后执行浏览器自动化测试。审批与 cwd 同 dev（YOLO）。
+  # 2026-11-06 用户指示：浏览器测试用 omp，只有必须验证桌面应用（Electron）时才用下面的 test-electron。
   test:
+    kind: omp
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+  # 只测桌面应用（Electron）时用；判断标准见 PROTOCOL.md §8。
+  test-electron:
     kind: codex
-    args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=low", "--dangerously-bypass-approvals-and-sandbox"]
+    args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=low", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
   # 需要访问 herdr socket 的验证角色。codex 的 workspace-write 沙箱会拒绝 herdr socket
   # （req-20261017-7a17bc93 实测 PermissionDenied），此时才可偏离 `test` 使用本 profile。
   # 必须显式固定模型：pi 的默认模型是 deepseek-v4-pro，裸 `--kind pi` 会产生未预期的额度消费
@@ -80,10 +85,10 @@ profiles:
   # 2026-10-24 用户指示：改为 omp + devin/claude-opus-5-5 + thinking low。
   precheck:
     kind: omp
-    args: ["--model", "devin/claude-opus-5-5", "--thinking", "low", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "low", "--approval-mode", "yolo"]
   # 代码评审（2026-10-24 用户指示）：omp + devin/claude-opus-5-5 + thinking medium。
   # 承担完整代码评审、增量闭环与测试用例终审；最终风险签发仍归 arch。
   code-review:
     kind: omp
-    args: ["--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
 default_profile: scheduler

@@ -22,6 +22,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `PROTOCOL.md` | 流程规则本体，所有角色都按它干活 |
 | `workflows/team-up.yaml` | Herdr 启动团队的入口 |
 | `herdr/config.yaml` | 各角色用什么工具、什么模型（install.sh 把 Herdr 插件配置链接到这里） |
+| `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
 | `scripts/` | 收件箱、飞书桥、找调度者、成员收尾、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |

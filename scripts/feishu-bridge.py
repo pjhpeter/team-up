@@ -306,6 +306,10 @@ class Bridge:
                 self.state["group_chats"].append(chat)
         if msg.get("sender_type") != "user":
             return  # 机器人（含自己）发的不处理，避免来回刷屏
+        if msg.get("chat_type") == "group" and not any(map(self.is_bot_mention, msg.get("mentions") or [])):
+            # 应用开了「获取群组中所有消息」权限后，群里每句话都会推过来；没 @ 机器人的不是对它说的，
+            # 一律不回（否则会给同事回「没有使用权限」或用法说明，在群里刷屏）。2026-11-08
+            return
         user = self.users.get(msg.get("sender_id", ""))
         if not user:
             self.reply(mid, "你还没有使用权限，请联系机器人的主人把你加进白名单。", f"deny-{mid}")

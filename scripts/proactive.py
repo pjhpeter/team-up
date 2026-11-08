@@ -383,7 +383,7 @@ class Scout:
         for m in sorted(rows, key=lambda r: r.get("ms", 0)):
             conv = fs["convs"].setdefault(self.conv_key(m), {"chat": m.get("chat", ""), "chat_name": m.get("chat_name", ""),
                                                             "pending": [], "context": [], "records": []})
-            conv["pending"].append({k: m.get(k) for k in ("mid", "sender", "sender_name", "text", "ms")})
+            conv["pending"].append({k: m.get(k) for k in ("mid", "sender", "sender_name", "text", "quote", "ms")})
             conv["last_ms"] = max(int(conv.get("last_ms", 0)), int(m.get("ms", 0)))
         for key, conv in fs["convs"].items():
             pending = conv["pending"]
@@ -404,8 +404,8 @@ class Scout:
 
     def conv_key(self, m: Mapping[str, Any]) -> str:
         chat = m.get("chat", "")
-        if m.get("thread") or m.get("root"):
-            return f"{chat}|t|{m.get('thread') or m.get('root')}"
+        if m.get("thread"):  # 只有话题单独成段；主聊天区的引用回复留在当时那段对话里（被引用的话由飞书桥附在 quote）
+            return f"{chat}|t|{m['thread']}"
         main = self.state["feishu"]["main"].get(chat)
         ms = int(m.get("ms", 0))
         if not main or ms - main["last_ms"] > self.cfg["feishu_gap_s"] * 1000:
@@ -421,7 +421,8 @@ class Scout:
     def feishu_text(self, conv: Mapping[str, Any], batch: Sequence[Mapping[str, Any]]) -> str:
         def line(m: Mapping[str, Any], tag: str) -> str:
             at = datetime.fromtimestamp(m["ms"] / 1000).strftime("%m-%d %H:%M")
-            return f"[{tag}] {at} {self.speaker(m)}：{(m.get('text') or '')[:800]}"
+            quote = f"（引用：{m['quote']}）" if m.get("quote") else ""
+            return f"[{tag}] {at} {self.speaker(m)}：{quote}{(m.get('text') or '')[:800]}"
         parts = [f"飞书群「{conv.get('chat_name') or '观察群'}」里的一段对话（没人 @ 机器人，或 @ 它的人不在白名单）。"]
         if conv["context"]:
             parts.append("前面已经判过的上文（只当背景，不重复判）：")

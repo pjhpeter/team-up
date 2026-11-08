@@ -415,6 +415,18 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.w.replies[0]["text"], "我是牛马，但你不是我的地主")
         self.assertEqual([w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")], ["本人明确指令"])
 
+    def test_observe_quote_reply_carries_quoted_text(self) -> None:
+        self.b.observe_chats = {"oc_g": "研发小分队"}
+        self.w.messages["om_old"] = "导出 PDF 点了没反应 [Image: img_9]"
+        self.b.handle(msg("om_1", "我这也是", sender="ou_other", chat="oc_g", chat_type="group",
+                          root="om_old", reply_to="om_old"))
+        self.b.handle(msg("om_2", "话题里接着说", sender="ou_other", chat="oc_g", chat_type="group",
+                          root="om_old", reply_to="om_old", thread="omt_1"))
+        rows = self.observed()
+        self.assertEqual(rows[0]["quote"], "导出 PDF 点了没反应 [附件]")
+        self.assertEqual(rows[1]["quote"], "")  # 话题里不额外取
+        self.assertEqual(self.w.replies, [])
+
     def test_catch_up_observes_group_history_but_skips_other_groups(self) -> None:
         self.b.observe_chats = {"oc_g": "研发小分队"}
         self.state["chats"] = {"oc_g": 1, "oc_x": 1}

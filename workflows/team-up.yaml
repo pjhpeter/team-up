@@ -47,7 +47,7 @@ steps:
       text: |
         你是这项需求的 Herdr 调度者。需求：{{inputs.task}}
         仓库：{{context.cwd}}
-        入口已为你开了新会话，之前的对话不在上下文里。按 ~/.hwf/PROTOCOL.md 开头「调度者阅读指引与省词元」读必读章节后按其中流程执行（进入各阶段前再读对应章节）；你已登记为调度者，先用 herdr agent get 回读核对登记身份，不要重复改名。
+        入口已为你开了新会话，之前的对话不在上下文里。按 ~/.hwf/PROTOCOL.md 开头「调度者阅读指引与省词元」读必读章节后按其中流程执行（进入各阶段前再读对应章节）；你已登记为调度者，先用 herdr agent get 回读核对登记身份，不要重复改名。确定本需求的 issue 编号后，用 python3 ~/.hwf/scripts/name-tab.py <编号|-> <短标题> 重命名你的 tab（未改名时领取不了成员）。
         入口已后台提交本条需求、不等待你的回复；进度写入任务记录与 STATE.md。hwf run id 用 hwf runs list --json --checkout-root {{context.cwd}} 取 workflow 为 team-up 的最新一条，查不到写 n/a。
         发现脚本已确认你名下没有未收尾任务和未关闭的发起 issue；仍按 PROTOCOL.md 先读 INDEX 与 STATE.md 核对，若发现自己仍有在途交付，回报并把本需求写入 INDEX 待领取，不打断现有任务。
         复用空闲成员，每个 issue 用新会话交接；角色启动参数只采用 hwf 合并后的配置层（全局插件配置 → 仓库 .hwf/config.yaml → 仓库 .hwf/config.local.yaml，后者整条覆盖前者）。
@@ -62,7 +62,7 @@ steps:
   - agent: &new_scheduler_prompt |
       你是这项需求的 Herdr 调度者。需求：{{inputs.task}}
       仓库：{{context.cwd}}
-      按 ~/.hwf/PROTOCOL.md 开头「调度者阅读指引与省词元」读必读章节（进入各阶段前再读对应章节），完成初始化第 1、2 步后再按协议登记调度者角色；不要把改名作为第一个动作。
+      按 ~/.hwf/PROTOCOL.md 开头「调度者阅读指引与省词元」读必读章节（进入各阶段前再读对应章节），完成初始化第 1、2 步后再按协议登记调度者角色；不要把改名作为第一个动作。登记后用 python3 ~/.hwf/scripts/name-tab.py <issue 编号|-> <短标题> 给你的 tab 起名（未改名时领取不了成员）。
       入口已后台提交本条需求、不等待你的回复；进度写入任务记录与 STATE.md。hwf run id 取本 pane 环境变量 $HWF_RUN_ID。
       复用空闲成员，每个 issue 用新会话交接；角色启动参数只采用 hwf 合并后的配置层（全局插件配置 → 仓库 .hwf/config.yaml → 仓库 .hwf/config.local.yaml，后者整条覆盖前者）。
       需求以「【对话模式】」开头时，是 GitLab 收件箱的对话模式：按 PROTOCOL.md「GitLab 收件箱」的对话模式规则执行——你自己不分析、不读代码，按用户点名派角色做只读分析（没点名派 arch），把成员结论原样转贴到 issue；不做复杂度判定、不进入交付流程，直到用户发 /go 或明确说开工；本段之后的交付步骤只在交付模式下适用。

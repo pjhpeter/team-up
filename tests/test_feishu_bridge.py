@@ -134,6 +134,11 @@ class BridgeTest(unittest.TestCase):
         cfg = {"gitlab_host": "git.example.com", "default_project": "frontend/web-v1",
                "users": {ME: "pengjh"}, "bot_open_id": BOT}
         self.uploads: list[tuple] = []
+        self.tmp = tempfile.TemporaryDirectory()  # 观察队列写到这里，不碰本机 ~/.hwf/state
+        self.addCleanup(self.tmp.cleanup)
+        proactive = FB.proactive_module()
+        self.addCleanup(setattr, proactive, "STATE_DIR", proactive.STATE_DIR)
+        proactive.STATE_DIR = Path(self.tmp.name)
         self.b = FB.Bridge(cfg, self.state, run=self.w, user_token="tok", now=lambda: 1_000_000.0,
                            upload=self.fake_upload, media_dir=Path(tempfile.mkdtemp(prefix="fb-media-")))
 
@@ -353,7 +358,7 @@ class BridgeTest(unittest.TestCase):
     def test_stranger_is_refused_and_nothing_written(self) -> None:
         self.b.handle(msg("om_1", "需求：我也要", sender="ou_other"))
         self.assertEqual(self.w.writes, [])
-        self.assertIn("没有使用权限", self.w.replies[0]["text"])
+        self.assertEqual(self.w.replies[0]["text"], "我是牛马，但你不是我的地主")
 
     def test_small_talk_gets_help_once_per_cooldown(self) -> None:
         self.b.handle(msg("om_1", "你叫什么名字？"))
@@ -382,6 +387,45 @@ class BridgeTest(unittest.TestCase):
         self.b.handle(msg("om_4", "@交付助手-试点 需求：这次 @ 了", chat="oc_g", chat_type="group",
                           mentions=[{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]))
         self.assertEqual([w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")], ["这次 @ 了"])
+
+    def observed(self) -> list:
+        path = Path(self.tmp.name) / "proactive-feishu-queue.jsonl"
+        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
+
+    def test_observe_chat_messages_go_to_queue_silently(self) -> None:
+        self.b.observe_chats = {"oc_g": "研发小分队"}
+        self.b.handle(msg("om_1", "导出又挂了 [Image: img_1]", sender="ou_other", chat="oc_g", chat_type="group",
+                          thread="omt_9"))
+        self.b.handle(msg("om_2", "我顺口说一句", chat="oc_g", chat_type="group"))  # 本人没 @ 也只观察
+        self.b.handle(msg("om_3", "随便聊", sender="ou_other", chat="oc_x", chat_type="group"))  # 非观察群：丢掉
+        self.assertEqual(self.w.replies, [])
+        self.assertEqual(self.w.writes, [])
+        rows = self.observed()
+        self.assertEqual([r["mid"] for r in rows], ["om_1", "om_2"])
+        self.assertEqual(rows[0]["text"], "导出又挂了 [附件]")
+        self.assertEqual((rows[0]["chat_name"], rows[0]["thread"], rows[0]["sender"]), ("研发小分队", "omt_9", "ou_other"))
+
+    def test_observe_chat_stranger_mention_is_observed_and_gets_fixed_reply(self) -> None:
+        self.b.observe_chats = {"oc_g": "研发小分队"}
+        bot = [{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]
+        self.b.handle(msg("om_1", "@交付助手-试点 导出挂了帮看下", sender="ou_other", chat="oc_g",
+                          chat_type="group", mentions=bot))
+        self.b.handle(msg("om_2", "@交付助手-试点 需求：本人明确指令", chat="oc_g", chat_type="group", mentions=bot))
+        self.assertEqual([r["mid"] for r in self.observed()], ["om_1"])  # 本人 @ 是指令，不进观察
+        self.assertEqual(self.w.replies[0]["text"], "我是牛马，但你不是我的地主")
+        self.assertEqual([w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")], ["本人明确指令"])
+
+    def test_catch_up_observes_group_history_but_skips_other_groups(self) -> None:
+        self.b.observe_chats = {"oc_g": "研发小分队"}
+        self.state["chats"] = {"oc_g": 1, "oc_x": 1}
+        self.state["group_chats"] = ["oc_g", "oc_x"]
+        item = lambda mid, chat: {"message_id": mid, "chat_id": chat, "content": "聊天", "create_time": "2026-11-08 17:00",
+                                  "sender": {"id": "ou_other", "name": "小王", "sender_type": "user"}}
+        self.w.history = {"oc_g": [item("om_1", "oc_g")], "oc_x": [item("om_2", "oc_x")]}
+        self.b.catch_up()
+        rows = self.observed()
+        self.assertEqual([(r["mid"], r["sender_name"]) for r in rows], [("om_1", "小王")])
+        self.assertEqual(self.w.replies, [])
 
     def test_other_people_mentioned_keep_their_name(self) -> None:
         self.b.handle(msg("om_1", "需求：让 @_user_2 看下", mentions=[{"key": "@_user_2", "id": "ou_x", "name": "小王"}]))

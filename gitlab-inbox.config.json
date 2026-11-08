@@ -7,5 +7,9 @@
   "interval_seconds": 60,
   "projects": [
     "frontend/web-v1"
-  ]
+  ],
+  "proactive": {
+    "model": "jc-gpt/gpt-6-luna",
+    "thinking": "medium"
+  }
 }

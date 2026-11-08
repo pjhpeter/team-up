@@ -752,6 +752,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"missing config {CONFIG_PATH}", file=sys.stderr)
         return 1
     inbox = Inbox(config, load_json(STATE_PATH, {}))
+    scout = start_scout(config) if not args.once else None
     while True:
         try:
             inbox.poll()
@@ -762,7 +763,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
         if args.once:
             return 0
+        if scout is not None:
+            scout.tick_in_background()  # 主动接活（observe 档）在后台线程跑，出错只记日志
         time.sleep(int(config.get("interval_seconds", 60)))
+
+
+def start_scout(config: Mapping[str, Any]) -> Any:
+    """加载同目录的 proactive.py（主动接活）；没有规则文件或加载失败就不启用，收件箱照常工作。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("proactive", Path(__file__).resolve().parent / "proactive.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not module.RULES_PATH.exists():
+            log(f"proactive off: no {module.RULES_PATH.name}")
+            return None
+        return module.Scout(config)
+    except Exception as error:  # 主动接活起不来不能影响收件箱
+        log(f"proactive off: {error!r}")
+        return None
 
 
 if __name__ == "__main__":

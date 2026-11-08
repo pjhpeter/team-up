@@ -55,6 +55,8 @@ DEFAULTS: dict[str, Any] = {
     "judge_timeout_s": 90, "retries": 3, "judge_per_tick": 10,
     "feishu_quiet_s": 300, "feishu_batch_max": 30, "feishu_gap_s": 600, "feishu_context": 20,
     "feishu_keep_days": 7, "inputs_keep_days": 14, "images_per_batch": 4,
+    "media_cap_mb": 300,          # 观察群图片总量上限，超了从最旧的删
+    "media_check_s": 3600,        # 图片目录每小时检查一次
     "digest_hour": 18, "unavailable_alert": 5, "ntfy_topic": "pjh-herdr-task",
 }
 KINDS = {"GitLab issue": "gitlab_issue", "GitLab 流水线": "gitlab_pipeline", "飞书观察群": "feishu"}
@@ -565,10 +567,12 @@ class Scout:
                 if d.get("carry_skipped"):
                     body += f"；昨天超额跳过 {d['carry_skipped']} 个事件"
                 self.ntfy("主动接活日报", body)
-        last = float(self.state.get("last_prune", 0))
-        if now - last >= 86400:
+        if now - float(self.state.get("last_prune", 0)) >= 86400:
             self.prune(now)
             self.state["last_prune"] = now
+        if now - float(self.state.get("last_media_check", 0)) >= self.cfg["media_check_s"]:
+            self.prune_media(now)
+            self.state["last_media_check"] = now
 
     def prune(self, now: float) -> None:
         """聊天原文只留 feishu_keep_days 天；其他事件的判断材料留 inputs_keep_days 天（供 replay）。"""
@@ -578,15 +582,34 @@ class Scout:
                 if parse_time(r["at"]) >= (keep_feishu if r["kind"] == "feishu" else keep_other)]
         if self.files.inputs.exists():
             self.files.rewrite(self.files.inputs, rows)
-        if self.files.media.exists():
-            for d in self.files.media.iterdir():
-                if d.stat().st_mtime < keep_feishu:
-                    shutil.rmtree(d, ignore_errors=True)
         convs = self.state["feishu"]["convs"]
         for key, conv in list(convs.items()):
             conv["context"] = [m for m in conv["context"] if m["ms"] / 1000 >= keep_feishu]
             if not conv["pending"] and int(conv.get("last_ms", 0)) / 1000 < keep_feishu:
                 del convs[key]
+
+    def prune_media(self, now: float) -> None:
+        """观察群图片：超过 feishu_keep_days 天的删掉；总量仍超 media_cap_mb 就从最旧的继续删。"""
+        if not self.files.media.exists():
+            return
+        keep = now - self.cfg["feishu_keep_days"] * 86400
+        dirs = []
+        for d in self.files.media.iterdir():
+            if d.stat().st_mtime < keep:
+                shutil.rmtree(d, ignore_errors=True)
+                continue
+            size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file()) if d.is_dir() else d.stat().st_size
+            dirs.append((d.stat().st_mtime, size, d))
+        total, cap_bytes = sum(x[1] for x in dirs), self.cfg["media_cap_mb"] * 1024 * 1024
+        removed = 0
+        for _, size, d in sorted(dirs, key=lambda x: x[0]):
+            if total <= cap_bytes:
+                break
+            shutil.rmtree(d, ignore_errors=True) if d.is_dir() else d.unlink()
+            total -= size
+            removed += 1
+        if removed:
+            log(f"media over {self.cfg['media_cap_mb']}MB: removed {removed} oldest message folders")
 
     def ntfy(self, title: str, body: str) -> bool:
         try:

@@ -712,6 +712,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGINT, stop_children)
     events: "queue.Queue[dict]" = queue.Queue()
     threading.Thread(target=consume_events, args=(events,), daemon=True).start()
+    # 搬附件用的中转目录正常情况下用完即删；上次被强杀可能留下半截文件，启动时清空
+    shutil.rmtree(MEDIA_DIR, ignore_errors=True)
     try:
         bridge.catch_up()
     except BridgeError as e:

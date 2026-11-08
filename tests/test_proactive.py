@@ -319,6 +319,25 @@ class ScoutTest(unittest.TestCase):
         self.scout.tick()
         self.assertFalse(old.exists())
 
+    def test_media_over_cap_removes_oldest_first(self) -> None:
+        import os
+        self.scout.cfg["media_cap_mb"] = 1
+        for i, age in enumerate((3, 2, 1)):  # 天前
+            d = self.files.media / f"om_{i}"
+            d.mkdir(parents=True)
+            (d / "a.jpg").write_bytes(b"x" * 600 * 1024)
+            os.utime(d, (self.t - age * 86400, self.t - age * 86400))
+        self.scout.tick()
+        self.assertEqual(sorted(p.name for p in self.files.media.iterdir()), ["om_2"])
+        (self.files.media / "om_9").mkdir()
+        (self.files.media / "om_9" / "b.jpg").write_bytes(b"x" * 600 * 1024)
+        self.t += 600
+        self.scout.tick()
+        self.assertTrue((self.files.media / "om_2").exists())  # 不到一小时不再检查
+        self.t += 3600
+        self.scout.tick()
+        self.assertEqual(sorted(p.name for p in self.files.media.iterdir()), ["om_9"])
+
     def test_feishu_big_batch_is_judged_immediately_and_threads_split(self) -> None:
         self.scout.cfg["feishu_batch_max"] = 3
         for i in range(3):

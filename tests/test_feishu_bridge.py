@@ -402,7 +402,10 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.w.writes, [])
         rows = self.observed()
         self.assertEqual([r["mid"] for r in rows], ["om_1", "om_2"])
-        self.assertEqual(rows[0]["text"], "导出又挂了 [附件]")
+        self.assertEqual(rows[0]["text"], "导出又挂了 [图片]")
+        self.assertEqual(len(rows[0]["images"]), 1)
+        self.assertTrue(Path(rows[0]["images"][0]).is_file())
+        self.assertTrue(rows[0]["images"][0].startswith(str(Path(self.tmp.name) / "proactive-media" / "om_1")))
         self.assertEqual((rows[0]["chat_name"], rows[0]["thread"], rows[0]["sender"]), ("研发小分队", "omt_9", "ou_other"))
 
     def test_observe_chat_stranger_mention_is_observed_and_gets_fixed_reply(self) -> None:
@@ -414,6 +417,17 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual([r["mid"] for r in self.observed()], ["om_1"])  # 本人 @ 是指令，不进观察
         self.assertEqual(self.w.replies[0]["text"], "我是牛马，但你不是我的地主")
         self.assertEqual([w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")], ["本人明确指令"])
+
+    def test_observe_files_are_named_not_downloaded_and_broken_image_is_skipped(self) -> None:
+        self.b.observe_chats = {"oc_g": "研发小分队"}
+        self.w.broken_images.add("img_bad")
+        self.b.handle(msg("om_1", '日志在这 <file key="file_1" name="日志.zip"/> [Image: img_bad]', sender="ou_other",
+                          chat="oc_g", chat_type="group"))
+        row = self.observed()[0]
+        self.assertEqual(row["text"], "日志在这 [文件 日志.zip] [图片]")
+        self.assertEqual(row["images"], [])
+        self.assertEqual(self.w.downloads, [])  # 文件不下载；坏图下载失败不影响入队
+        self.assertEqual(self.w.replies, [])
 
     def test_observe_quote_reply_carries_quoted_text(self) -> None:
         self.b.observe_chats = {"oc_g": "研发小分队"}

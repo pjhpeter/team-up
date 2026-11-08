@@ -235,7 +235,8 @@ def owner_of(url: str, repo: str, agents: Sequence[Mapping[str, Any]]) -> dict[s
     task = task_id_for(url)
     rows = active_rows(repo)
     index = read_index(repo)
-    owner = next((row for row in index if row.task == task), None)
+    # 同一任务被接手时会追加新行（新调度者），取最后一行才是现在的负责人。
+    owner = next((row for row in reversed(index) if row.task == task), None)
     if owner is None:
         owner = next((row for row in rows if state_mentions(repo, row, url)), None)
     if owner is None:

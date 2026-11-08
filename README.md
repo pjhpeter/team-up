@@ -27,7 +27,8 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
-| `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔 |
+| `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔；`proactive` 段是主动接活用的模型 |
+| `proactive-rules.md` | 主动接活的规则：什么情况 → 做什么，每条规则单独一档 |
 
 不入库（每台电脑自己的）：`state/`（运行状态）、`gitlab-inbox.local.json`（每个项目在本机的仓库路径，也可覆盖共用配置里的其他值，比如换成你自己的白名单账号）。
 
@@ -44,9 +45,23 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | 在上面的话题里回复 | 写成该 issue 的评论；`/go`、`/status` 等指令照常生效 |
 | 调度者贴出编号选项后回一个数字（如 `1`） | 收件箱核对界面没变，替你在电脑上选中这一项并回帖结果 |
 
-群里使用时，每句话（包括话题里的回复）都要 @机器人，它才收得到；私聊不用。
+群里给机器人下指令时，每句话（包括话题里的回复）都要 @机器人；私聊不用。白名单外的人找机器人，它只回一句「我是牛马，但你不是我的地主」。
 
 每人接一套：用 lark-cli 建好机器人应用、存一个本人 GitLab 令牌、写本机配置 `~/.hwf/feishu-bridge.local.json`，然后在一个 Herdr 窗格里常驻 `python3 ~/.hwf/scripts/feishu-bridge.py`。完整步骤、用法和排查见 Wiki [飞书接入](https://git.bootingai.net/ai-hub/skills/workflow/team-up/-/wikis/飞书接入)。
+
+## 主动接活（observe 档）
+
+没人叫 Agent 时，收件箱每 10 分钟看一遍 GitLab 新开的 issue（创建满 2 小时仍没人指派的）和 main / release-* 失败的流水线，再加上飞书「观察群」里的对话，按 `proactive-rules.md` 逐条判断 Agent 本来该不该主动接活。observe 档**只记录、不动手**：对 GitLab 只读，不在飞书说话，不启动调度者。
+
+| 要做的事 | 怎么做 |
+| --- | --- |
+| 看观察结果 | `python3 ~/.hwf/scripts/proactive.py report`（生成报告并打开；每条右侧有标注命令） |
+| 标注判得对不对 | `proactive.py mark O-0031 ok`、`mark O-0032 wrong 理由`（理由写「严重」算严重误接）、`mark O-0040 should R2 理由`（漏接） |
+| 改了规则验证一下 | `proactive.py replay R2 --days 14`：拿旧事件按新规则重判，对照之前的标注，不改原记录 |
+| 加观察群 | 机器人要有飞书权限 `im:message.group_msg`；在 `feishu-bridge.local.json` 加 `"observe_chats": {"oc_xxx": "群名"}`，重启飞书桥 |
+| 放开一条规则 | 成绩卡显示「可以考虑切 auto」后，由人把该规则的档位改掉（auto 档还没实现，现在按 observe 处理） |
+
+平时不推送；每天 18 点后当天有新的「本来会接」时发一条 ntfy，当天判不了的事件超过 5 个时也发一条。记录都在本机 `state/proactive-*`，飞书聊天原文 7 天后自动删除。
 
 ## 怎么改
 

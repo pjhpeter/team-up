@@ -12,6 +12,7 @@ exit 0 = 指定 worktree 下已无监听进程、待回读端口全部空闲；e
 - 只沿父进程链向上收拢 node/pnpm/npm 等包装进程（`pnpm exec vite` 会留两层 pnpm），
   遇到 shell、agent、omp broker 即停，不碰成员 pane 本身；
 - agent 自身（omp/codex/claude/pi/herdr）即使 cwd 在 worktree 内也不关。
+测试浏览器（Chrome for Testing 等）带调试端口，cwd 在 worktree 内时同样会被认领关闭。
 --port 只用于回读（例如 STATE 里登记的端口）；worktree 登记的 dev-server-port 会自动加入回读。
 """
 

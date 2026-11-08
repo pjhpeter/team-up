@@ -35,8 +35,9 @@ def agent(name: str, pane: str, tab: str = "w1:t1", status: str = "idle", kind: 
 class FakeHerdr:
     """只模拟本脚本用到的命令；记录调用，便于断言没有手写参数、没有多建 pane。"""
 
-    def __init__(self, team: list[dict], width: int = 200, height: int = 48) -> None:
+    def __init__(self, team: list[dict], width: int = 200, height: int = 48, tab: str = "#453 调度 水印") -> None:
         self.agents = team
+        self.tab_label = tab
         self.calls: list[tuple[str, ...]] = []
         self.width, self.height = width, height
         self.argv: dict[str, list[str]] = {}
@@ -50,6 +51,11 @@ class FakeHerdr:
             self.agents = [a for a in self.agents if a["pane_id"] != args[2]]
             return {}
         if cmd == ("pane", "rename"):
+            return {}
+        if cmd == ("tab", "get"):
+            return {"result": {"tab": {"label": self.tab_label}}}
+        if cmd == ("agent", "rename"):
+            next(a for a in self.agents if a["pane_id"] == args[2])["name"] = args[3]
             return {}
         if cmd == ("pane", "layout"):
             panes = [{"pane_id": a["pane_id"], "rect": {"width": self.width, "height": self.height}}
@@ -124,16 +130,16 @@ class ClaimTest(Case):
         arch = agent("delivery-arch-w1-pt", "w1:pT") | {"terminal_title": "Issue 453 AI生成水印"}
         fake = FakeHerdr([SCHED, agent("delivery-dev-w1-pd", "w1:pD", kind="omp"), arch])
         out = self.run_claim(fake)
-        self.assertEqual((out["action"], out["name"], out["pane_id"]), ("restarted", "delivery-arch-w1-pt", "w1:pT"))
+        self.assertEqual((out["action"], out["name"], out["pane_id"]), ("restarted", "i453-arch", "w1:pT"))
         self.assertFalse([c for c in fake.calls if c[:2] in (("pane", "split"), ("tab", "create"))])
         (start,) = fake.starts()
-        self.assertEqual(start[2:7], ("delivery-arch-w1-pt", "--kind", "claude", "--pane", "w1:pT"))
+        self.assertEqual(start[2:7], ("i453-arch", "--kind", "claude", "--pane", "w1:pT"))
         self.assertEqual(list(start[start.index("--") + 1:]), ["--model", "claude-opus-5-5", "--effort", "medium"])
 
     def test_creates_with_profile_args_when_all_busy(self) -> None:
         fake = FakeHerdr([SCHED, agent("delivery-arch-w1-pt", "w1:pT", status="working")])
         out = self.run_claim(fake, "dev")
-        self.assertEqual((out["action"], out["name"]), ("created", "delivery-dev-w1-pnew"))
+        self.assertEqual((out["action"], out["name"]), ("created", "i453-dev"))
         (start,) = fake.starts()
         self.assertEqual(start[4], "omp")
         self.assertIn(("pane", "rename", "w1:pNEW", "dev-gpt-6.1-sol-#453核查"), fake.calls)
@@ -181,6 +187,30 @@ class ClaimTest(Case):
         (start,) = fake.starts()
         self.assertEqual(list(start[start.index("--") + 1:]), ["--model", "jc-gpt/gpt-6-astra", "--thinking", "low"])
         self.assertEqual(out["label"], "dev-gpt-6-astra-#453核查")
+
+    def test_tab_must_carry_issue_number(self) -> None:
+        with self.assertRaisesRegex(MS.ClaimError, "name-tab.py"):
+            self.run_claim(FakeHerdr([SCHED], tab="hwf-agent"))
+        self.assertEqual(self.run_claim(FakeHerdr([SCHED], tab="待建issue 调度 新需求"))["name"], "new-arch")
+
+    def test_name_taken_gets_suffix_and_new_tab_carries_issue(self) -> None:
+        busy = agent("i453-arch", "w1:pT", status="working")
+        fake = FakeHerdr([SCHED, busy], width=100, height=20)
+        out = self.run_claim(fake)
+        self.assertEqual(out["name"], "i453-arch-2")
+        self.assertIn("#453 成员", [c for c in fake.calls if c[:2] == ("tab", "create")][0])
+
+    def test_dev_does_not_claim_dev_fe(self) -> None:
+        fake = FakeHerdr([SCHED, agent("delivery-dev-fe-w1-pv", "w1:pV", kind="omp"),
+                          agent("i453-dev-fe", "w1:pW", kind="omp")])
+        self.assertEqual(self.run_claim(fake, "dev")["action"], "created")
+
+    def test_kept_member_renamed_for_new_issue(self) -> None:
+        fake = FakeHerdr([SCHED, agent("i400-arch", "w1:pT")])
+        fake.argv["w1:pT"] = ["claude", "--model", "claude-opus-5-5", "--effort", "medium"]
+        out = self.run_claim(fake, keep_session=True)
+        self.assertEqual((out["action"], out["name"]), ("kept", "i453-arch"))
+        self.assertIn(("agent", "rename", "w1:pT", "i453-arch"), fake.calls)
 
     def test_caller_must_be_registered_scheduler(self) -> None:
         fake = FakeHerdr([agent("delivery-dev-w1-ps", "w1:pS", kind="omp")])

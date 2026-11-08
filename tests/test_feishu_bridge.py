@@ -371,6 +371,18 @@ class BridgeTest(unittest.TestCase):
         titles = [w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")]
         self.assertEqual(titles, ["群里提的", "事件格式"])
 
+    def test_group_message_without_bot_mention_gets_no_reply(self) -> None:
+        # 开了群消息权限后，群里所有话都会推过来：同事闲聊、本人没 @ 的话都不能回复或写 GitLab
+        self.b.handle(msg("om_1", "导出又挂了", sender="ou_other", chat="oc_g", chat_type="group"))
+        self.b.handle(msg("om_2", "需求：顺手提一个", chat="oc_g", chat_type="group"))
+        self.b.handle(msg("om_3", "@小王 你看下", chat="oc_g", chat_type="group",
+                          mentions=[{"key": "@_user_2", "id": "ou_x", "name": "小王"}]))
+        self.assertEqual(self.w.replies, [])
+        self.assertEqual(self.w.writes, [])
+        self.b.handle(msg("om_4", "@交付助手-试点 需求：这次 @ 了", chat="oc_g", chat_type="group",
+                          mentions=[{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]))
+        self.assertEqual([w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")], ["这次 @ 了"])
+
     def test_other_people_mentioned_keep_their_name(self) -> None:
         self.b.handle(msg("om_1", "需求：让 @_user_2 看下", mentions=[{"key": "@_user_2", "id": "ou_x", "name": "小王"}]))
         self.assertEqual(self.w.writes[0][2]["title"], "让 @小王 看下")

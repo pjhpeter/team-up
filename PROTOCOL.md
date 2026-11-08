@@ -134,7 +134,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 3. 按「调度者阅读指引与省词元」读完必读章节并完成第 1、2 步之后才登记角色：用 `herdr pane current --current` 取得实际 pane，按下文「登记名规则」生成 `delivery-scheduler-<handle>`，执行 `herdr agent rename <pane-id> <登记名>`。**不得把 rename 作为收到入口 prompt 后的第一个动作**：入口新建调度者时，引擎会按创建名确认 prompt 已被接收，过早改名会让入口因 `agent_not_found` 失败。被入口复用的调度者已经登记，只回读核对，不重复改名。登记失败先核对身份，不能继续静默创建另一个调度者。登记后用 `herdr agent get <登记名>` 回读 name、pane_id、session id，记入 STATE。
 4. 阅读 `AGENTS.md` 及当前任务涉及目录的规则。读取原 issue、关系与全部评论；记录仓库、worktree、分支、HEAD 和允许写入范围。
 5. 按下文「任务标识与索引」生成任务标识；先按该节「过期清理」执行一次 tmp 清理，再读 `.hwf/tmp/INDEX.md` 匹配是否已有同一需求，命中则按「调度记录与恢复」接续，未命中才创建 `.hwf/tmp/<任务标识>/` 并追加索引行。仓库项目与每个 issue 的身份使用完整 GitLab URL，不能仅用 IID 跨项目混认。
-6. 按下一阶段需要领取角色，不预先创建一整排空闲成员。每次领取都先执行 `herdr agent list`，核对角色、实际状态、cwd 和任务归属。
+6. 按下一阶段需要领取角色，不预先创建一整排空闲成员。**领取成员一律调用 `python3 ~/.hwf/scripts/member-start.py <profile> --task <任务>`**（见下文「领取规则」第一条），不得手写 `pane split` / `agent start` 参数。
 
 登记名规则：
 
@@ -152,13 +152,17 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 领取规则：
 
+- **只用脚本领取（2026-11-08 用户指示）**：`python3 ~/.hwf/scripts/member-start.py <profile> --task <任务> [--cwd <worktree>] [--exclude <登记名>]… [--keep-session]`。脚本按登记名 `delivery-<profile>-` 找本调度者名下 `idle`/`done` 的同角色成员，有就在原 pane 退出旧会话、按配置重启（`--keep-session` 且正在跑的命令行与配置一致时原样交回）；没有才在本调度者 tab 切 pane（太挤开新 tab）新建；启动参数只取 hwf 合并后的角色配置，配置没写模型的角色拒绝启动；同时设好 `角色-模型-任务` pane 标题。stdout 一行 JSON（`action`/`name`/`pane_id`/`session`/`args`/`created_by`），原样记入 STATE。来由：2026-11-07 #453 调度者手写参数，把开发者的 gpt-6.1-sol 参数给了架构师，又只看窗口标题没认出已在的架构师，重复新建。
+  - 知道某个空闲成员还有在途任务或未收取产出时，用 `--exclude` 排除它，不得改用手写命令绕开。
+  - 用户授权临时换模型（如额度耗尽）时加 `--model-override <模型> --authorized-by <授权评论链接>`，只替换模型值；没有授权链接脚本拒绝。
+  - 脚本失败（非 0）就按阻塞处理并写入 STATE，不得手写命令兜底。
 - 角色名称按「登记名规则」使用 `delivery-<profile>-<handle>`；既有 `arch`、`arch-lite`、`dev`、`test` 等明确角色也必须检查。hwf 自动生成的名称不能替代角色登记。
 - 同角色有本团队 `idle`/`done` 成员时，优先读取其最近结果并确认上一个任务交付已收取，然后复用该 pane。**本团队有可用的同角色空闲成员时，禁止再创建该角色。** 本调度者团队的空闲成员在其他 tab/workspace 时也要检查并复用，不以“当前 tab 没有”作为重复创建理由；其他调度者的成员不属于本团队，不参与检查或复用。
 - `idle`/`done` 不等于上一 issue 已交付，也不保证该执行体在前台；复用前用 `agent read` 确认最后输出。尚有未收取产出或未交接任务时先完成交接。`working`、`blocked`、`unknown`、启动未就绪的成员，以及读屏显示审批/确认界面的 `idle`/`done` 成员，都不能当作空闲，也不能擅自中断。
 - `idle`/`done` 只表示当前没有模型生成或审批界面，**不代表没有在途任务**：2026-10-17 实测 omp 在执行工具调用期间仍报 `idle`。复用前必须先读 `.hwf/tmp/INDEX.md` 与该任务的 `STATE.md`；有在途任务的 idle 成员按忙碌计，适用“均忙碌才可新建”。调度者的并行规则见「多调度者并行」。
 - **成员归属**：成员同一时间只归一个调度者。成员只归创建/领取它的调度者，不跨调度者复用或改派；领取时在 STATE 记录，并在成员 pane 标题的任务字段写明 issue。各调度者的团队相互独立。
 - 本团队同角色均忙碌时，调度者可按需求创建该已定义角色的新成员。创建前把角色、pane、session 与 `created_by` 写入本任务记录。团队按调度者私有，不同调度者可以同时创建同角色成员，互不阻塞；不存在跨调度者角色锁，任何调度者不得因他人创建同名角色而等待（2026-10-22 用户指示）。
-- **每个调度者一个 tab（2026-10-22 用户指示）**：入口新建的调度者独占一个新 tab；它新建的成员只在自己的 tab 里分割 pane，不得分到入口、收件箱或其他调度者的 tab。保持 cwd 与用户焦点（`--no-focus`）。`agent start` 不创建或切分布局，须先 `pane split`（目标用自己 tab 内的 pane）得到 pane。方向根据 `pane layout` 选择，不连切出过窄窗格；自己的 tab 太挤时用 `tab create` 在同一 workspace 再开一个 tab，并在 STATE 记录。用 JSON 返回的实际 ID，禁止拼接预测 ID；在 STATE 为该 pane 记 `created_by=<本调度者登记名>`。成员只在本调度者自己的 tab 内创建和复用，不搬动、不复用其他调度者的成员。
+- **每个调度者一个 tab（2026-10-22 用户指示）**：入口新建的调度者独占一个新 tab；它新建的成员只在自己的 tab 里分割 pane，不得分到入口、收件箱或其他调度者的 tab。保持 cwd 与用户焦点（`--no-focus`）。切 pane、选方向、太挤时开新 tab 都由 `member-start.py` 完成（不切出宽不足 60 列、高不足 16 行的窗格），在 STATE 记录它返回的 pane/tab；禁止拼接预测 ID；在 STATE 为该 pane 记 `created_by=<本调度者登记名>`。成员只在本调度者自己的 tab 内创建和复用，不搬动、不复用其他调度者的成员。
 - **持久 pane 标题**：创建 pane 后、启动 agent 或派活前，必须设置持久 pane title/label，严格使用 `角色-模型-任务` 格式，例如 `test-gpt-6.1-sol-#317浏览器复测`，不带字面 `title-` 前缀或方括号。模型填写实际固定模型；角色、模型或任务变更，以及复用 pane 时，必须同步更新。任务尚未确定时，任务字段暂填明确的“待派任务”，并在派活前补齐实际任务。不能只依赖终端进程的动态标题。
 - 同一 cwd/worktree 同时只安排一个代码写入者；并行 issue 使用独立 worktree/分支。**用户启动 team-up 即视为授权为并行 issue 创建独立 worktree，并以该 worktree 作为成员 cwd**（通过 `pane split --cwd` 或执行体自身的工作目录参数提供）；`--trust-repository` 不在此授权内，需要时先问用户。每个成员交接明确唯一可写目录，测试人员的脚本变更也不能与开发同时写同一文件。worktree 的创建数量与清理按下文「worktree 生命周期」执行。
 
@@ -189,7 +193,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 **复用 pane 与复用旧会话是两回事：复用空闲角色的 pane，但每个新 issue 必须开启新会话。**
 
 - 已有会话切换 issue 前，先保存上一 issue 的产出和真实 session id；确认 idle、归属与交接完成。
-- 用当前执行体官方支持的新会话方式。可以退出旧 agent，等待 shell 空闲，在同一 pane 按 profile 重新 `agent start`，并把原登记名作为 `<NAME>` 传入；不带旧 `--resume`、`--continue` 或 session 参数。重启后按「身份记账」回读并更新 session id。只有确认当前 CLI 支持且能核验 session id 变化时才用 `/new`。
+- 换新会话用 `member-start.py`（不带 `--keep-session`）：它退出旧 agent、在同一 pane 以原登记名按 profile 重启；不带旧 `--resume`、`--continue` 或 session 参数。重启后按「身份记账」回读并更新 session id。只有确认当前 CLI 支持且能核验 session id 变化时才用 `/new`。
 - 同一 issue 的回改可继续该 issue 会话（test 除外，见 §8「每次测试一个新会话」）；评审轮数始终留在调度记录，重启会话不清零。从父 spec 切到子 issue、从一个子 issue 切到另一个，也必须新会话。
 - 尚未发布 spec 时，用临时需求标识归档方案与评审；发布后关联 spec URL。成员开始 spec issue 或实现子 issue 时，重新建立该 issue 的会话并读取方案、spec 和证据，而非恢复临时需求会话。子/孙 issue 只读取 spec 的方案与已批准用例，不重开方案/用例阶段（§3.1）。
 - 每次派活附：本角色、完整 issue URL、spec/方案路径、阶段、worktree/分支/HEAD、允许写入范围、验收条目、评审剩余轮数、交付路径。评审类角色另附评审范围契约（in-scope / out-of-scope / 复核项 / 预算 / 停止条件）。先完整读取本协议再按领取的角色工作。`reviewer`/`arch` 的最终回复必须以单独一行结论结尾（`通过` / `需修改`）；`arch-lite`/`dev`/`test` 以 `完成` / `阻塞` 结尾。

@@ -374,12 +374,22 @@ class Bridge:
         text = self.clean_text(msg)
         body = strip_attachments(text).strip() + (" [附件]" if find_attachments(text) else "")
         chat = msg.get("chat_id", "")
+        quote = ""
+        quoted = msg.get("reply_to") or msg.get("root_id") or ""
+        if quoted and quoted != msg["message_id"] and not msg.get("thread_id"):
+            # 主聊天区的引用回复：把被引用那句带上，否则「同上」「这个也是」之类的话判不了；话题里本来就有上下文
+            try:
+                items = (self.lark(["im", "+messages-mget", "--message-ids", quoted]).get("data") or {}).get("messages")
+                raw = (items or [{}])[0].get("content") or ""
+                quote = (strip_attachments(raw).strip() + (" [附件]" if find_attachments(raw) else ""))[:300]
+            except BridgeError as e:
+                log(f"read quoted {quoted} failed: {e}")
         try:
             proactive_module().append_feishu_queue({
                 "mid": msg["message_id"], "chat": chat, "chat_name": self.observe_chats.get(chat, ""),
                 "root": msg.get("root_id") or "", "thread": msg.get("thread_id") or "",
                 "sender": msg.get("sender_id") or "", "sender_name": msg.get("sender_name") or "",
-                "text": body, "ms": int(msg.get("create_ms") or 0)})
+                "text": body, "quote": quote, "ms": int(msg.get("create_ms") or 0)})
         except OSError as e:
             log(f"observe {msg['message_id']} failed: {e}")
 

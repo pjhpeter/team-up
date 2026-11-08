@@ -286,6 +286,15 @@ class ScoutTest(unittest.TestCase):
         self.assertIn("O-0001", self.w.prompts[1])
         self.assertEqual(self.records()[1]["verdict"], "same_as")
 
+    def test_feishu_quote_reply_stays_in_conversation_with_quoted_text(self) -> None:
+        self.w.judge = hits("R2")
+        self.feishu("m1", "导出又挂了", self.t - 120)
+        self.feishu("m2", "我这也是", self.t - 60, root="m0", quote="昨天说的 PDF 那个问题")
+        self.t += 300
+        self.scout.tick()
+        self.assertEqual(len(self.w.prompts), 1)  # 引用回复没被拆成另一段
+        self.assertIn("（引用：昨天说的 PDF 那个问题）我这也是", self.w.prompts[0])
+
     def test_feishu_big_batch_is_judged_immediately_and_threads_split(self) -> None:
         self.scout.cfg["feishu_batch_max"] = 3
         for i in range(3):

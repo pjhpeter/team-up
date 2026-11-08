@@ -295,6 +295,30 @@ class ScoutTest(unittest.TestCase):
         self.assertEqual(len(self.w.prompts), 1)  # 引用回复没被拆成另一段
         self.assertIn("（引用：昨天说的 PDF 那个问题）我这也是", self.w.prompts[0])
 
+    def test_feishu_images_go_to_model_capped_and_missing_skipped(self) -> None:
+        self.w.judge = hits("R2")
+        pics = []
+        for i in range(6):
+            f = self.dir / f"p{i}.jpg"
+            f.write_bytes(b"x")
+            pics.append(str(f))
+        Path(pics[1]).unlink()  # 已被清理的图不带
+        self.feishu("m1", "看图 [图片] [图片] [图片]", self.t - 400, images=pics[:3])
+        self.feishu("m2", "还有 [图片] [图片] [图片]", self.t - 390, images=pics[3:])
+        self.scout.tick()
+        cmd = next(c for c in self.w.calls if c[0] == "omp")
+        self.assertEqual([a for a in cmd if a.startswith("@")], [f"@{pics[0]}", f"@{pics[2]}", f"@{pics[3]}"])
+        self.assertIn("随材料附了 3 张图片", cmd[-1])
+
+    def test_old_media_is_pruned(self) -> None:
+        old = self.files.media / "om_old"
+        old.mkdir(parents=True)
+        (old / "a.jpg").write_bytes(b"x")
+        import os
+        os.utime(old, (self.t - 8 * 86400, self.t - 8 * 86400))
+        self.scout.tick()
+        self.assertFalse(old.exists())
+
     def test_feishu_big_batch_is_judged_immediately_and_threads_split(self) -> None:
         self.scout.cfg["feishu_batch_max"] = 3
         for i in range(3):

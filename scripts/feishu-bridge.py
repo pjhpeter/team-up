@@ -77,6 +77,8 @@ IMAGE_HINT = "收到附件。10 分钟内接着发「需求：<要做的事>」�
 # 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉
 BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*")
 FAILED_TEXT = "这条没处理成功，请重发。"
+OBSERVE_IMAGES_PER_MESSAGE = 4  # 观察群一条消息最多下载几张图给模型看
+OBSERVE_DOWNLOAD_TIMEOUT_S = 60  # 观察是顺带做的，单张图下载超时比搬到 GitLab 短，免得拖慢 @ 指令的处理
 DENY_TEXT = "我是牛马，但你不是我的地主"  # 白名单外的人找机器人时的回复（2026-11-08 用户指定）
 HELP_TEXT = (
     "用法：\n"
@@ -253,20 +255,22 @@ class Bridge:
         # 每个附件一个子目录，文件按原名落盘，GitLab 里显示的就是原文件名
         workdir = self.media_dir / a["key"]
         try:
-            workdir.mkdir(parents=True, exist_ok=True)
-            out = a["key"] if a["kind"] == "image" else safe_filename(a["name"], a["key"])
-            data = self.lark(["im", "+messages-resources-download", "--message-id", mid, "--file-key", a["key"],
-                              "--type", a["kind"], "--output", out], cwd=workdir, timeout=TRANSFER_TIMEOUT_S)
-            path = Path((data.get("data") or {}).get("saved_path") or "")
-            if not path.is_absolute():
-                path = workdir / path
-            return self.upload(project, path)
+            return self.upload(project, self.download(mid, a, workdir, TRANSFER_TIMEOUT_S))
         except BridgeError as e:
             log(f"{a['kind']} {a['key']} of {mid} failed: {e}")
             what = "张图片" if a["kind"] == "image" else f"个文件{'「' + a['name'] + '」' if a['name'] else ''}"
             return f"_（有一{what}没搬过来：{e}）_"
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def download(self, mid: str, a: dict[str, str], workdir: Path, timeout: int) -> Path:
+        """把一个飞书附件下载到 workdir（lark-cli 只许写到当前目录下），返回落盘路径。"""
+        workdir.mkdir(parents=True, exist_ok=True)
+        out = a["key"] if a["kind"] == "image" else safe_filename(a["name"], a["key"])
+        data = self.lark(["im", "+messages-resources-download", "--message-id", mid, "--file-key", a["key"],
+                          "--type", a["kind"], "--output", out], cwd=workdir, timeout=timeout)
+        path = Path((data.get("data") or {}).get("saved_path") or "")
+        return path if path.is_absolute() else workdir / path
 
     # ---------- 飞书 → GitLab ----------
     def handle(self, msg: dict[str, Any]) -> None:
@@ -372,7 +376,17 @@ class Bridge:
     def observe(self, msg: dict[str, Any]) -> None:
         """观察群里的一条消息进主动接活队列：只写本机文件，不回复、不碰 GitLab；写失败只记日志。"""
         text = self.clean_text(msg)
-        body = strip_attachments(text).strip() + (" [附件]" if find_attachments(text) else "")
+        attachments = find_attachments(text)
+        marks = ["[图片]" if a["kind"] == "image" else f"[文件 {a['name'] or '未命名'}]" for a in attachments]
+        body = " ".join([strip_attachments(text).strip(), *marks]).strip()
+        # 图片下载到本机给模型看（2026-11-08 用户同意）；文件、视频只写名字不下载。7 天后由 proactive 清理
+        images: list[str] = []
+        media = proactive_module().Files().media / msg["message_id"]
+        for a in [a for a in attachments if a["kind"] == "image"][:OBSERVE_IMAGES_PER_MESSAGE]:
+            try:
+                images.append(str(self.download(msg["message_id"], a, media, OBSERVE_DOWNLOAD_TIMEOUT_S)))
+            except BridgeError as e:
+                log(f"observe image {a['key']} of {msg['message_id']} failed: {e}")
         chat = msg.get("chat_id", "")
         quote = ""
         quoted = msg.get("reply_to") or msg.get("root_id") or ""
@@ -389,7 +403,7 @@ class Bridge:
                 "mid": msg["message_id"], "chat": chat, "chat_name": self.observe_chats.get(chat, ""),
                 "root": msg.get("root_id") or "", "thread": msg.get("thread_id") or "",
                 "sender": msg.get("sender_id") or "", "sender_name": msg.get("sender_name") or "",
-                "text": body, "quote": quote, "ms": int(msg.get("create_ms") or 0)})
+                "text": body, "quote": quote, "images": images, "ms": int(msg.get("create_ms") or 0)})
         except OSError as e:
             log(f"observe {msg['message_id']} failed: {e}")
 

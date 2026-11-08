@@ -77,6 +77,9 @@ IMAGE_HINT = "收到附件。10 分钟内接着发「需求：<要做的事>」�
 # 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉
 BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*")
 FAILED_TEXT = "这条没处理成功，请重发。"
+OBSERVE_IMAGES_PER_MESSAGE = 4  # 观察群一条消息最多下载几张图给模型看
+OBSERVE_DOWNLOAD_TIMEOUT_S = 60  # 观察是顺带做的，单张图下载超时比搬到 GitLab 短，免得拖慢 @ 指令的处理
+DENY_TEXT = "我是牛马，但你不是我的地主"  # 白名单外的人找机器人时的回复（2026-11-08 用户指定）
 HELP_TEXT = (
     "用法：\n"
     "1. 发「需求：<要做的事>」→ 我在 GitLab 建 issue，Agent 先分析，结论会回到这条消息的话题里\n"
@@ -145,6 +148,8 @@ class Bridge:
         self.project: str = config["default_project"]
         self.label: str = config.get("label", "herdr-auto")
         self.users: dict[str, str] = dict(config["users"])
+        # 主动接活的观察群：chat_id → 群名（备注）。这些群里的消息写进本机观察队列，由收件箱里的 proactive 判断。
+        self.observe_chats: dict[str, str] = dict(config.get("observe_chats") or {})
         self.user_token = user_token
         self.agent: str = config.get("agent_account") or self.api("user")["username"]
         state.setdefault("threads", {})      # 话题根消息 id → {project, iid, chat_id, last_note, closed}
@@ -250,20 +255,22 @@ class Bridge:
         # 每个附件一个子目录，文件按原名落盘，GitLab 里显示的就是原文件名
         workdir = self.media_dir / a["key"]
         try:
-            workdir.mkdir(parents=True, exist_ok=True)
-            out = a["key"] if a["kind"] == "image" else safe_filename(a["name"], a["key"])
-            data = self.lark(["im", "+messages-resources-download", "--message-id", mid, "--file-key", a["key"],
-                              "--type", a["kind"], "--output", out], cwd=workdir, timeout=TRANSFER_TIMEOUT_S)
-            path = Path((data.get("data") or {}).get("saved_path") or "")
-            if not path.is_absolute():
-                path = workdir / path
-            return self.upload(project, path)
+            return self.upload(project, self.download(mid, a, workdir, TRANSFER_TIMEOUT_S))
         except BridgeError as e:
             log(f"{a['kind']} {a['key']} of {mid} failed: {e}")
             what = "张图片" if a["kind"] == "image" else f"个文件{'「' + a['name'] + '」' if a['name'] else ''}"
             return f"_（有一{what}没搬过来：{e}）_"
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def download(self, mid: str, a: dict[str, str], workdir: Path, timeout: int) -> Path:
+        """把一个飞书附件下载到 workdir（lark-cli 只许写到当前目录下），返回落盘路径。"""
+        workdir.mkdir(parents=True, exist_ok=True)
+        out = a["key"] if a["kind"] == "image" else safe_filename(a["name"], a["key"])
+        data = self.lark(["im", "+messages-resources-download", "--message-id", mid, "--file-key", a["key"],
+                          "--type", a["kind"], "--output", out], cwd=workdir, timeout=timeout)
+        path = Path((data.get("data") or {}).get("saved_path") or "")
+        return path if path.is_absolute() else workdir / path
 
     # ---------- 飞书 → GitLab ----------
     def handle(self, msg: dict[str, Any]) -> None:
@@ -306,13 +313,17 @@ class Bridge:
                 self.state["group_chats"].append(chat)
         if msg.get("sender_type") != "user":
             return  # 机器人（含自己）发的不处理，避免来回刷屏
-        if msg.get("chat_type") == "group" and not any(map(self.is_bot_mention, msg.get("mentions") or [])):
+        mentioned = any(map(self.is_bot_mention, msg.get("mentions") or []))
+        user = self.users.get(msg.get("sender_id", ""))
+        if msg.get("chat_type") == "group" and chat in self.observe_chats and not (mentioned and user):
+            # 观察群：白名单的人 @ 机器人是明确指令，照常处理；其余消息（含同事 @ 机器人）交给主动接活去判断
+            self.observe(msg)
+        if msg.get("chat_type") == "group" and not mentioned:
             # 应用开了「获取群组中所有消息」权限后，群里每句话都会推过来；没 @ 机器人的不是对它说的，
             # 一律不回（否则会给同事回「没有使用权限」或用法说明，在群里刷屏）。2026-11-08
             return
-        user = self.users.get(msg.get("sender_id", ""))
         if not user:
-            self.reply(mid, "你还没有使用权限，请联系机器人的主人把你加进白名单。", f"deny-{mid}")
+            self.reply(mid, DENY_TEXT, f"deny-{mid}")
             return
         text = self.clean_text(msg)
         root, tid = msg.get("root_id") or "", msg.get("thread_id") or ""
@@ -361,6 +372,40 @@ class Bridge:
             elif key:
                 text = text.replace(key, f"@{name}")
         return text.strip()
+
+    def observe(self, msg: dict[str, Any]) -> None:
+        """观察群里的一条消息进主动接活队列：只写本机文件，不回复、不碰 GitLab；写失败只记日志。"""
+        text = self.clean_text(msg)
+        attachments = find_attachments(text)
+        marks = ["[图片]" if a["kind"] == "image" else f"[文件 {a['name'] or '未命名'}]" for a in attachments]
+        body = " ".join([strip_attachments(text).strip(), *marks]).strip()
+        # 图片下载到本机给模型看（2026-11-08 用户同意）；文件、视频只写名字不下载。7 天后由 proactive 清理
+        images: list[str] = []
+        media = proactive_module().Files().media / msg["message_id"]
+        for a in [a for a in attachments if a["kind"] == "image"][:OBSERVE_IMAGES_PER_MESSAGE]:
+            try:
+                images.append(str(self.download(msg["message_id"], a, media, OBSERVE_DOWNLOAD_TIMEOUT_S)))
+            except BridgeError as e:
+                log(f"observe image {a['key']} of {msg['message_id']} failed: {e}")
+        chat = msg.get("chat_id", "")
+        quote = ""
+        quoted = msg.get("reply_to") or msg.get("root_id") or ""
+        if quoted and quoted != msg["message_id"] and not msg.get("thread_id"):
+            # 主聊天区的引用回复：把被引用那句带上，否则「同上」「这个也是」之类的话判不了；话题里本来就有上下文
+            try:
+                items = (self.lark(["im", "+messages-mget", "--message-ids", quoted]).get("data") or {}).get("messages")
+                raw = (items or [{}])[0].get("content") or ""
+                quote = (strip_attachments(raw).strip() + (" [附件]" if find_attachments(raw) else ""))[:300]
+            except BridgeError as e:
+                log(f"read quoted {quoted} failed: {e}")
+        try:
+            proactive_module().append_feishu_queue({
+                "mid": msg["message_id"], "chat": chat, "chat_name": self.observe_chats.get(chat, ""),
+                "root": msg.get("root_id") or "", "thread": msg.get("thread_id") or "",
+                "sender": msg.get("sender_id") or "", "sender_name": msg.get("sender_name") or "",
+                "text": body, "quote": quote, "images": images, "ms": int(msg.get("create_ms") or 0)})
+        except OSError as e:
+            log(f"observe {msg['message_id']} failed: {e}")
 
     @staticmethod
     def strip_images(text: str) -> str:
@@ -518,8 +563,10 @@ class Bridge:
                 continue
             for item in (data.get("data") or {}).get("messages", []):
                 msg = normalize_history(item)
-                if chat in self.state["group_chats"] and not any(map(self.is_bot_mention, msg["mentions"])):
-                    continue  # 群里没 @ 机器人的话不是对它说的
+                if chat in self.state["group_chats"]:
+                    msg["chat_type"] = "group"  # 历史记录不带会话类型，补上后由 dispatch 统一分流
+                    if chat not in self.observe_chats and not any(map(self.is_bot_mention, msg["mentions"])):
+                        continue  # 非观察群里没 @ 机器人的话不是对它说的
                 self.handle(msg)
         for root, t in list(self.state["threads"].items()):
             if t.get("closed"):
@@ -534,9 +581,26 @@ class Bridge:
                 self.handle(normalize_history(item, default_root=root))
 
 
+_PROACTIVE: Any = None
+
+
+def proactive_module() -> Any:
+    """按需加载同目录的 proactive.py（复用它的队列写入，队列格式只在一处定义）。"""
+    global _PROACTIVE
+    if _PROACTIVE is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("proactive", Path(__file__).resolve().parent / "proactive.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _PROACTIVE = module
+    return _PROACTIVE
+
+
 def normalize_event(e: dict[str, Any]) -> dict[str, Any]:
     return {"message_id": e.get("message_id") or e.get("id"), "chat_id": e.get("chat_id"),
             "chat_type": e.get("chat_type"), "sender_id": e.get("sender_id"),
+            "sender_name": e.get("sender_name") or "",
             "sender_type": e.get("sender_type"), "content": e.get("content") or "",
             "mentions": e.get("mentions") or [], "root_id": e.get("root_id") or "",
             "reply_to": e.get("reply_to") or "", "message_type": e.get("message_type") or "",
@@ -648,6 +712,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     signal.signal(signal.SIGINT, stop_children)
     events: "queue.Queue[dict]" = queue.Queue()
     threading.Thread(target=consume_events, args=(events,), daemon=True).start()
+    # 搬附件用的中转目录正常情况下用完即删；上次被强杀可能留下半截文件，启动时清空
+    shutil.rmtree(MEDIA_DIR, ignore_errors=True)
     try:
         bridge.catch_up()
     except BridgeError as e:

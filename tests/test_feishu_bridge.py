@@ -358,7 +358,16 @@ class BridgeTest(unittest.TestCase):
     def test_stranger_is_refused_and_nothing_written(self) -> None:
         self.b.handle(msg("om_1", "需求：我也要", sender="ou_other"))
         self.assertEqual(self.w.writes, [])
-        self.assertEqual(self.w.replies[0]["text"], "我是牛马，但你不是我的地主")
+        self.assertIn(self.w.replies[0]["text"], FB.DENY_TEXTS)
+
+    def test_stranger_replies_are_random_from_ten(self) -> None:
+        self.assertEqual(len(set(FB.DENY_TEXTS)), 10)
+        for i in range(60):
+            self.b.handle(msg(f"om_s{i}", "在吗", sender="ou_other"))
+        texts = {r["text"] for r in self.w.replies}
+        self.assertTrue(texts <= set(FB.DENY_TEXTS))
+        self.assertGreater(len(texts), 1)  # 不是固定一句
+        self.assertEqual(self.w.writes, [])
 
     def test_small_talk_gets_help_once_per_cooldown(self) -> None:
         self.b.handle(msg("om_1", "你叫什么名字？"))
@@ -415,7 +424,7 @@ class BridgeTest(unittest.TestCase):
                           chat_type="group", mentions=bot))
         self.b.handle(msg("om_2", "@交付助手-试点 需求：本人明确指令", chat="oc_g", chat_type="group", mentions=bot))
         self.assertEqual([r["mid"] for r in self.observed()], ["om_1"])  # 本人 @ 是指令，不进观察
-        self.assertEqual(self.w.replies[0]["text"], "我是牛马，但你不是我的地主")
+        self.assertIn(self.w.replies[0]["text"], FB.DENY_TEXTS)
         self.assertEqual([w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")], ["本人明确指令"])
 
     def test_observe_files_are_named_not_downloaded_and_broken_image_is_skipped(self) -> None:

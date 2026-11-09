@@ -41,6 +41,8 @@ class FakeHerdr:
         self.calls: list[tuple[str, ...]] = []
         self.width, self.height = width, height
         self.argv: dict[str, list[str]] = {}
+        self.cwd: dict[str, str] = {}  # pane → 工作目录；没写的取 run_claim 的 --cwd
+        self.default_cwd = ""
 
     def __call__(self, *args: str, timeout: int = 30) -> dict:
         self.calls.append(args)
@@ -72,6 +74,8 @@ class FakeHerdr:
             return {}
         if cmd == ("agent", "get"):
             return {"result": {"agent": next(a for a in self.agents if a["name"] == args[2])}}
+        if cmd == ("pane", "get"):
+            return {"result": {"pane": {"pane_id": args[2], "cwd": self.cwd.get(args[2], self.default_cwd)}}}
         if cmd == ("pane", "process-info"):
             argv = self.argv.get(args[3], ["claude", "--model", "jc-gpt/gpt-6.1-sol"])
             return {"result": {"process_info": {"foreground_processes": [{"argv": argv}]}}}
@@ -99,6 +103,7 @@ class Case(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
     def run_claim(self, fake: FakeHerdr, profile: str = "arch", **kw: object) -> dict:
+        fake.default_cwd = str(self.dir)
         with patch.object(MS, "herdr", fake):
             return MS.claim(profile, kw.get("task", "#453核查"), str(self.dir), kw.get("exclude", []),
                             kw.get("keep_session", False), kw.get("model_override"), kw.get("authorized_by"))
@@ -127,7 +132,7 @@ class ProfileTest(Case):
 class ClaimTest(Case):
     def test_reuses_idle_arch_by_name_even_if_title_changed(self) -> None:
         """#453 事故：架构师窗口标题被改成「Issue 453 AI生成水印」，仍须按登记名认出并复用。"""
-        arch = agent("delivery-arch-w1-pt", "w1:pT") | {"terminal_title": "Issue 453 AI生成水印"}
+        arch = agent("i453-arch", "w1:pT") | {"terminal_title": "Issue 453 AI生成水印"}
         fake = FakeHerdr([SCHED, agent("delivery-dev-w1-pd", "w1:pD", kind="omp"), arch])
         out = self.run_claim(fake)
         self.assertEqual((out["action"], out["name"], out["pane_id"]), ("restarted", "i453-arch", "w1:pT"))
@@ -147,10 +152,10 @@ class ClaimTest(Case):
                         fake.calls.index(start))
 
     def test_excluded_member_counts_as_busy(self) -> None:
-        fake = FakeHerdr([SCHED, agent("delivery-arch-w1-pt", "w1:pT")])
-        out = self.run_claim(fake, exclude=["delivery-arch-w1-pt"])
+        fake = FakeHerdr([SCHED, agent("i453-arch", "w1:pT")])
+        out = self.run_claim(fake, exclude=["i453-arch"])
         self.assertEqual(out["action"], "created")
-        self.assertEqual(out["other_same_role"], ["delivery-arch-w1-pt"])
+        self.assertEqual(out["other_same_role"], ["i453-arch"])
 
     def test_other_schedulers_members_are_not_reused(self) -> None:
         other = agent("delivery-arch-w1-px", "w1:pX", tab="w1:t5")
@@ -162,16 +167,16 @@ class ClaimTest(Case):
 
     def test_registry_extends_team_to_other_tabs(self) -> None:
         MS.record({"pane_id": "w1:pD", "tab_id": "w1:t2"}, SCHED["name"], "dev")
-        fake = FakeHerdr([SCHED, agent("delivery-arch-w1-pa", "w1:pA", tab="w1:t2")])
+        fake = FakeHerdr([SCHED, agent("i453-arch", "w1:pA", tab="w1:t2")])
         self.assertEqual(self.run_claim(fake)["action"], "restarted")
 
     def test_keep_session_only_when_running_args_match(self) -> None:
-        arch = agent("delivery-arch-w1-pt", "w1:pT")
+        arch = agent("i453-arch", "w1:pT")
         fake = FakeHerdr([SCHED, arch])
         fake.argv["w1:pT"] = ["claude", "--model", "claude-opus-5-5", "--effort", "medium", "--x"]
         self.assertEqual(self.run_claim(fake, keep_session=True)["action"], "kept")
         self.assertFalse(fake.starts())
-        fake = FakeHerdr([SCHED, agent("delivery-arch-w1-pt", "w1:pT")])  # 跑的是 sol：必须重启
+        fake = FakeHerdr([SCHED, agent("i453-arch", "w1:pT")])  # 跑的是 sol：必须重启
         self.assertEqual(self.run_claim(fake, keep_session=True)["action"], "restarted")
 
     def test_crowded_tab_opens_new_tab(self) -> None:
@@ -205,12 +210,32 @@ class ClaimTest(Case):
                           agent("i453-dev-fe", "w1:pW", kind="omp")])
         self.assertEqual(self.run_claim(fake, "dev")["action"], "created")
 
-    def test_kept_member_renamed_for_new_issue(self) -> None:
-        fake = FakeHerdr([SCHED, agent("i400-arch", "w1:pT")])
+    def test_pre_issue_member_renamed_once_issue_exists(self) -> None:
+        fake = FakeHerdr([SCHED, agent("new-arch", "w1:pT")])
         fake.argv["w1:pT"] = ["claude", "--model", "claude-opus-5-5", "--effort", "medium"]
         out = self.run_claim(fake, keep_session=True)
         self.assertEqual((out["action"], out["name"]), ("kept", "i453-arch"))
         self.assertIn(("agent", "rename", "w1:pT", "i453-arch"), fake.calls)
+
+    def test_other_issue_member_is_not_reused(self) -> None:
+        """2026-11-09 #453：#464 还没收尾的开发被拉来复用，在 #464 的 worktree 里重启。"""
+        fake = FakeHerdr([SCHED, agent("i464-dev", "w1:pD", kind="omp", status="done")])
+        out = self.run_claim(fake, "dev")
+        self.assertEqual((out["action"], out["name"], out["pane_id"]), ("created", "i453-dev", "w1:pNEW"))
+        self.assertEqual(out["other_same_role"], ["i464-dev"])
+        self.assertFalse([c for c in fake.calls if c[:2] == ("pane", "run")])  # 没碰 #464 的会话
+
+    def test_legacy_name_is_not_reused(self) -> None:
+        fake = FakeHerdr([SCHED, agent("delivery-arch-w1-pt", "w1:pT")])
+        self.assertEqual(self.run_claim(fake)["action"], "created")
+
+    def test_member_in_other_worktree_is_not_reused(self) -> None:
+        fake = FakeHerdr([SCHED, agent("i453-dev", "w1:pD", kind="omp")])
+        fake.cwd["w1:pD"] = str(self.dir / "old-worktree")
+        out = self.run_claim(fake, "dev")
+        self.assertEqual((out["action"], out["name"]), ("created", "i453-dev-2"))
+        self.assertIn(("pane", "split", "w1:pS", "--direction", "right", "--cwd", str(self.dir), "--no-focus"),
+                      fake.calls)
 
     def test_caller_must_be_registered_scheduler(self) -> None:
         fake = FakeHerdr([agent("delivery-dev-w1-ps", "w1:pS", kind="omp")])

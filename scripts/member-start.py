@@ -16,8 +16,12 @@
 3. 找本团队同角色成员：登记名为 `i<编号>-<profile>[-n]`（无 issue 时 `new-<profile>[-n]`，旧名
    `delivery-<profile>-<handle>` 也认），pane 在本调度者的 tab 里或登记簿记在本调度者名下。
    成员登记名 = `i<编号>-<profile>`（2026-11-08 用户指示「issue 编号-角色」；herdr 要求字母开头，所以加 i），
-   同名已被占用时依次加 -2、-3；复用到别的 issue 时随之改名。
-   idle/done 且不在 --exclude（调度者自知还有在途任务的成员）里才算空闲。
+   同名已被占用时依次加 -2、-3。
+   idle/done、不在 --exclude（调度者自知还有在途任务的成员）里，而且同时满足下面两条才算空闲：
+   - 属于本 issue：登记名前缀是本 issue 的 `i<编号>`，或建 issue 前领取的 `new`（领取后改名为 `i<编号>-…`）。
+     别的 issue 的成员（`i464-dev-fe`）在那个 issue 收尾前还没释放，旧名 `delivery-…` 看不出归属，都不复用。
+   - pane 的工作目录就是 --cwd：重启只能在原 pane 原目录，目录不同会在错的 worktree 里干活。
+   2026-11-09 #453：脚本把 #464 未释放的开发复用过来、在 #464 的 worktree 里重启，调度者只好再建一个。
 4. 有空闲成员：--keep-session 且正在跑的命令行与配置一致 → 原样交回；否则在同一 pane 退出旧会话、按配置重启。
    没有：在本调度者 tab 里挑最宽敞的 pane 切一块（太挤就在同一 workspace 开新 tab），按配置启动。
 5. 设持久 pane 标题 `角色-模型-任务`，登记簿记下归属，stdout 输出一行 JSON，调度者照抄进 STATE。
@@ -217,8 +221,21 @@ def same_role(all_agents: Sequence[dict[str, Any]], profile: str, scheduler: dic
     return mine
 
 
-def pick_idle(members: Sequence[dict[str, Any]], exclude: Sequence[str], tag: str = "") -> Optional[dict[str, Any]]:
-    idle = [m for m in members if m.get("agent_status") in ("idle", "done") and m.get("name") not in exclude]
+def same_dir(a: object, b: str) -> bool:
+    return bool(a) and os.path.realpath(str(a)) == os.path.realpath(b)
+
+
+def reusable(member: dict[str, Any], tag: str, cwd: str) -> bool:
+    """本 issue（或建 issue 前）的成员，且 pane 就在要干活的目录里。"""
+    if not re.fullmatch(rf"({re.escape(tag)}|new)-.+", str(member.get("name") or "")):
+        return False
+    pane = herdr("pane", "get", member["pane_id"])["result"]["pane"]
+    return same_dir(pane.get("cwd"), cwd)
+
+
+def pick_idle(members: Sequence[dict[str, Any]], exclude: Sequence[str], tag: str, cwd: str) -> Optional[dict[str, Any]]:
+    idle = [m for m in members if m.get("agent_status") in ("idle", "done") and m.get("name") not in exclude
+            and reusable(m, tag, cwd)]
     idle.sort(key=lambda m: not str(m.get("name") or "").startswith(f"{tag}-"))  # 同一 issue 的优先
     return idle[0] if idle else None
 
@@ -301,7 +318,7 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
     registry = read_registry()
     tag, issue = member_tag(scheduler)
     members = same_role(all_agents, profile_name, scheduler, registry)
-    member = pick_idle(members, exclude, tag)
+    member = pick_idle(members, exclude, tag, cwd)
     base = f"{tag}-{profile_name}"
     label = pane_label(profile_name, profile["args"], task)
 

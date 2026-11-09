@@ -88,6 +88,11 @@ class CleanRepo(unittest.TestCase):
         patcher = patch.object(DISCOVERY, "INBOX_STATE", inbox_state)
         patcher.start()
         self.addCleanup(patcher.stop)
+        claims = Path(ROOT) / "scheduler-claims.json"
+        claims.unlink(missing_ok=True)
+        claims_patcher = patch.object(DISCOVERY, "CLAIMS_PATH", claims)
+        claims_patcher.start()
+        self.addCleanup(claims_patcher.stop)
 
 
 def write_origins(*urls: str, repo: str = ROOT) -> None:
@@ -208,6 +213,44 @@ class CliContractTests(CleanRepo):
                      ("a-2", "delivery-scheduler-w9-p2", "done")])
         rc, out, _, _ = run_cli(fake_herdr([candidate()]))
         self.assertEqual((rc, out), (0, "w9:p2"))
+
+
+class ClaimTests(CleanRepo):
+    """两个入口几乎同时挑调度者（2026-11-09 #464/#465 都被塞给 p23）：先挑的占座，后挑的不再选它。"""
+
+    def test_second_entry_skips_just_picked_scheduler_and_creates_new(self) -> None:
+        herdr = fake_herdr([candidate()])
+        first = run_cli(herdr)
+        second = run_cli(herdr)
+        self.assertEqual(first[:2], (0, "w9:p2"))
+        self.assertEqual(second[:2], (0, ""))  # 空 → 入口新建一个调度者
+        self.assertIn("just picked by another entry", second[2])
+
+    def test_second_entry_takes_next_idle_scheduler(self) -> None:
+        herdr = fake_herdr([candidate(), candidate(name="delivery-scheduler-w9-p3", pane_id="w9:p3")])
+        self.assertEqual(run_cli(herdr)[1], "w9:p2")
+        self.assertEqual(run_cli(herdr)[1], "w9:p3")
+
+    def test_claim_expires(self) -> None:
+        herdr = fake_herdr([candidate()])
+        run_cli(herdr)
+        DISCOVERY.CLAIMS_PATH.write_text(json.dumps({"w9:p2": 1.0}))  # 很久以前的占座
+        self.assertEqual(run_cli(herdr)[1], "w9:p2")
+
+    def test_no_pick_writes_no_claim_and_corrupt_claims_do_not_block(self) -> None:
+        run_cli(fake_herdr([]))
+        self.assertEqual(json.loads(DISCOVERY.CLAIMS_PATH.read_text()), {})
+        DISCOVERY.CLAIMS_PATH.write_text("not json")
+        self.assertEqual(run_cli(fake_herdr([candidate()]))[1], "w9:p2")
+
+    def test_owner_of_does_not_claim(self) -> None:
+        out, err = io.StringIO(), io.StringIO()
+        with patch.dict(os.environ, {"HERDR_ENV": "1"}), \
+             patch.object(DISCOVERY.subprocess, "run", side_effect=fake_herdr([candidate()])), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            DISCOVERY.cli([ROOT, "--owner-of", "https://g/x/-/issues/1"])
+        self.assertFalse(DISCOVERY.CLAIMS_PATH.exists())
+        self.assertEqual(run_cli(fake_herdr([candidate()]))[1], "w9:p2")
 
 
 class OriginBindingTests(CleanRepo):

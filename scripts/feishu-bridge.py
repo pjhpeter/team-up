@@ -38,6 +38,7 @@ import json
 import os
 from pathlib import Path
 import queue
+import random
 import re
 import shutil
 import signal
@@ -79,7 +80,19 @@ BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)
 FAILED_TEXT = "这条没处理成功，请重发。"
 OBSERVE_IMAGES_PER_MESSAGE = 4  # 观察群一条消息最多下载几张图给模型看
 OBSERVE_DOWNLOAD_TIMEOUT_S = 60  # 观察是顺带做的，单张图下载超时比搬到 GitLab 短，免得拖慢 @ 指令的处理
-DENY_TEXT = "我是牛马，但你不是我的地主"  # 白名单外的人找机器人时的回复（2026-11-08 用户指定）
+# 白名单外的人找机器人时随机回一句（2026-11-09 用户指定前两句，其余为配套编写）
+DENY_TEXTS = (
+    "给钱我主人，我帮你干活",
+    "我是牛马，阿巴阿巴阿巴.......",
+    "牛马正在吃草，有事请找我主人",
+    "牛马今日工位已满，请找我主人排队",
+    "我是有主的牛马，不接私活",
+    "想使唤我？先问问我主人同不同意",
+    "本牛马只吃主人喂的草",
+    "你 @ 我也没用，我的缰绳在主人手里",
+    "对不起，你不在我的饲料名单上",
+    "牛马已读，但牛马不回（除非主人发话）",
+)
 HELP_TEXT = (
     "用法：\n"
     "1. 发「需求：<要做的事>」→ 我在 GitLab 建 issue，Agent 先分析，结论会回到这条消息的话题里\n"
@@ -323,7 +336,7 @@ class Bridge:
             # 一律不回（否则会给同事回「没有使用权限」或用法说明，在群里刷屏）。2026-11-08
             return
         if not user:
-            self.reply(mid, DENY_TEXT, f"deny-{mid}")
+            self.reply(mid, random.choice(DENY_TEXTS), f"deny-{mid}")
             return
         text = self.clean_text(msg)
         root, tid = msg.get("root_id") or "", msg.get("thread_id") or ""

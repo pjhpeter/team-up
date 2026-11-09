@@ -45,7 +45,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | 在上面的话题里回复 | 写成该 issue 的评论；`/go`、`/status` 等指令照常生效 |
 | 调度者贴出编号选项后回一个数字（如 `1`） | 收件箱核对界面没变，替你在电脑上选中这一项并回帖结果 |
 
-群里给机器人下指令时，每句话（包括话题里的回复）都要 @机器人；私聊不用。白名单外的人找机器人，它只回一句「我是牛马，但你不是我的地主」。
+群里给机器人下指令时，每句话（包括话题里的回复）都要 @机器人；私聊不用。白名单外的人找机器人，它从 10 句俏皮话里随机回一句（如「给钱我主人，我帮你干活」），什么都不做。
 
 每人接一套：用 lark-cli 建好机器人应用、存一个本人 GitLab 令牌、写本机配置 `~/.hwf/feishu-bridge.local.json`，然后在一个 Herdr 窗格里常驻 `python3 ~/.hwf/scripts/feishu-bridge.py`。完整步骤、用法和排查见 Wiki [飞书接入](https://git.bootingai.net/ai-hub/skills/workflow/team-up/-/wikis/飞书接入)。
 

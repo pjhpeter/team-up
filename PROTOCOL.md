@@ -140,7 +140,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 登记名规则：
 
 - 调度者：格式 `delivery-scheduler-<handle>`（入口与收件箱靠这个前缀找调度者，不改）。
-- 成员（2026-11-08 用户指示「issue 编号-角色」）：格式 `i<issue 编号>-<profile>`，如 `i453-arch`、`i453-dev-fe`；herdr 要求名字以小写字母开头，所以编号前加 `i`。还没有 issue 时为 `new-<profile>`；同名已被占用时依次加 `-2`、`-3`。成员换到另一个 issue 时随之改名。成员名由 `member-start.py` 按调度者 tab 名里的编号生成，不手工起名；旧格式 `delivery-<profile>-<handle>` 的成员仍按同角色认领。profile 名长度 ≤ 12。
+- 成员（2026-11-08 用户指示「issue 编号-角色」）：格式 `i<issue 编号>-<profile>`，如 `i453-arch`、`i453-dev-fe`；herdr 要求名字以小写字母开头，所以编号前加 `i`。还没有 issue 时为 `new-<profile>`；同名已被占用时依次加 `-2`、`-3`。建 issue 前领取的 `new-` 成员在建好 issue 后改名为 `i<编号>-…`；成员不换到别的 issue。成员名由 `member-start.py` 按调度者 tab 名里的编号生成，不手工起名；旧格式 `delivery-<profile>-<handle>` 的成员看不出归属，不再复用。profile 名长度 ≤ 12。
 - handle（调度者用）= 实际 pane id 转小写后，把每段连续的非 `[a-z0-9]` 字符替换成单个 `-`，再去掉首尾 `-`。例：`wS:p1` → `ws-p1`，登记名 `delivery-scheduler-ws-p1`。
 - 登记名须符合 herdr 名称规则 `[a-z][a-z0-9_-]{0,31}`；总长超过 32 时直接报阻塞并写入 STATE，**不截断**（截断会让不同 pane 撞名）。
 - handle 只用于命名，不得据 handle 反推当前 pane；pane 一律以 `herdr pane current --current` 和 `agent get` 的返回为准。
@@ -154,12 +154,12 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 领取规则：
 
-- **只用脚本领取（2026-11-08 用户指示）**：`python3 ~/.hwf/scripts/member-start.py <profile> --task <任务> [--cwd <worktree>] [--exclude <登记名>]… [--keep-session]`。脚本按登记名（`i<编号>-<profile>`，兼容旧的 `delivery-<profile>-<handle>`）找本调度者名下 `idle`/`done` 的同角色成员，有就在原 pane 退出旧会话、按配置重启（`--keep-session` 且正在跑的命令行与配置一致时原样交回）；没有才在本调度者 tab 切 pane（太挤开新 tab）新建；启动参数只取 hwf 合并后的角色配置，配置没写模型的角色拒绝启动；同时设好 `角色-模型-任务` pane 标题。stdout 一行 JSON（`action`/`name`/`pane_id`/`session`/`args`/`created_by`），原样记入 STATE。来由：2026-11-07 #453 调度者手写参数，把开发者的 gpt-6.1-sol 参数给了架构师，又只看窗口标题没认出已在的架构师，重复新建。
+- **只用脚本领取（2026-11-08 用户指示）**：`python3 ~/.hwf/scripts/member-start.py <profile> --task <任务> [--cwd <worktree>] [--exclude <登记名>]… [--keep-session]`。脚本按登记名（`i<编号>-<profile>`）找本调度者名下 `idle`/`done` 的同角色成员，有就在原 pane 退出旧会话、按配置重启（`--keep-session` 且正在跑的命令行与配置一致时原样交回）。**只复用本 issue（或建 issue 前 `new-`）的成员，且其 pane 工作目录必须等于 `--cwd`**：别的 issue 的成员在那个 issue 收尾前没有释放，一律不拉来复用（2026-11-09 用户指示；#453 曾把 #464 的开发拉来，在 #464 的 worktree 里重启）。没有才在本调度者 tab 切 pane（太挤开新 tab）新建；启动参数只取 hwf 合并后的角色配置，配置没写模型的角色拒绝启动；同时设好 `角色-模型-任务` pane 标题。stdout 一行 JSON（`action`/`name`/`pane_id`/`session`/`args`/`created_by`），原样记入 STATE。来由：2026-11-07 #453 调度者手写参数，把开发者的 gpt-6.1-sol 参数给了架构师，又只看窗口标题没认出已在的架构师，重复新建。
   - 知道某个空闲成员还有在途任务或未收取产出时，用 `--exclude` 排除它，不得改用手写命令绕开。
   - 用户授权临时换模型（如额度耗尽）时加 `--model-override <模型> --authorized-by <授权评论链接>`，只替换模型值；没有授权链接脚本拒绝。
   - 脚本失败（非 0）就按阻塞处理并写入 STATE，不得手写命令兜底。
 - 角色名称按「登记名规则」；既有 `arch`、`arch-lite`、`dev`、`test` 等明确角色也必须检查。hwf 自动生成的名称不能替代角色登记。
-- 同角色有本团队 `idle`/`done` 成员时，优先读取其最近结果并确认上一个任务交付已收取，然后复用该 pane。**本团队有可用的同角色空闲成员时，禁止再创建该角色。** 本调度者团队的空闲成员在其他 tab/workspace 时也要检查并复用，不以“当前 tab 没有”作为重复创建理由；其他调度者的成员不属于本团队，不参与检查或复用。
+- 同角色有本团队、本 issue 的 `idle`/`done` 成员时，优先读取其最近结果并确认上一个任务交付已收取，然后复用该 pane。**本团队有可用的同角色空闲成员时，禁止再创建该角色。** 本调度者团队的空闲成员在其他 tab/workspace 时也要检查并复用，不以“当前 tab 没有”作为重复创建理由；其他调度者的成员不属于本团队，不参与检查或复用。
 - `idle`/`done` 不等于上一 issue 已交付，也不保证该执行体在前台；复用前用 `agent read` 确认最后输出。尚有未收取产出或未交接任务时先完成交接。`working`、`blocked`、`unknown`、启动未就绪的成员，以及读屏显示审批/确认界面的 `idle`/`done` 成员，都不能当作空闲，也不能擅自中断。
 - `idle`/`done` 只表示当前没有模型生成或审批界面，**不代表没有在途任务**：2026-10-17 实测 omp 在执行工具调用期间仍报 `idle`。复用前必须先读 `.hwf/tmp/INDEX.md` 与该任务的 `STATE.md`；有在途任务的 idle 成员按忙碌计，适用“均忙碌才可新建”。调度者的并行规则见「多调度者并行」。
 - **成员归属**：成员同一时间只归一个调度者。成员只归创建/领取它的调度者，不跨调度者复用或改派；领取时在 STATE 记录，并在成员 pane 标题的任务字段写明 issue。各调度者的团队相互独立。

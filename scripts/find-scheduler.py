@@ -20,6 +20,10 @@ stdout / 退出码契约（team-up.yaml 依赖本契约，修改须同步）：
 agent 退出即被清除。herdr 把 omp always-ask 审批界面判为 `blocked`（2026-10-17 S11 实测），
 状态过滤即可拦住审批界面。
 
+占座（2026-11-09）：同一时刻可能有多个入口在挑调度者（收件箱 1 秒内连发两次入口，#464、#465 都选中了同一个
+空闲调度者，一个被它记成排队、从此没人领）。挑选在文件锁里进行，选中即记一笔占座（state/scheduler-claims.json），
+CLAIM_TTL_S 内别的入口不再选它；期间它把任务写进 INDEX，之后由「名下有未收尾任务」接手判断。
+
 测试覆盖：用 HERDR_DISCOVERY_BIN 指向桩替换 herdr 二进制。不要用 HERDR_BIN_PATH：
 hwf 的 profile 加载器（herdr plugin config-dir）也读它，全局导出指向桩会让 profile
 解析失败（unknown profile）。必须临时覆盖时，只把 HERDR_DISCOVERY_BIN 挂在发现步骤的 env: 上。
@@ -28,14 +32,17 @@ hwf 的 profile 加载器（herdr plugin config-dir）也读它，全局导出�
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+import fcntl
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-from typing import Any, Mapping, Sequence
+import time
+from typing import Any, Iterator, Mapping, Sequence
 
 NAME_PREFIX = "delivery-scheduler-"
 REUSABLE_STATES = frozenset({"idle", "done"})
@@ -45,6 +52,9 @@ TERMINAL_STATUS = ("done", "delivered", "closed", "cancelled")
 INDEX_RELATIVE = Path(".hwf/tmp/INDEX.md")
 # GitLab 收件箱记录仍打开的发起 issue；发起 issue 只由用户关闭，关闭前其调度者一直被占用（2026-10-22 用户指示）。
 INBOX_STATE = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf")) / "state" / "gitlab-inbox.json"
+# 入口选中调度者后的占座记录：pane id → 选中时间戳；见文件头「占座」。
+CLAIMS_PATH = INBOX_STATE.parent / "scheduler-claims.json"
+CLAIM_TTL_S = 600  # 与收件箱的 LAUNCH_COOLDOWN_S 一致：新调度者通常几分钟内写好 INDEX
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -122,8 +132,9 @@ def _directories(agent: Mapping[str, Any]) -> list[Path]:
 
 def select_scheduler(
     agents: Sequence[Mapping[str, Any]], cwd: str, owners: frozenset[str] = frozenset(),
+    claimed: frozenset[str] = frozenset(),
 ) -> Selection:
-    """owners：INDEX 中名下有未收尾任务的登记名。
+    """owners：INDEX 中名下有未收尾任务的登记名；claimed：刚被别的入口选中、还在占座期的 pane。
 
     归属：`cwd` 或 `foreground_cwd` 任一等于仓库 → 本仓库调度者（2026-10-17 R-2：前台目录
     可能漂移，任一匹配避免漏认）。可复用：所有上报目录都等于仓库，否则不把需求派给它。
@@ -146,6 +157,8 @@ def select_scheduler(
             selection.skipped.append(f"{label}: status {status}")
         elif name in owners:
             selection.skipped.append(f"{label}: owns an open delivery in INDEX")
+        elif pane in claimed:
+            selection.skipped.append(f"{label}: just picked by another entry")
         elif any(directory != target for directory in directories):
             selection.skipped.append(
                 f"{label}: directory mismatch "
@@ -160,6 +173,25 @@ def select_scheduler(
     # pane id 是不透明句柄：普通字典序，只保证相同输入得到相同选择。
     selection.candidates.sort()
     return selection
+
+
+@contextmanager
+def claims_locked() -> Iterator[dict[str, float]]:
+    """独占读写占座记录：进入时去掉过期的，退出时写回。同一时刻只有一个入口在挑调度者。"""
+    CLAIMS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(CLAIMS_PATH.with_suffix(".lock"), "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        now = time.time()
+        try:
+            raw = json.loads(CLAIMS_PATH.read_text()) if CLAIMS_PATH.exists() else {}
+        except ValueError:
+            print("Scheduler claims unreadable, starting empty", file=sys.stderr)
+            raw = {}
+        claims = {pane: float(at) for pane, at in raw.items() if now - float(at) < CLAIM_TTL_S}
+        yield claims
+        tmp = CLAIMS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(claims))
+        tmp.replace(CLAIMS_PATH)
 
 
 def load_inventory() -> list[dict[str, Any]]:
@@ -264,7 +296,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stdout.write(json.dumps(owner_of(args.owner_of, args.cwd, agents)))
         return EXIT_OK
     owners = frozenset(row.scheduler for row in active_rows(args.cwd) if row.scheduler)
-    selection = select_scheduler(agents, args.cwd, owners)
+    with claims_locked() as claims:
+        selection = select_scheduler(agents, args.cwd, owners, frozenset(claims))
+        if selection.candidates:
+            claims[selection.candidates[0]] = time.time()  # 占座：别的入口在占座期内不再选它
     if selection.skipped:
         print("Skipped scheduler(s): " + "; ".join(selection.skipped), file=sys.stderr)
     if selection.candidates:

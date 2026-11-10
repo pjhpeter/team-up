@@ -6,6 +6,11 @@
 # 2026-10-20 用户指示：技术方案编写改由 gpt-6-astra 模型、thinking medium 承担；
 # 该职责固定使用 arch-lite，不再限于试点，也不再以 Opus 终审可用为前提。
 # arch（Opus）保留关键架构取舍、严重争议裁决与代码最终风险闸门，不编写技术方案。
+# 2026-11-10 用户指示（当前生效的模型分配）：Claude 账号已停用，配置里不再有 kind: claude。
+# 「原来是 Claude Code + claude-opus-5-5」的角色（arch、reviewer）改为 omp + devin/claude-opus-5-5，
+# 思考档沿用原来的 effort（arch medium、reviewer high）；
+# 「原来是 omp + devin/claude-opus-5-5」的角色（arch-lite、precheck、code-review）改为
+# omp + jc-gpt/gpt-6-astra，思考档不变（arch-lite medium、precheck low、code-review medium）。
 # 2026-10-20 用户指示：scheduler 不固定模型与思考档，按用户发起工作流时的当前会话
 # 模型运行；因此 scheduler 的 args 只保留权限参数，不写 --model / --thinking。
 # 合并顺序：本文件 → 仓库 .hwf/config.yaml → 仓库 .hwf/config.local.yaml；
@@ -29,25 +34,25 @@ profiles:
   scheduler:
     kind: omp
     args: ["--config", "/Users/pengjiahui/.hwf/scheduler-omp.yml", "--approval-mode", "yolo"]
-  # 架构师（2026-10-24 用户指示）：Claude Code + claude-opus-5-5 + effort medium。
+  # 架构师（2026-11-10 用户指示）：omp + devin/claude-opus-5-5 + thinking medium
+  # （原为 Claude Code + claude-opus-5-5 + effort medium；Claude 账号已停用）。
   # 只承担复杂度判定、关键架构裁决、严重争议拍板与代码最终风险闸门，不编写技术方案；
   # 常规代码评审和回改由 code-review 承担。
-  # 2026-10-28 用户同意：Claude Code 角色加 --exclude-dynamic-system-prompt-sections，
-  # 把工作目录/git 状态移出系统提示，便于跨会话共用缓存（实测每会话约多共用 1.6k 词元）；不改启动目录。
   arch:
-    kind: claude
-    args: ["--model", "claude-opus-5-5", "--effort", "medium", "--exclude-dynamic-system-prompt-sections", "--dangerously-skip-permissions"]
+    kind: omp
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
   # 技术方案编写（arch-lite）：所有技术方案的初稿、逐文件改动、回滚与验证表、评审回改。
-  # 2026-10-24 用户指示：改为 omp + devin/claude-opus-5-5 + thinking medium。
+  # 2026-11-10 用户指示：改为 omp + jc-gpt/gpt-6-astra + thinking medium（原为 devin/claude-opus-5-5）。
   # 不签发、不拍板、不评审自己的方案；编写会话不得兼任同一交付物的 precheck/reviewer/dev。
   arch-lite:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
-  # 方案评审员（2026-10-24 用户指示）：Claude Code + claude-opus-5-5 + effort high。
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6-astra", "--thinking", "medium", "--approval-mode", "yolo"]
+  # 方案评审员（2026-11-10 用户指示）：omp + devin/claude-opus-5-5 + thinking high
+  # （原为 Claude Code + claude-opus-5-5 + effort high）。
   # 结论写在终端最终回复，由调度者 agent read 取回落盘。
   reviewer:
-    kind: claude
-    args: ["--model", "claude-opus-5-5", "--effort", "high", "--exclude-dynamic-system-prompt-sections", "--dangerously-skip-permissions"]
+    kind: omp
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "high", "--approval-mode", "yolo"]
   # 开发者：按 spec 与已评审用例实现、修复验证失败。
   # 2026-10-20 用户指示：模型改为 jc-gpt/gpt-6.1-sol，思考强度 low。
   # 按用户 2026-10-17 指示使用 YOLO（跳过审批与沙箱）。
@@ -88,13 +93,15 @@ profiles:
     args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low"]
   # 双层评审的辅审（precheck）：承担机械阅读、取证、候选问题清单，不输出通过结论。
   # 不计入 5/3/6 评审轮次；最终结论由阶段终审人签发（方案 reviewer、用例 code-review、代码 arch）。
-  # 2026-10-24 用户指示：改为 omp + devin/claude-opus-5-5 + thinking low。
+  # 2026-11-10 用户指示：改为 omp + jc-gpt/gpt-6-astra + thinking low（原为 devin/claude-opus-5-5）。
+  # 不输出通过结论。
   precheck:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "low", "--approval-mode", "yolo"]
-  # 代码评审（2026-10-24 用户指示）：omp + devin/claude-opus-5-5 + thinking medium。
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6-astra", "--thinking", "low", "--approval-mode", "yolo"]
+  # 代码评审（2026-11-10 用户指示）：omp + jc-gpt/gpt-6-astra + thinking medium
+  # （原为 devin/claude-opus-5-5）。
   # 承担完整代码评审、增量闭环与测试用例终审；最终风险签发仍归 arch。
   code-review:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6-astra", "--thinking", "medium", "--approval-mode", "yolo"]
 default_profile: scheduler

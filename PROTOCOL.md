@@ -63,7 +63,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 | 角色 profile | 职责 | 交付物 |
 | --- | --- | --- |
 | scheduler | 组建与复用团队、推进阶段、编写 spec、维护 GitLab issues（含进度标签）、按 arch 确认划分步骤或创建子 issue、核验并关闭 issues；只调度，不亲自执行成员职责范围内的实际工作 | spec、任务依赖、阶段记录、证据索引 |
-| arch | （omp + devin/claude-fable-5-2 + thinking medium）任务复杂度判定（先出方案、防风险两个开关，附关键决定）、步骤划分与子 issue 确认（最多 2 层）、独立评审技术方案、关键架构取舍、严重争议裁决、代码最终风险闸门、**交付结果最终验收（对最终交付的东西是不是当初要的负责）**（不编写技术方案） | 复杂度判定、方案评审结论、关键决定、拆分确认、决策、风险终审结论、最终验收结论 |
+| arch | （默认模型见下文「成员模型」）任务复杂度判定（先出方案、防风险两个开关，附关键决定）、步骤划分与子 issue 确认（最多 2 层）、独立评审技术方案、关键架构取舍、严重争议裁决、代码最终风险闸门、**交付结果最终验收（对最终交付的东西是不是当初要的负责）**（不编写技术方案） | 复杂度判定、方案评审结论、关键决定、拆分确认、决策、风险终审结论、最终验收结论 |
 | arch-lite | 技术方案编写（codex + gpt-6-astra + thinking medium）：初稿、逐文件改动、回改；不签发、不拍板 | 方案与回改版本、回滚与验证表 |
 | precheck | （codex + gpt-6-astra + thinking low）机械阅读、取证、候选问题与严重度建议；不输出结论 | 证据表（file:line / 命令输出） |
 | code-review | （codex + gpt-6-astra + thinking medium）完整代码评审、测试用例终审、常规回改与增量复核；独立于开发者 | 问题清单、修复验证、已审版本与风险交接包 |
@@ -75,7 +75,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 **开发者分前后端（2026-11-02 用户指示）**：改前端代码派 `dev-fe`，改后端代码派 `dev-be`，只改一端时只派那一端；前后端都要改时两人同时开工，按「前后端并行开发」执行。一个开发会话只写一端的仓库，不同时改前后端。本协议其他地方写的 `dev`，指本次改动那一端的开发者（`dev-fe`、`dev-be`，或不分端时的 `dev`）。三者模型以全局插件配置为准。
 
-**成员模型（2026-11-11 用户指示）**：固定使用 GPT 的成员全部使用 codex：`arch-lite`、`code-review` 用 `gpt-6-astra` + thinking medium，`precheck` 用 `gpt-6-astra` + thinking low；`dev`、`dev-fe`、`dev-be`、`test` 用 `gpt-6.1-sol` + thinking medium，`test-writer` 用同模型 + thinking high，`test-herdr` 用同模型 + thinking low。`arch` 保持 omp + `devin/claude-fable-5-2` + thinking medium，同时承担独立方案评审；`scheduler` 仍跟随发起会话，不固定模型。以全局插件配置为准，不得擅自替换。方案作者 arch-lite 与方案评审者 arch 分别领取会话，方案作者不兼任自己的独立评审者；换 profile 或换模型本身不构成独立。测试人员可以写用例、测试脚本和证据，不兼任被验代码的开发者。模型不可用时报告实际阻塞，不能未经用户授权替换指定模型。precheck 只出证据、不出结论；阶段终审人保留结论权与最终闸门：方案评审为 arch，测试用例评审为 code-review（独立会话），代码最终风险闸门为 arch。临时替换模型见双层评审第 11 条。
+**成员模型（2026-11-11 用户指示）**：固定使用 GPT 的成员全部使用 codex：`arch-lite`、`code-review` 用 `gpt-6-astra` + thinking medium，`precheck` 用 `gpt-6-astra` + thinking low；`dev`、`dev-fe`、`dev-be`、`test` 用 `gpt-6.1-sol` + thinking medium，`test-writer` 用同模型 + thinking high，`test-herdr` 用同模型 + thinking low。`arch` 默认使用 omp + `devin/claude-opus-5-5` + thinking medium，同时承担独立方案评审；只有用户明确指定其他模型时才按其指定使用，不自行更换。用户指定的适用范围结束后，恢复全局默认模型；`scheduler` 仍跟随发起会话，不固定模型。以全局插件配置为准，不得擅自替换。方案作者 arch-lite 与方案评审者 arch 分别领取会话，方案作者不兼任自己的独立评审者；换 profile 或换模型本身不构成独立。测试人员可以写用例、测试脚本和证据，不兼任被验代码的开发者。模型不可用时报告实际阻塞，不能未经用户授权替换指定模型。precheck 只出证据、不出结论；阶段终审人保留结论权与最终闸门：方案评审为 arch，测试用例评审为 code-review（独立会话），代码最终风险闸门为 arch。临时替换模型见双层评审第 11 条。
 
 **`scheduler` 绝对不得亲自做实际工作**（2026-10-21 用户指示）：方案编写、开发、测试、评审、取证、浏览器验收等成员职责范围内的工作，一律领取或创建对应角色并派活；scheduler 只做调度、阶段推进、任务记录、GitLab issue 管理、通知与验收，不得以“更快”“更省”“成员忙”或“顺手改一下”为由代做。除协议明确分配给 scheduler 的 spec、issue、任务记录和通知外，不得亲自产出交付物。
 
@@ -108,9 +108,9 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 6. **计轮**：方案/用例的完整终审分别计入 5/3 轮。代码完整评审无论由 code-review 或 arch 执行，均累计到原有 6 轮；定点修复核验单独留痕，不冒充完整评审或重置计数。precheck 的证据整理不计轮；不得把完整代码评审改名为 precheck 来绕过上限。第 7 阶段规定代码的最终放行与升级。
 7. **独立性**：precheck 不得预审自己起草或参与编写的任何被审交付物（方案、测试用例、测试脚本、代码）；也不得兼任该 issue 的 dev。换 profile 或换模型本身不构成独立。
 8. **完成判定**：precheck 以 `预审完成` 结尾；code-review 以 `常规评审通过`/`需修改` 结尾，前者只表示可进入风险终审，不是最终放行；阶段终审人以 `通过`/`需修改` 结尾。所有结论对应明确版本，调度者按「派活、等待与结果收取」确认完成并归档 `reviews/`。
-9. **启用前提**：模型、执行体或 herdr 版本变化后，首次使用该 profile 前须实测 herdr 能识别其 `working`/`blocked` 状态与结论格式（2026-11-11 GPT 成员统一改用 codex，需重跑；arch 改为 Fable 5.2 的核验要求不变）。
+9. **启用前提**：模型、执行体或 herdr 版本变化后，首次使用该 profile 前须实测 herdr 能识别其 `working`/`blocked` 状态与结论格式（2026-11-11 GPT 成员统一改用 codex，需重跑；arch 恢复默认模型后仍按本条核验）。
 10. **试点与指标**：记录实际试点清单、各模型总成本与 turns、严重漏检、审后返工和运行缺陷。代码使用“code-review 完整评审与增量闭环、arch 关键风险终审”；该流程按第 7 阶段执行，不以每次改代码为由重新调用 arch。方案/用例评审与 arch-lite 方案编写仍分别统计；未有同规模对照前，不宣称成本下降比例已达标。
-11. **临时替换模型**：指定模型额度耗尽或不可用时，先报告实际阻塞，取得用户针对本次替换的明确授权后才换模型。终审必须在独立的新会话中进行，precheck 和方案作者不得兼任该终审。STATE 记录授权来源、实际模型与实际 thinking；额度恢复后切回该角色配置指定的模型。替换模型不等于取消终审。
+11. **临时替换模型**：用户明确指定其他模型时，按其指定使用并记录适用范围；指定模型额度耗尽或不可用时，先报告实际阻塞，取得用户针对本次替换的明确授权后才换模型。终审必须在独立的新会话中进行，precheck 和方案作者不得兼任该终审。STATE 记录授权来源、适用范围、实际模型与实际 thinking；授权范围结束后恢复该角色配置的默认模型，因额度不足临时替换的按授权在额度恢复后切回。替换模型不等于取消终审。
 12. **审计字段**：每次 precheck 与终审都记录：issue/阶段、交付物版本（SHA 或路径+时间）、证据表编号与路径、name/pane/session、实际 model 与 thinking、对应的终审轮次、终审人采纳/驳回结果。配置文件值不能代替实际会话记录。
 
 ### 技术方案编写（arch-lite）
@@ -155,7 +155,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 - **只用脚本领取（2026-11-08 用户指示）**：`python3 ~/.hwf/scripts/member-start.py <profile> --task <任务> [--cwd <worktree>] [--exclude <登记名>]… [--keep-session]`。脚本按登记名（`i<编号>-<profile>`）找本调度者名下 `idle`/`done` 的同角色成员，有就在原 pane 退出旧会话、按配置重启（`--keep-session` 且正在跑的命令行与配置一致时原样交回）。**只复用本 issue（或建 issue 前 `new-`）的成员，且其 pane 工作目录必须等于 `--cwd`**：别的 issue 的成员在那个 issue 收尾前没有释放，一律不拉来复用（2026-11-09 用户指示；#453 曾把 #464 的开发拉来，在 #464 的 worktree 里重启）。没有才在本调度者 tab 切 pane（太挤开新 tab）新建；启动参数只取 hwf 合并后的角色配置，配置没写模型的角色拒绝启动；同时设好 `角色-模型-任务` pane 标题。stdout 一行 JSON（`action`/`name`/`pane_id`/`session`/`args`/`created_by`），原样记入 STATE。来由：2026-11-07 #453 调度者手写参数，把开发者的 gpt-6.1-sol 参数给了架构师，又只看窗口标题没认出已在的架构师，重复新建。
   - 知道某个空闲成员还有在途任务或未收取产出时，用 `--exclude` 排除它，不得改用手写命令绕开。
-  - 用户授权临时换模型（如额度耗尽）时加 `--model-override <模型> --authorized-by <授权评论链接>`，只替换模型值；没有授权链接脚本拒绝。
+  - 用户明确指定其他模型（包括额度耗尽时授权临时替换）时加 `--model-override <模型> --authorized-by <用户授权出处>`，出处为 issue 评论链接或可定位的会话消息；只替换模型值，没有授权出处脚本拒绝。
   - 脚本失败（非 0）就按阻塞处理并写入 STATE，不得手写命令兜底。
 - 角色名称按「登记名规则」；既有 `arch`、`arch-lite`、`dev`、`test` 等明确角色也必须检查。hwf 自动生成的名称不能替代角色登记。
 - 同角色有本团队、本 issue 的 `idle`/`done` 成员时，优先读取其最近结果并确认上一个任务交付已收取，然后复用该 pane。**本团队有可用的同角色空闲成员时，禁止再创建该角色。** 本调度者团队的空闲成员在其他 tab/workspace 时也要检查并复用，不以“当前 tab 没有”作为重复创建理由；其他调度者的成员不属于本团队，不参与检查或复用。

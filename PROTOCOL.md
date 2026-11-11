@@ -64,7 +64,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 | --- | --- | --- |
 | scheduler | 组建与复用团队、推进阶段、编写 spec、维护 GitLab issues（含进度标签）、按 arch 确认划分步骤或创建子 issue、核验并关闭 issues；只调度，不亲自执行成员职责范围内的实际工作 | spec、任务依赖、阶段记录、证据索引 |
 | arch | （omp + devin/claude-fable-5-2 + thinking medium）任务复杂度判定（先出方案、防风险两个开关，附关键决定）、步骤划分与子 issue 确认（最多 2 层）、独立评审技术方案、关键架构取舍、严重争议裁决、代码最终风险闸门、**交付结果最终验收（对最终交付的东西是不是当初要的负责）**（不编写技术方案） | 复杂度判定、方案评审结论、关键决定、拆分确认、决策、风险终审结论、最终验收结论 |
-| arch-lite | 技术方案编写（omp + devin/claude-opus-5-5 + thinking medium）：初稿、逐文件改动、回改；不签发、不拍板 | 方案与回改版本、回滚与验证表 |
+| arch-lite | 技术方案编写（omp + jc-gpt/gpt-6-astra + thinking medium）：初稿、逐文件改动、回改；不签发、不拍板 | 方案与回改版本、回滚与验证表 |
 | precheck | （omp + jc-gpt/gpt-6-astra + thinking low）机械阅读、取证、候选问题与严重度建议；不输出结论 | 证据表（file:line / 命令输出） |
 | code-review | （omp + jc-gpt/gpt-6-astra + thinking medium）完整代码评审、测试用例终审、常规回改与增量复核；独立于开发者 | 问题清单、修复验证、已审版本与风险交接包 |
 | test-writer | spec 编写测试用例并按评审回改；子/孙 issue 需要时补定向断言 | 用例、可提前编写的脚本 |
@@ -76,7 +76,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 **开发者分前后端（2026-11-02 用户指示）**：改前端代码派 `dev-fe`，改后端代码派 `dev-be`，只改一端时只派那一端；前后端都要改时两人同时开工，按「前后端并行开发」执行。一个开发会话只写一端的仓库，不同时改前后端。本协议其他地方写的 `dev`，指本次改动那一端的开发者（`dev-fe`、`dev-be`，或不分端时的 `dev`）。三者模型以全局插件配置为准。
 
-**成员模型（2026-11-11 用户指示）**：`arch` 用 omp + `devin/claude-fable-5-2` + thinking medium，同时承担独立方案评审；`arch-lite`（方案编写）用 omp + `devin/claude-opus-5-5` + thinking medium；`code-review` 用 omp + `jc-gpt/gpt-6-astra` + thinking medium；`precheck` 用 omp + `jc-gpt/gpt-6-astra` + thinking low；`dev`、`dev-fe`、`dev-be` 用 omp + `jc-gpt/gpt-6.1-sol` + thinking medium。以全局插件配置为准，不得擅自替换。方案作者 arch-lite 与方案评审者 arch 分别领取会话，方案作者不兼任自己的独立评审者；换 profile 或换模型本身不构成独立。测试人员可以写用例、测试脚本和证据，不兼任被验代码的开发者。模型不可用时报告实际阻塞，不能未经用户授权替换指定模型。precheck 只出证据、不出结论；阶段终审人保留结论权与最终闸门：方案评审为 arch，测试用例评审为 code-review（独立会话），代码最终风险闸门为 arch。临时替换模型见双层评审第 11 条。
+**成员模型（2026-11-11 用户指示）**：`arch` 用 omp + `devin/claude-fable-5-2` + thinking medium，同时承担独立方案评审；`arch-lite`（方案编写）用 omp + `jc-gpt/gpt-6-astra` + thinking medium；`code-review` 用 omp + `jc-gpt/gpt-6-astra` + thinking medium；`precheck` 用 omp + `jc-gpt/gpt-6-astra` + thinking low；`dev`、`dev-fe`、`dev-be` 用 omp + `jc-gpt/gpt-6.1-sol` + thinking medium。以全局插件配置为准，不得擅自替换。方案作者 arch-lite 与方案评审者 arch 分别领取会话，方案作者不兼任自己的独立评审者；换 profile 或换模型本身不构成独立。测试人员可以写用例、测试脚本和证据，不兼任被验代码的开发者。模型不可用时报告实际阻塞，不能未经用户授权替换指定模型。precheck 只出证据、不出结论；阶段终审人保留结论权与最终闸门：方案评审为 arch，测试用例评审为 code-review（独立会话），代码最终风险闸门为 arch。临时替换模型见双层评审第 11 条。
 
 **`scheduler` 绝对不得亲自做实际工作**（2026-10-21 用户指示）：方案编写、开发、测试、评审、取证、浏览器验收等成员职责范围内的工作，一律领取或创建对应角色并派活；scheduler 只做调度、阶段推进、任务记录、GitLab issue 管理、通知与验收，不得以“更快”“更省”“成员忙”或“顺手改一下”为由代做。除协议明确分配给 scheduler 的 spec、issue、任务记录和通知外，不得亲自产出交付物。
 
@@ -109,16 +109,16 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 6. **计轮**：方案/用例的完整终审分别计入 5/3 轮。代码完整评审无论由 code-review 或 arch 执行，均累计到原有 6 轮；定点修复核验单独留痕，不冒充完整评审或重置计数。precheck 的证据整理不计轮；不得把完整代码评审改名为 precheck 来绕过上限。第 7 阶段规定代码的最终放行与升级。
 7. **独立性**：precheck 不得预审自己起草或参与编写的任何被审交付物（方案、测试用例、测试脚本、代码）；也不得兼任该 issue 的 dev。换 profile 或换模型本身不构成独立。
 8. **完成判定**：precheck 以 `预审完成` 结尾；code-review 以 `常规评审通过`/`需修改` 结尾，前者只表示可进入风险终审，不是最终放行；阶段终审人以 `通过`/`需修改` 结尾。所有结论对应明确版本，调度者按「派活、等待与结果收取」确认完成并归档 `reviews/`。
-9. **启用前提**：模型、执行体或 herdr 版本变化后，首次使用该 profile 前须实测 herdr 能识别其 `working`/`blocked` 状态与结论格式（2026-11-11 arch 改为 Fable 5.2、arch-lite 改为 Opus 5.5，需重跑）。
+9. **启用前提**：模型、执行体或 herdr 版本变化后，首次使用该 profile 前须实测 herdr 能识别其 `working`/`blocked` 状态与结论格式（2026-11-11 arch 改为 Fable 5.2、arch-lite 改为 GPT-6-Astra，需重跑）。
 10. **试点与指标**：记录实际试点清单、各模型总成本与 turns、严重漏检、审后返工和运行缺陷。代码使用“code-review 完整评审与增量闭环、arch 关键风险终审”；该流程按第 7 阶段执行，不以每次改代码为由重新调用 arch。方案/用例评审与 arch-lite 方案编写仍分别统计；未有同规模对照前，不宣称成本下降比例已达标。
 11. **临时替换模型**：指定模型额度耗尽或不可用时，先报告实际阻塞，取得用户针对本次替换的明确授权后才换模型。终审必须在独立的新会话中进行，precheck 和方案作者不得兼任该终审。STATE 记录授权来源、实际模型与实际 thinking；额度恢复后切回该角色配置指定的模型。替换模型不等于取消终审。
 12. **审计字段**：每次 precheck 与终审都记录：issue/阶段、交付物版本（SHA 或路径+时间）、证据表编号与路径、name/pane/session、实际 model 与 thinking、对应的终审轮次、终审人采纳/驳回结果。配置文件值不能代替实际会话记录。
 
 ### 技术方案编写（arch-lite）
 
-技术方案统一由 `arch-lite` profile（omp + `devin/claude-opus-5-5` + thinking medium，2026-11-11 用户指示）编写；`arch` 不编写方案，承担独立方案评审、关键取舍、严重争议裁决、代码最终风险闸门与最终验收。
+技术方案统一由 `arch-lite` profile（omp + `jc-gpt/gpt-6-astra` + thinking medium，2026-11-11 用户指示）编写；`arch` 不编写方案，承担独立方案评审、关键取舍、严重争议裁决、代码最终风险闸门与最终验收。
 
-1. **模型固定**：方案编写一律使用 omp + `devin/claude-opus-5-5` + thinking medium，不得依赖执行体默认模型，也不得擅自替换；实际 model/thinking 记入 STATE。
+1. **模型固定**：方案编写一律使用 omp + `jc-gpt/gpt-6-astra` + thinking medium，不得依赖执行体默认模型，也不得擅自替换；实际 model/thinking 记入 STATE。
 2. **职责边界**：arch-lite 产出方案初稿、逐文件改动、回滚与验证表，并按评审意见回改；不签发、不拍板、不评审自己的方案。
 3. **闸门**：方案由 arch 按双层评审签发，并负责方案取舍与争议拍板；precheck 只出证据。
 4. **独立性**：arch-lite 会话不得兼任同一交付物的 precheck、arch 或 dev；换 profile/模型不构成独立。

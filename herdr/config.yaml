@@ -1,6 +1,7 @@
 # 机器级角色定义（hwf 全局插件配置层，最低优先级）。
 # 2026-11-11 用户指示：arch 使用 Fable 5.2，并承担方案评审；arch-lite 使用 GPT-6-Astra。
 # 两者 thinking 均为 medium；三个开发角色 thinking 改为 medium，模型保持 gpt-6.1-sol。
+# 2026-11-11 用户指示：固定使用 GPT 的成员统一用 codex；模型与思考强度不变。
 # 模型不可用时先报告；每次临时替换须用户确认，替换与恢复都记入 STATE。
 # 2026-10-20 用户指示：scheduler 不固定模型与思考档，按用户发起工作流时的当前会话
 # 模型运行；因此 scheduler 的 args 只保留权限参数，不写 --model / --thinking。
@@ -32,60 +33,51 @@ profiles:
     kind: omp
     args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-fable-5-2", "--thinking", "medium", "--approval-mode", "yolo"]
   # 技术方案编写（arch-lite）：所有技术方案的初稿、逐文件改动、回滚与验证表、评审回改。
-  # 2026-11-11 用户指示：方案作者改用 omp + jc-gpt/gpt-6-astra，thinking 保持 medium。
+  # 方案作者使用 codex + gpt-6-astra，思考强度 medium。
   # 不签发、不拍板、不评审自己的方案；编写会话不得兼任同一交付物的 precheck/arch/dev。
   arch-lite:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6-astra", "--thinking", "medium", "--approval-mode", "yolo"]
+    kind: codex
+    args: ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=medium", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
   # 开发者：按 spec 与已评审用例实现、修复验证失败。
-  # 2026-11-11 用户指示：三个开发角色均使用 jc-gpt/gpt-6.1-sol，思考强度 medium。
+  # 三个开发角色均使用 codex + gpt-6.1-sol，思考强度 medium。
   # 按用户 2026-10-17 指示使用 YOLO（跳过审批与沙箱）。
   # worktree cwd 由调度者通过 `pane split --cwd` 提供。
   dev:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "medium", "--approval-mode", "yolo"]
+    kind: codex
+    args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=medium", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
   # 2026-11-02 用户指示：开发者分前后端，需求前后端都改时两人并行（见 PROTOCOL「前后端并行开发」）。
   # dev-fe 只写前端仓库、dev-be 只写后端仓库；模型暂与 dev 相同，需要时各自改。
   # dev 保留给不分前后端的仓库。
   dev-fe:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "medium", "--approval-mode", "yolo"]
-  dev-be:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "medium", "--approval-mode", "yolo"]
-  # 2026-11-07 用户指示：测试只用 GPT 模型；写用例用 gpt-6.1-sol + 思考高，执行测试用 gpt-6-luna + 思考中。
-  # 2026-11-10 用户指示：luna 执行测试太死板（#453 12 轮里多次自停），test / test-electron 换回 gpt-6.1-sol，思考仍为中。
-  # 写用例。审批与 cwd 同 dev（YOLO）。
-  test-writer:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "high", "--approval-mode", "yolo"]
-  # 代码评审通过后执行浏览器自动化测试。
-  # 2026-11-06 用户指示：浏览器测试用 omp，只有必须验证桌面应用（Electron）时才用下面的 test-electron。
-  test:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "medium", "--approval-mode", "yolo"]
-  # 只测桌面应用（Electron）时用；判断标准见 PROTOCOL.md §8。
-  test-electron:
     kind: codex
     args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=medium", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
-  # 需要访问 herdr socket 的验证角色。codex 的 workspace-write 沙箱会拒绝 herdr socket
-  # （req-20261017-7a17bc93 实测 PermissionDenied），此时才可偏离 `test` 使用本 profile。
-  # 必须显式固定模型：pi 的默认模型是 deepseek-v4-pro，裸 `--kind pi` 会产生未预期的额度消费
-  # （2026-10-17 实测：56 turns ≈ $0.389）。任何成员都不得依赖执行体默认模型。
+  dev-be:
+    kind: codex
+    args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=medium", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
+  # 测试使用 gpt-6.1-sol：写用例思考强度 high，执行测试 medium。
+  # 写用例。审批与 cwd 同 dev（YOLO）。
+  test-writer:
+    kind: codex
+    args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=high", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
+  # 2026-11-11 用户指示：浏览器与 Electron 测试统一由 test 执行，按需求选择启动方式。
+  test:
+    kind: codex
+    args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=medium", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
+  # 需要访问 herdr socket 的验证角色；沿用 YOLO 权限，避免 workspace-write 沙箱拒绝 socket。
+  # 显式固定模型，思考强度保留 low。
   test-herdr:
-    kind: pi
-    args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low"]
+    kind: codex
+    args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=low", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
   # 双层评审的辅审（precheck）：承担机械阅读、取证、候选问题清单，不输出通过结论。
   # 不计入 5/3/6 评审轮次；最终结论由阶段终审人签发（方案 arch、用例 code-review、代码 arch）。
-  # 2026-11-10 用户指示：改为 omp + jc-gpt/gpt-6-astra + thinking low（原为 devin/claude-opus-5-5）。
+  # 使用 codex + gpt-6-astra，思考强度 low。
   # 不输出通过结论。
   precheck:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6-astra", "--thinking", "low", "--approval-mode", "yolo"]
-  # 代码评审（2026-11-10 用户指示）：omp + jc-gpt/gpt-6-astra + thinking medium
-  # （原为 devin/claude-opus-5-5）。
+    kind: codex
+    args: ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=low", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
+  # 代码评审使用 codex + gpt-6-astra，思考强度 medium。
   # 承担完整代码评审、增量闭环与测试用例终审；最终风险签发仍归 arch。
   code-review:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6-astra", "--thinking", "medium", "--approval-mode", "yolo"]
+    kind: codex
+    args: ["-m", "gpt-6-astra", "-c", "model_reasoning_effort=medium", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
 default_profile: scheduler

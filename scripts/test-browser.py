@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""给浏览器测试准备一个「全新、已登录」的浏览器目录，输出 omp 浏览器工具直接能用的打开参数。
+"""给浏览器测试准备一个「全新、已登录」的浏览器目录，输出浏览器路径、启动参数和登录目录。
 
     python3 ~/.hwf/scripts/test-browser.py <worktree> --url <被测地址> --account <测试账号> --out <本轮证据目录>
 
 为什么有它：2026-11-09 #453 浏览器测试跑了 12 轮，8 轮卡在「浏览器目录不干净 / 登录点不上」这类准备工作上，
 测试成员每轮新会话从头摸索，还用 `persist: true` 打开了共用的旧目录，再以「目录不干净」为由自停。
 准备环境不再交给模型临场发挥：本脚本每次删掉重建 `<out>/browser-profile`，调用项目登录脚本登录，
-成功后输出一行 JSON，其中 `open` 原样传给 omp 的 `browser.open(...)` 即是同一目录、已登录的浏览器。
+成功后输出一行 JSON；Codex 按 open.app.path、open.app.args 和 url 打开同一 profile。
+open 字段保留 omp 的 browser.open(...) 参数格式，其他工具按对应字段启动，不另建登录目录。
 
 项目在 docs/agents/herdr-project.yaml 里配置登录脚本（在 worktree 里运行，占位符 {url} {account} {profile}）：
 

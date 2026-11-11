@@ -1,16 +1,7 @@
 # 机器级角色定义（hwf 全局插件配置层，最低优先级）。
-# 模型降级（用户 2026-10-17 指示）：Opus 额度于 15:02 耗尽、16:30 确认恢复；
-# 降级期间 scheduler/arch/reviewer 曾切到 jc-gpt/gpt-6-astra + thinking medium，
-# 恢复后已切回 devin/claude-opus-5-5。
-# 每次额度耗尽后的降级须用户确认；降级与恢复都记入 STATE。
-# 2026-10-20 用户指示：技术方案编写改由 gpt-6-astra 模型、thinking medium 承担；
-# 该职责固定使用 arch-lite，不再限于试点，也不再以 Opus 终审可用为前提。
-# arch（Opus）保留关键架构取舍、严重争议裁决与代码最终风险闸门，不编写技术方案。
-# 2026-11-10 用户指示（当前生效的模型分配）：Claude 账号已停用，配置里不再有 kind: claude。
-# 「原来是 Claude Code + claude-opus-5-5」的角色（arch、reviewer）改为 omp + devin/claude-opus-5-5，
-# 思考档沿用原来的 effort（arch medium、reviewer high）；
-# 「原来是 omp + devin/claude-opus-5-5」的角色（arch-lite、precheck、code-review）改为
-# omp + jc-gpt/gpt-6-astra，思考档不变（arch-lite medium、precheck low、code-review medium）。
+# 2026-11-11 用户指示：arch 使用 Fable 5.2，并承担方案评审；arch-lite 使用 Opus 5.5。
+# 两者 thinking 均为 medium；三个开发角色 thinking 改为 medium，模型保持 gpt-6.1-sol。
+# 模型不可用时先报告；每次临时替换须用户确认，替换与恢复都记入 STATE。
 # 2026-10-20 用户指示：scheduler 不固定模型与思考档，按用户发起工作流时的当前会话
 # 模型运行；因此 scheduler 的 args 只保留权限参数，不写 --model / --thinking。
 # 合并顺序：本文件 → 仓库 .hwf/config.yaml → 仓库 .hwf/config.local.yaml；
@@ -34,41 +25,34 @@ profiles:
   scheduler:
     kind: omp
     args: ["--config", "/Users/pengjiahui/.hwf/scheduler-omp.yml", "--approval-mode", "yolo"]
-  # 架构师（2026-11-10 用户指示）：omp + devin/claude-opus-5-5 + thinking medium
-  # （原为 Claude Code + claude-opus-5-5 + effort medium；Claude 账号已停用）。
-  # 只承担复杂度判定、关键架构裁决、严重争议拍板与代码最终风险闸门，不编写技术方案；
+  # 架构师：omp + devin/claude-fable-5-2 + thinking medium。
+  # 承担复杂度判定、独立方案评审、关键取舍、风险终审与最终验收；不编写技术方案。
   # 常规代码评审和回改由 code-review 承担。
   arch:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-fable-5-2", "--thinking", "medium", "--approval-mode", "yolo"]
   # 技术方案编写（arch-lite）：所有技术方案的初稿、逐文件改动、回滚与验证表、评审回改。
-  # 2026-11-10 用户指示：改为 omp + jc-gpt/gpt-6-astra + thinking medium（原为 devin/claude-opus-5-5）。
-  # 不签发、不拍板、不评审自己的方案；编写会话不得兼任同一交付物的 precheck/reviewer/dev。
+  # 2026-11-11 用户指示：omp + devin/claude-opus-5-5 + thinking medium。
+  # 不签发、不拍板、不评审自己的方案；编写会话不得兼任同一交付物的 precheck/arch/dev。
   arch-lite:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6-astra", "--thinking", "medium", "--approval-mode", "yolo"]
-  # 方案评审员（2026-11-10 用户指示）：omp + devin/claude-opus-5-5 + thinking high
-  # （原为 Claude Code + claude-opus-5-5 + effort high）。
-  # 结论写在终端最终回复，由调度者 agent read 取回落盘。
-  reviewer:
-    kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "high", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
   # 开发者：按 spec 与已评审用例实现、修复验证失败。
-  # 2026-10-20 用户指示：模型改为 jc-gpt/gpt-6.1-sol，思考强度 low。
+  # 2026-11-11 用户指示：三个开发角色均使用 jc-gpt/gpt-6.1-sol，思考强度 medium。
   # 按用户 2026-10-17 指示使用 YOLO（跳过审批与沙箱）。
   # worktree cwd 由调度者通过 `pane split --cwd` 提供。
   dev:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "medium", "--approval-mode", "yolo"]
   # 2026-11-02 用户指示：开发者分前后端，需求前后端都改时两人并行（见 PROTOCOL「前后端并行开发」）。
   # dev-fe 只写前端仓库、dev-be 只写后端仓库；模型暂与 dev 相同，需要时各自改。
   # dev 保留给不分前后端的仓库。
   dev-fe:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "medium", "--approval-mode", "yolo"]
   dev-be:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "medium", "--approval-mode", "yolo"]
   # 2026-11-07 用户指示：测试只用 GPT 模型；写用例用 gpt-6.1-sol + 思考高，执行测试用 gpt-6-luna + 思考中。
   # 2026-11-10 用户指示：luna 执行测试太死板（#453 12 轮里多次自停），test / test-electron 换回 gpt-6.1-sol，思考仍为中。
   # 写用例。审批与 cwd 同 dev（YOLO）。
@@ -92,7 +76,7 @@ profiles:
     kind: pi
     args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low"]
   # 双层评审的辅审（precheck）：承担机械阅读、取证、候选问题清单，不输出通过结论。
-  # 不计入 5/3/6 评审轮次；最终结论由阶段终审人签发（方案 reviewer、用例 code-review、代码 arch）。
+  # 不计入 5/3/6 评审轮次；最终结论由阶段终审人签发（方案 arch、用例 code-review、代码 arch）。
   # 2026-11-10 用户指示：改为 omp + jc-gpt/gpt-6-astra + thinking low（原为 devin/claude-opus-5-5）。
   # 不输出通过结论。
   precheck:

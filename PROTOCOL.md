@@ -63,9 +63,8 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 | 角色 profile | 职责 | 交付物 |
 | --- | --- | --- |
 | scheduler | 组建与复用团队、推进阶段、编写 spec、维护 GitLab issues（含进度标签）、按 arch 确认划分步骤或创建子 issue、核验并关闭 issues；只调度，不亲自执行成员职责范围内的实际工作 | spec、任务依赖、阶段记录、证据索引 |
-| arch | （omp + devin/claude-opus-5-5 + thinking medium）任务复杂度判定（先出方案、防风险两个开关，附关键决定）、步骤划分与子 issue 确认（最多 2 层）、关键架构取舍、严重争议裁决、代码最终风险闸门、**交付结果最终验收（对最终交付的东西是不是当初要的负责）**（不编写技术方案） | 复杂度判定、关键决定、拆分确认、决策、风险终审结论、最终验收结论 |
-| arch-lite | 技术方案编写（omp + jc-gpt/gpt-6-astra + thinking medium）：初稿、逐文件改动、回改；不签发、不拍板 | 方案与回改版本、回滚与验证表 |
-| reviewer | 独立评审技术方案（omp + devin/claude-opus-5-5 + thinking high）；测试用例评审由 code-review 独立会话承担 | 问题及严重程度、证据、通过/需修改结论 |
+| arch | （omp + devin/claude-fable-5-2 + thinking medium）任务复杂度判定（先出方案、防风险两个开关，附关键决定）、步骤划分与子 issue 确认（最多 2 层）、独立评审技术方案、关键架构取舍、严重争议裁决、代码最终风险闸门、**交付结果最终验收（对最终交付的东西是不是当初要的负责）**（不编写技术方案） | 复杂度判定、方案评审结论、关键决定、拆分确认、决策、风险终审结论、最终验收结论 |
+| arch-lite | 技术方案编写（omp + devin/claude-opus-5-5 + thinking medium）：初稿、逐文件改动、回改；不签发、不拍板 | 方案与回改版本、回滚与验证表 |
 | precheck | （omp + jc-gpt/gpt-6-astra + thinking low）机械阅读、取证、候选问题与严重度建议；不输出结论 | 证据表（file:line / 命令输出） |
 | code-review | （omp + jc-gpt/gpt-6-astra + thinking medium）完整代码评审、测试用例终审、常规回改与增量复核；独立于开发者 | 问题清单、修复验证、已审版本与风险交接包 |
 | test-writer | spec 编写测试用例并按评审回改；子/孙 issue 需要时补定向断言 | 用例、可提前编写的脚本 |
@@ -77,7 +76,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 **开发者分前后端（2026-11-02 用户指示）**：改前端代码派 `dev-fe`，改后端代码派 `dev-be`，只改一端时只派那一端；前后端都要改时两人同时开工，按「前后端并行开发」执行。一个开发会话只写一端的仓库，不同时改前后端。本协议其他地方写的 `dev`，指本次改动那一端的开发者（`dev-fe`、`dev-be`，或不分端时的 `dev`）。三者模型以全局插件配置为准。
 
-**成员模型（2026-11-10 用户指示）**：Claude 账号已停用，配置里不再有 `kind: claude`。`arch` 用 omp + `devin/claude-opus-5-5` + thinking medium；`reviewer`（方案评审）用 omp + `devin/claude-opus-5-5` + thinking high；`arch-lite`（方案编写）、`code-review` 用 omp + `jc-gpt/gpt-6-astra` + thinking medium；`precheck` 用 omp + `jc-gpt/gpt-6-astra` + thinking low。以全局插件配置为准，不得擅自替换。方案作者与评审员分别领取会话，方案作者不兼任自己的独立评审员；换 profile 或换模型本身不构成独立。测试人员可以写用例、测试脚本和证据，不兼任被验代码的开发者。模型不可用时报告实际阻塞，不能未经用户授权替换指定模型。precheck 只出证据、不出结论；阶段终审人保留结论权与最终闸门：方案评审为 reviewer，测试用例评审为 code-review（独立会话），代码最终风险闸门为 arch。Opus 额度耗尽时的降级见双层评审第 11 条。
+**成员模型（2026-11-11 用户指示）**：`arch` 用 omp + `devin/claude-fable-5-2` + thinking medium，同时承担独立方案评审；`arch-lite`（方案编写）用 omp + `devin/claude-opus-5-5` + thinking medium；`code-review` 用 omp + `jc-gpt/gpt-6-astra` + thinking medium；`precheck` 用 omp + `jc-gpt/gpt-6-astra` + thinking low；`dev`、`dev-fe`、`dev-be` 用 omp + `jc-gpt/gpt-6.1-sol` + thinking medium。以全局插件配置为准，不得擅自替换。方案作者 arch-lite 与方案评审者 arch 分别领取会话，方案作者不兼任自己的独立评审者；换 profile 或换模型本身不构成独立。测试人员可以写用例、测试脚本和证据，不兼任被验代码的开发者。模型不可用时报告实际阻塞，不能未经用户授权替换指定模型。precheck 只出证据、不出结论；阶段终审人保留结论权与最终闸门：方案评审为 arch，测试用例评审为 code-review（独立会话），代码最终风险闸门为 arch。临时替换模型见双层评审第 11 条。
 
 **`scheduler` 绝对不得亲自做实际工作**（2026-10-21 用户指示）：方案编写、开发、测试、评审、取证、浏览器验收等成员职责范围内的工作，一律领取或创建对应角色并派活；scheduler 只做调度、阶段推进、任务记录、GitLab issue 管理、通知与验收，不得以“更快”“更省”“成员忙”或“顺手改一下”为由代做。除协议明确分配给 scheduler 的 spec、issue、任务记录和通知外，不得亲自产出交付物。
 
@@ -98,9 +97,9 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 ## 双层评审（precheck + 阶段终审人）
 
-方案由 `precheck` 取证、reviewer 终审；测试用例由 `precheck` 取证、code-review 独立会话终审。代码使用第 7 阶段的独立流程：`code-review` 承担完整评审与常规闭环，arch 只在最终版本集中审查关键风险。代码不再由 arch 重复执行每轮常规全量评审。
+方案由 `precheck` 取证、arch 终审；测试用例由 `precheck` 取证、code-review 独立会话终审。代码使用第 7 阶段的独立流程：`code-review` 承担完整评审与常规闭环，arch 只在最终版本集中审查关键风险。代码不再由 arch 重复执行每轮常规全量评审。
 
-阶段出口的签发人：方案为 reviewer，测试用例为 code-review，代码最终风险闸门为 arch，交付结果最终验收为 arch（见 §9.1「arch 最终验收」）。code-review 的常规评审结论不等于最终放行。子/孙任务不适用方案评审与用例评审；代码评审仍按 §7 执行（见 §3.1）。
+阶段出口的签发人：方案为 arch，测试用例为 code-review，代码最终风险闸门为 arch，交付结果最终验收为 arch（见 §9.1「arch 最终验收」）。code-review 的常规评审结论不等于最终放行。子/孙任务不适用方案评审与用例评审；代码评审仍按 §7 执行（见 §3.1）。
 
 1. **precheck 只出证据，不出结论**：每条候选问题必须带 `file:line` 或命令输出；可给严重度建议，但不得输出「通过/需修改」。它说「没问题」不能作为通过依据。
 2. **防锚定**：阶段终审人先独立读取交付物并写下自己的严重项，再读 precheck 的证据表；派活模板必须写明这个顺序。
@@ -110,21 +109,21 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 6. **计轮**：方案/用例的完整终审分别计入 5/3 轮。代码完整评审无论由 code-review 或 arch 执行，均累计到原有 6 轮；定点修复核验单独留痕，不冒充完整评审或重置计数。precheck 的证据整理不计轮；不得把完整代码评审改名为 precheck 来绕过上限。第 7 阶段规定代码的最终放行与升级。
 7. **独立性**：precheck 不得预审自己起草或参与编写的任何被审交付物（方案、测试用例、测试脚本、代码）；也不得兼任该 issue 的 dev。换 profile 或换模型本身不构成独立。
 8. **完成判定**：precheck 以 `预审完成` 结尾；code-review 以 `常规评审通过`/`需修改` 结尾，前者只表示可进入风险终审，不是最终放行；阶段终审人以 `通过`/`需修改` 结尾。所有结论对应明确版本，调度者按「派活、等待与结果收取」确认完成并归档 `reviews/`。
-9. **启用前提**：模型、执行体或 herdr 版本变化后，首次使用该 profile 前须实测 herdr 能识别其 `working`/`blocked` 状态与结论格式（2026-11-10 arch/reviewer 改为 omp + devin/claude-opus-5-5、arch-lite/precheck/code-review 改为 omp + jc-gpt/gpt-6-astra，需重跑）。
+9. **启用前提**：模型、执行体或 herdr 版本变化后，首次使用该 profile 前须实测 herdr 能识别其 `working`/`blocked` 状态与结论格式（2026-11-11 arch 改为 Fable 5.2、arch-lite 改为 Opus 5.5，需重跑）。
 10. **试点与指标**：记录实际试点清单、各模型总成本与 turns、严重漏检、审后返工和运行缺陷。代码使用“code-review 完整评审与增量闭环、arch 关键风险终审”；该流程按第 7 阶段执行，不以每次改代码为由重新调用 arch。方案/用例评审与 arch-lite 方案编写仍分别统计；未有同规模对照前，不宣称成本下降比例已达标。
-11. **额度降级**：Opus 额度耗尽时，按用户指示由 jc-gpt/gpt-6-astra + thinking medium 承担终审（涉及使用 Opus 的角色：arch、reviewer）；终审必须在独立的新会话中进行，precheck 不得兼任该终审。STATE 记录实际模型与实际 thinking；额度恢复后切回 Opus。降级不等于取消终审。
+11. **临时替换模型**：指定模型额度耗尽或不可用时，先报告实际阻塞，取得用户针对本次替换的明确授权后才换模型。终审必须在独立的新会话中进行，precheck 和方案作者不得兼任该终审。STATE 记录授权来源、实际模型与实际 thinking；额度恢复后切回该角色配置指定的模型。替换模型不等于取消终审。
 12. **审计字段**：每次 precheck 与终审都记录：issue/阶段、交付物版本（SHA 或路径+时间）、证据表编号与路径、name/pane/session、实际 model 与 thinking、对应的终审轮次、终审人采纳/驳回结果。配置文件值不能代替实际会话记录。
 
 ### 技术方案编写（arch-lite）
 
-技术方案统一由 `arch-lite` profile（omp + `jc-gpt/gpt-6-astra` + thinking medium，2026-11-10 用户指示）编写；`arch` 不编写方案，只负责取舍、严重争议裁决和代码最终风险闸门。
+技术方案统一由 `arch-lite` profile（omp + `devin/claude-opus-5-5` + thinking medium，2026-11-11 用户指示）编写；`arch` 不编写方案，承担独立方案评审、关键取舍、严重争议裁决、代码最终风险闸门与最终验收。
 
-1. **模型固定**：方案编写一律使用 omp + `jc-gpt/gpt-6-astra` + thinking medium，不得依赖执行体默认模型，也不得擅自替换；实际 model/thinking 记入 STATE。
+1. **模型固定**：方案编写一律使用 omp + `devin/claude-opus-5-5` + thinking medium，不得依赖执行体默认模型，也不得擅自替换；实际 model/thinking 记入 STATE。
 2. **职责边界**：arch-lite 产出方案初稿、逐文件改动、回滚与验证表，并按评审意见回改；不签发、不拍板、不评审自己的方案。
-3. **闸门**：方案由 reviewer 按双层评审签发；arch 负责方案取舍与争议拍板；precheck 只出证据。
-4. **独立性**：arch-lite 会话不得兼任同一交付物的 precheck、reviewer 或 dev；换 profile/模型不构成独立。
-5. **额度降级**：Opus 角色（arch、reviewer）额度耗尽时的降级见双层评审第 11 条；arch-lite 的编写会话不得兼任该终审。
-6. **回改责任**：arch-lite 起草的方案由 arch-lite 回改；arch 只做取舍与拍板，避免同一人既回改又拍板。
+3. **闸门**：方案由 arch 按双层评审签发，并负责方案取舍与争议拍板；precheck 只出证据。
+4. **独立性**：arch-lite 会话不得兼任同一交付物的 precheck、arch 或 dev；换 profile/模型不构成独立。
+5. **临时替换模型**：模型不可用时按双层评审第 11 条处理；arch-lite 的编写会话不得兼任方案终审。
+6. **回改责任**：arch-lite 起草的方案由 arch-lite 回改；arch 负责评审、取舍与拍板，避免同一人既回改又拍板。
 7. **审计**：STATE 记录编写实际 model/thinking、会话、方案版本；终审结论注明已参考哪一版方案。
 8. **统计**：记录方案编写与评审的 turns/cost、方案返工轮次与严重漏检；扩展与成本结论由用户按实测数据决定。
 
@@ -199,7 +198,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 - 换新会话用 `member-start.py`（不带 `--keep-session`）：它退出旧 agent、在同一 pane 以原登记名按 profile 重启；不带旧 `--resume`、`--continue` 或 session 参数。重启后按「身份记账」回读并更新 session id。只有确认当前 CLI 支持且能核验 session id 变化时才用 `/new`。
 - 同一 issue 的回改可继续该 issue 会话（test 除外，见 §8「每次测试一个新会话」）；评审轮数始终留在调度记录，重启会话不清零。从父 spec 切到子 issue、从一个子 issue 切到另一个，也必须新会话。
 - 尚未发布 spec 时，用临时需求标识归档方案与评审；发布后关联 spec URL。成员开始 spec issue 或实现子 issue 时，重新建立该 issue 的会话并读取方案、spec 和证据，而非恢复临时需求会话。子/孙 issue 只读取 spec 的方案与已批准用例，不重开方案/用例阶段（§3.1）。
-- 每次派活附：本角色、完整 issue URL、spec/方案路径、阶段、worktree/分支/HEAD、允许写入范围、验收条目、评审剩余轮数、交付路径。评审类角色另附评审范围契约（in-scope / out-of-scope / 复核项 / 预算 / 停止条件）。先完整读取本协议再按领取的角色工作。`reviewer`/`arch` 的最终回复必须以单独一行结论结尾（`通过` / `需修改`）；`arch-lite`/`dev`/`test` 以 `完成` / `阻塞` 结尾。
+- 每次派活附：本角色、完整 issue URL、spec/方案路径、阶段、worktree/分支/HEAD、允许写入范围、验收条目、评审剩余轮数、交付路径。评审类角色另附评审范围契约（in-scope / out-of-scope / 复核项 / 预算 / 停止条件）。先完整读取本协议再按领取的角色工作。`arch` 的最终回复必须以单独一行结论结尾（`通过` / `需修改`）；`arch-lite`/`dev`/`test` 以 `完成` / `阻塞` 结尾。
 - 评审类派活必须写明顺序：阶段终审人先独立给出自己的严重项，再读 precheck 证据表；precheck 的交付物是证据表，不是结论。
 - 调度者核验返回的 session id 与 issue 的对应关系后才提交任务。未经验证不能声称“已开新会话”。
 
@@ -254,7 +253,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
       │   （任一路径前后端都改时：arch 判定附接口约定 → dev-be、dev-fe 同时开发与评审 → 后端先测试、合入 develop 部署 → 前端再做浏览器测试与合并；见「前后端并行开发」）
       │   （防风险「要」时：关键决定含回滚方案与上线顺序，登记上线清单，评审与测试加做兼容/回滚核对；见 §0「防风险措施」）
       └─ 方案路径（先出方案「要」）：arch-lite 编写技术方案
-                → reviewer 方案评审（≤5轮；非严重剩余意见由 arch 拍板，严重剩余意见交用户裁定）
+                → arch 方案评审（≤5轮；非严重剩余意见由 arch 拍板，严重剩余意见交用户裁定）
                 → scheduler 上传最终方案到 GitLab 代码段（snippet，标“待确认”）
                 → 用户确认最终方案（强制检查点：确认请求必须附 snippet 链接；停下等待明确确认，未确认不得进入 spec/用例/开发）
                 → scheduler 把 snippet 标为“已确认”并回填 issue 链接
@@ -402,11 +401,11 @@ arch 判出两个开关后，**先停下请用户确认，不得直接进入任�
 
 完成条件：方案覆盖需求中的全部目标与关键边界，评审员可凭方案及源码独立评审。
 
-### 2. 评审员评审技术方案：最多 5 轮
+### 2. arch 评审技术方案：最多 5 轮
 
 本轮可先由 precheck 出证据表；阶段终审人独立判断后复核并出结论，轮次只记阶段终审人。
 
-reviewer 每轮输出明确问题、严重程度、对应证据与修正建议；arch-lite 回改，scheduler 记录轮次和决策。第 5 轮后停止追加方案评审，不能启动第 6 轮，也不能以“意见尚未全部一致”拖住流程。剩余意见按严重程度分流：reviewer 标为「严重」的剩余意见由 scheduler 整理（意见、双方理由、风险、可选方案）**交用户裁定**，方案作者不得自行裁定；非严重剩余意见由 arch **拍板**。采用/不采用的意见、裁定人、理由、风险和最终方案版本写入决策记录，再交给 scheduler。
+arch 每轮输出明确问题、严重程度、对应证据与修正建议；arch-lite 回改，scheduler 记录轮次和决策。第 5 轮后停止追加方案评审，不能启动第 6 轮，也不能以“意见尚未全部一致”拖住流程。剩余意见按严重程度分流：arch 标为「严重」的剩余意见由 scheduler 整理（意见、双方理由、风险、可选方案）**交用户裁定**，方案作者不得自行裁定；非严重剩余意见由 arch **拍板**。采用/不采用的意见、裁定人、理由、风险和最终方案版本写入决策记录，再交给 scheduler。
 
 架构师拍板确定方案取舍，不能将客观无法执行、验收证据缺失或数据破坏风险说成通过；实际无法推进时给出具体阻塞与恢复动作。
 
@@ -415,7 +414,7 @@ reviewer 每轮输出明确问题、严重程度、对应证据与修正建议�
 方案评审通过后，scheduler 不得直接进入 spec、用例或开发。arch-lite 合并评审通过的各版方案为最终版本、arch 复核关键取舍并写决策记录后，scheduler 先按 §2.2 把最终方案上传为“待确认”snippet 并回读，再停下向用户提交：**最终方案 snippet 链接（必填，放在确认请求第一行）**、方案 SHA、目标/范围、关键取舍与用户裁定项、未关闭风险、P2/P3/P6 等实测闸门、下一步计划。只给本地路径或 SHA、不给可点开的链接，不算提交确认请求（2026-10-22 用户指示：用户必须能直接看到方案）。等待用户明确回复“确认/按此实现”后，按 §2.2 把 snippet 标为已确认并回填 issue，再进入第 3 阶段。
 
 - 停下前必须按 `~/.codex/rules/07-completion.md` 的 Herdr 通知铁律，向 `https://ntfy.sh/pjh-herdr-task` 发送 `⚠️ 需要处理`，收到 2xx 后才提出确认请求；失败时至多追加一次有界重试，并如实说明“ntfy 未发送成功”。
-- 用户要求修改：由 arch-lite 更新最终方案（arch 复核取舍），按 §2.2 上传新版本“待确认”snippet 后重新提交确认（附新链接）；用户反馈不计入 reviewer 的 5 轮。若修改触及已评审的契约、数据安全或验收口径，scheduler 可安排 reviewer 做定点复核并记录，不重开完整轮次；出现新的严重问题时按严重意见分流交用户裁定。
+- 用户要求修改：由 arch-lite 更新最终方案（arch 复核取舍），按 §2.2 上传新版本“待确认”snippet 后重新提交确认（附新链接）；用户反馈不计入 arch 的 5 轮方案评审。若修改触及已评审的契约、数据安全或验收口径，scheduler 可安排 arch 做定点复核并记录，不重开完整轮次；出现新的严重问题时按严重意见分流交用户裁定。
 - 用户未回复：保持 blocked，不得以“评审已通过”“CI 已绿”或时间压力为由自动越过。
 - 除用户在当前任务中明确放弃该检查点外，该检查点适用于所有走完整交付流程且产出了技术方案的任务；放弃授权必须写入 STATE 与 issue。
 - 直达路径按 §0 不产出技术方案，用户在 §0.1 确认判定后直接进入开发，不适用本检查点；scheduler 不得在直达路径中自行增加方案确认或补写方案（关键决定随 §0.1 判定一起由用户确认，不再单独确认）。
@@ -752,15 +751,15 @@ scheduler 回收实际输出并核验：每条验收有运行证据、测试 HEA
 - **派活只给任务本身**：见开头「调度者铁律：派活只说目标，不教怎么做」。只写目标、上下文、验收标准、评审边界与证据位置；**不要指定工具、操作方式或完成路径，也不要复述全局规则**——成员已有自己的规则上下文，工具选择由成员按自身规则决定。评审边界、非目标和预算属于验收上下文，不属于工具指定。
 - **评审类任务必须写范围契约**：未写明 in-scope / out-of-scope、预算和停止条件的评审派活，调度者不得提交；预计超过 10 分钟的评审，派活时给后台 `agent wait` 加 `--timeout 600000`（10 分钟），超时返回时用 `agent prompt` 做一次 checkpoint，询问“还有哪条验收标准没有结论；如无，立即收敛并输出结论”，随后续挂后台 `agent wait`；不得等到 20 分钟以上才叫停。checkpoint 只问范围与剩余验收项，不得要求降低严重度或放行。checkpoint 不计评审轮次，也不创建周期性监控。
 - **等待必须解析状态，不能只等完成标记**：每一轮 `agent wait` / `agent get` 都要读取 `agent_status`；出现 `blocked` 时立即 `agent read`（含 `--source detection`）读取审批/提问界面并**通知用户具体选项**，然后按「续挂监听」挂 `--until working --until idle --until done` 的后台等待，不反复读屏空转。不得只 grep 完成标记而忽略 `blocked`，也不得代按审批键。
-- 通过 `herdr agent prompt <明确target>` 派活，用后台 `agent wait` 收取本轮 settled/blocked 状态；长任务可给后台 `agent wait` 加 `--timeout`，超时后按上一条续挂。omp 在工具调用期间也报 `idle`，`agent wait` 返回的 settled 不代表本轮完成。**只有读屏看到本轮最终回复（方案 reviewer、用例 code-review、代码 arch 以单独一行 `通过`/`需修改` 或等价明确结论结尾），且间隔 ≥15 秒两次 `agent get` 都是 `idle`/`done` 且读屏内容不再变化，才算完成**（这两次 `agent get` 是完成核对，不是轮询）；否则续挂后台 `agent wait`。
+- 通过 `herdr agent prompt <明确target>` 派活，用后台 `agent wait` 收取本轮 settled/blocked 状态；长任务可给后台 `agent wait` 加 `--timeout`，超时后按上一条续挂。omp 在工具调用期间也报 `idle`，`agent wait` 返回的 settled 不代表本轮完成。**只有读屏看到本轮最终回复（方案 arch、用例 code-review、代码 arch 以单独一行 `通过`/`需修改` 或等价明确结论结尾），且间隔 ≥15 秒两次 `agent get` 都是 `idle`/`done` 且读屏内容不再变化，才算完成**（这两次 `agent get` 是完成核对，不是轮询）；否则续挂后台 `agent wait`。
 - 入口复用分支单次调用 `agent.prompt` 提交，不确认接收；调度者正在执行工具调用时消息会排队。入口的 `agent_prompt_stalled` 只可能出现在新建分支。
 - prompt 返回、等待超时或 `agent_prompt_stalled` 都不证明未送达；先 `agent get` + `agent read` 核对本轮活动后再续等。只有同时满足以下两条，才可以用 `herdr agent send-keys` 补发**一次** Enter（语法以 `--help` 为准）：`agent read` 显示本次 prompt 原文仍停在输入行；读屏最后 12 行不含审批短语（如 `Allow tool`、`approve`、`deny`、`[y/N]`）。其他情况一律禁止补按键，也禁止重发整段 prompt。
 - 成员仍 working 时调度者须保持当前派活的监听。
 - `blocked` = herdr 识别到的审批/提问界面：调度者只能 `agent read` 读取内容，然后通知用户；禁止用 `agent send-keys`、`pane send-*` 或任何按键代答，`agent prompt` 本身也会被 herdr 拒绝。唯一例外是 GitLab 收件箱的「远程作答」：发起人在发起 issue（或经飞书）明确回复了选项编号，收件箱核对界面未变后按该编号按键；这是转达用户本人的选择，不是代答，调度者与成员仍不得自己按键。
 - 成员 `idle`/`done` 且最后输出是向调度者提问：在已记录的授权范围内用 `agent prompt` 回答；超出授权时通知用户。
 - 成员 `idle`/`done` 但读屏显示审批/确认界面：按 `blocked` 处理。
-- reviewer 与 code-review 的用例评审只读：结论写在终端的最终回复中，不写文件、不执行命令。调度者在按上述完成判定确认本轮评审完成后用 `member-settle.py` 取回完整结论并落盘到 `.hwf/tmp/<任务标识>/reviews/<阶段>-r<N>.md`（如 `plan-r1.md`、`cases-r2.md`），并在 STATE 记录该路径、被评审交付物版本与结论。
-- 只有实际交付物与结论已收取才算阶段结束。终端历史不全时，先加大 `--lines` 或改用 `--source recent-unwrapped` 重读；仍不全的，可以写文件的角色由成员把结果写入任务证据文件并回报路径。reviewer 与做用例评审的 code-review 改为要求其在终端分段重发结论，不得要求写文件。「每个 issue 的新会话」派活清单中的「交付路径」对 reviewer 与用例评审指调度者落盘的 `reviews/` 路径。初始派活就约定业务交付物路径。
+- arch 的方案评审与 code-review 的用例评审只读：结论写在终端的最终回复中，不写文件、不执行命令。调度者在按上述完成判定确认本轮评审完成后用 `member-settle.py` 取回完整结论并落盘到 `.hwf/tmp/<任务标识>/reviews/<阶段>-r<N>.md`（如 `plan-r1.md`、`cases-r2.md`），并在 STATE 记录该路径、被评审交付物版本与结论。
+- 只有实际交付物与结论已收取才算阶段结束。终端历史不全时，先加大 `--lines` 或改用 `--source recent-unwrapped` 重读；仍不全的，可以写文件的角色由成员把结果写入任务证据文件并回报路径。做方案评审的 arch 与做用例评审的 code-review 改为要求其在终端分段重发结论，不得要求写文件。「每个 issue 的新会话」派活清单中的「交付路径」对方案评审与用例评审指调度者落盘的 `reviews/` 路径。初始派活就约定业务交付物路径。
 - **不创建周期性的模型监控调度、不恢复已暂停的 `member-monitor-health`。** 本轮监听随任务结束收尾；额外定时任务须用户另行明确要求。
 - 人工介入和完成通知由调度者按全局终态规则统一发送，成员不重复发。只报告已核验的状态，不把 ntfy HTTP 2xx 当成用户已确认。
 
@@ -803,7 +802,7 @@ scheduler 回收实际输出并核验：每条验收有运行证据、测试 HEA
 - **发起**：白名单用户把带开关标签的 issue 指派给本账号 → 收件箱执行 `hwf run team-up`，需求文本标明「GitLab 收件箱」「发起 issue」与发起人。该 issue 即**发起 issue**；STATE 记录发起 issue URL 与发起人账号。本账号把交付中拆出的 issue 指派给自己不会触发，这些 issue 按本协议在原交付里推进。
 - **对话模式：调度者只派人分析（2026-10-30 用户指示，取代 10-22 的「调度者只读答疑」）**：指派后默认是**对话模式**，需求或消息以「【对话模式】」开头或注明「对话模式」。用户在这个阶段常常只想先看分析结论再决定下一步，所以：
   1. **调度者自己不分析**：不读源码、不查图谱、不翻资料、不给技术判断或建议。凡要看代码或材料才能回答的问题，一律派角色。调度者只能直接回答流程与进度类问题（谁在做、做到哪、下一步是什么）。
-  2. **派谁由用户定**：用户在评论里点名就派谁，大白话即可，不需要任何指令，如「让架构师分析一下」「让 reviewer 看看这个思路」。称呼对照：架构师 → `arch`，方案作者 → `arch-lite`，方案评审 → `reviewer`，代码评审 → `code-review`，取证 → `precheck`，开发 → `dev`，测试 → `test`。**没点名默认派 `arch`**，回复里写明「由 arch 分析」，方便用户换人。点名多个角色时分别派，各自出结论，不合并改写。
+  2. **派谁由用户定**：用户在评论里点名就派谁，大白话即可，不需要任何指令，如「让架构师分析一下」「让架构师评审这个思路」。称呼对照：架构师、方案评审 → `arch`，方案作者 → `arch-lite`，代码评审 → `code-review`，取证 → `precheck`，开发 → `dev`，测试 → `test`。**没点名默认派 `arch`**，回复里写明「由 arch 分析」，方便用户换人。点名多个角色时分别派，各自出结论，不合并改写。
   3. **只读分析**：派活写明「对话模式只读分析，不是复杂度判定」和回复要分摘要、完整内容两段，附 issue URL、用户问题原文（含 note 链接）、已有分析记录路径。成员可读代码、查图谱、`git show origin/<分支>`、读 GitLab；不改仓库文件、不 checkout、不建 worktree/分支/MR/issue、不起服务、不跑测试。需要运行或复现才能下结论时，成员报 `阻塞` 并说明要做什么，调度者向用户申请授权。成员以 `完成` / `阻塞` 结尾；派活同样必须挂后台 `agent wait`。
   4. **会话**：同一发起 issue 里对同一角色的追问发到该角色本轮分析的同一会话，让它带着上下文继续；第一次派某角色时开新会话。这些会话记入 STATE。
   5. **转贴结论**：按「派活、等待与结果收取」收取后，用 `member-settle.py` 落盘到 `.hwf/tmp/<任务标识>/analysis/<序号>-<角色>.md`，在 issue 评论里**转贴成员结论**：开头写「<角色> 的分析：」，正文用 `.comment.md`（摘要在前、全文折叠，见「发给用户的内容分两层」），不改写、不删减、不加调度者自己的判断，不上传 snippet。INDEX 状态写 `chat（<角色>分析中）` 或 `chat（分析已回复，等用户决定）`。

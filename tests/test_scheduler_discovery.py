@@ -93,6 +93,11 @@ class CleanRepo(unittest.TestCase):
         claims_patcher = patch.object(DISCOVERY, "CLAIMS_PATH", claims)
         claims_patcher.start()
         self.addCleanup(claims_patcher.stop)
+        self.topic_home = tempfile.TemporaryDirectory(prefix="hwf-topic-owner-")
+        self.addCleanup(self.topic_home.cleanup)
+        home_patcher = patch.object(DISCOVERY, "HWF_HOME", Path(self.topic_home.name))
+        home_patcher.start()
+        self.addCleanup(home_patcher.stop)
 
 
 def write_origins(*urls: str, repo: str = ROOT) -> None:
@@ -298,6 +303,25 @@ class OwnerTests(CleanRepo):
         self.assertEqual(self.owner(71)["task"], "frontend-web-v1-7")
         # 号码前缀相同但不是同一个 issue。
         self.assertIsNone(self.owner(700)["task"])
+
+    def test_registered_independent_issue_never_inherits_source_owner(self) -> None:
+        write_index([("frontend-web-v1-7", "delivery-scheduler-w9-p2", "in-progress")],
+                    states={"frontend-web-v1-7": "另开独立需求 #70，来源是本任务"})
+        config = {"gitlab_host": "git.example", "default_project": "frontend/web-v1"}
+
+        def api(path):
+            return [] if "/notes?" in path else {"title": "独立需求", "state": "opened"}
+
+        DISCOVERY._TOPICS.register(config, DISCOVERY.HWF_HOME / "state/feishu-topics",
+                                   self.URL.format(7), self.URL.format(70).replace("issues", "work_items"), api)
+        self.assertEqual(self.owner(70), {"task": "frontend-web-v1-70", "pane": None})
+        self.assertEqual(self.owner(7), {"task": "frontend-web-v1-7", "pane": "w9:p2"})
+        # 独立调度者登记后只投给它，不受来源记录仍提及目标编号影响。
+        write_index([("frontend-web-v1-7", "delivery-scheduler-w9-p2", "in-progress"),
+                     ("frontend-web-v1-70", "delivery-scheduler-w9-p5", "in-progress")],
+                    states={"frontend-web-v1-7": "另开独立需求 #70"})
+        agents = [candidate(), candidate(name="delivery-scheduler-w9-p5", pane_id="w9:p5")]
+        self.assertEqual(self.owner(70, agents), {"task": "frontend-web-v1-70", "pane": "w9:p5"})
 
     def test_short_reference_only_counts_within_same_project(self) -> None:
         write_index([("other-repo-9", "delivery-scheduler-w9-p2", "in-progress")],

@@ -56,6 +56,13 @@ class FakeWorld:
         self.owners = owners if owners is not None else {URL: ("frontend-web-v1-7", "w1:p1")}
         self.prompt_rc = prompt_rc
         self.issue_state = "opened"
+        self.issue_labels = ["状态:开发中"]
+        self.issue_rc = 0
+        self.issue_details: dict[str, dict[str, Any]] = {}
+        self.detail_queries: list[str] = []
+        self.index_status = "in-progress（§0 判定中）"
+        self.agent_title = "π > 派 arch 判定复杂度"
+        self.prompt_panes: list[str] = []
         self.opened_assigned: list[dict[str, Any]] = []  # 指派给本账号、带开关标签、仍打开的 issue
         self.authored: list[dict[str, Any]] = []  # 本账号建的、近期有更新的 issue
         self.by_iid: list[dict[str, Any]] = []  # 按 iids[] 查到的、近期有更新的 issue
@@ -94,7 +101,10 @@ class FakeWorld:
             elif "/notes?" in path:
                 out = json.dumps(sorted(self.notes, key=lambda n: -n["id"]))
             else:
-                out = json.dumps({"state": self.issue_state})
+                self.detail_queries.append(path)
+                rc = self.issue_rc
+                out = (json.dumps(self.issue_details.get(path, {"state": self.issue_state, "labels": self.issue_labels}))
+                       if rc == 0 else "GitLab unavailable")
         elif argv[1].endswith("reset-session.py"):
             rc = self.reset_rc
             self.resets.append(argv[2])
@@ -103,10 +113,10 @@ class FakeWorld:
             assert argv[3] == "--owner-of", argv  # 收件箱只用归属查询，入口发现交给 team-up。
             task, pane = self.owners.get(argv[4], (None, None))
             out = json.dumps({"task": task, "pane": pane, "live_pane": pane, "scheduler": "delivery-scheduler-w1-p1" if task else None,
-                              "status": "in-progress（§0 判定中）" if task else None})
+                              "status": self.index_status if task else None})
         elif argv[:3] == ["herdr", "agent", "get"]:
             out = json.dumps({"result": {"agent": {"agent_status": self.agent_status,
-                                                   "terminal_title_stripped": "π > 派 arch 判定复杂度"}}})
+                                                   "terminal_title_stripped": self.agent_title}}})
         elif argv[0] == "hwf":
             values = [argv[i + 1] for i, a in enumerate(argv) if a == "--input"]
             inputs = dict(v.split("=", 1) for v in values)
@@ -116,6 +126,7 @@ class FakeWorld:
             out = json.dumps({"models": [m for m in MODELS if argv[3] in m["selector"]]})
         elif argv[:3] == ["herdr", "agent", "prompt"]:
             rc = self.prompt_rc
+            self.prompt_panes.append(argv[3])
             self.prompts.append(argv[4])
         elif argv[:3] == ["herdr", "agent", "read"]:
             out = self.screen
@@ -282,7 +293,6 @@ class InboxTests(unittest.TestCase):
         make(world, state).poll()
         self.assertNotIn(URL, state["origins"])
         self.assertEqual(len(world.prompts), 1)
-        self.assertIn("已关闭", world.prompts[0])
 
     def test_reset_command_tolerates_mentioning_the_agent(self) -> None:
         world = FakeWorld([], notes=[note(6) | {"body": "/new @pjhagent"}])
@@ -327,7 +337,6 @@ class InboxTests(unittest.TestCase):
         world.issue_state = "closed"
         make(world, state).poll()
         self.assertEqual(world.resets, ["w1:p1"])
-        self.assertIn("已关闭", world.prompts[-1])
         self.assertNotIn(URL, state["origins"])
         self.assertEqual(state["closed_origins"][URL]["last_note_id"], 6)
 
@@ -344,14 +353,33 @@ class InboxTests(unittest.TestCase):
         self.assertIn("body 6", world.prompts[-2])
 
 
-    def test_forwarded_comment_gets_an_immediate_receipt(self) -> None:
-        # 调度者在干活时要回合结束才回复；收件箱立即回执，用户在远程知道消息已到、它在干什么。
-        world = FakeWorld([], notes=[note(6)])
-        make(world, self.origin_state()).poll()
+    def test_forwarded_comment_receipt_does_not_query_progress(self) -> None:
+        # 转交成功就回执，即使 GitLab 进度查询不可用，也不能重发已送达的消息。
+        world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")], notes=[note(6)])
+        world.index_status = "delivered"
+        world.agent_title = "旧任务已完成"
+        world.issue_rc = 1
+        inbox = make(world)
+        inbox.poll()
+        self.assertEqual(world.prompt_panes, ["w1:p1"])
+        self.assertEqual(world.detail_queries, [])
         self.assertEqual(len(world.comments), 1)
-        self.assertIn("正在干活", world.comments[0])
-        self.assertIn("派 arch 判定复杂度", world.comments[0])
-        self.assertIn("§0 判定中", world.comments[0])
+        self.assertIn(URL, world.comments[0])
+        self.assertNotIn(world.index_status, world.comments[0])
+        self.assertNotIn(world.agent_title, world.comments[0])
+        self.assertIn(6, inbox.state["forwarded"])
+        self.assertIn("todos/1/mark_as_done", world.done)
+
+    def test_entry_receipt_names_target_without_querying_progress(self) -> None:
+        world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")], notes=[note(6)], owners={})
+        world.issue_rc = 1
+        make(world).poll()
+        self.assertEqual(len(world.launched), 1)
+        self.assertEqual(world.prompts, [])
+        self.assertEqual(world.detail_queries, [])
+        self.assertEqual(len(world.comments), 1)
+        self.assertIn(URL, world.comments[0])
+        self.assertIn("todos/1/mark_as_done", world.done)
 
     def test_no_receipt_when_delivery_fails(self) -> None:
         world = FakeWorld([], notes=[note(6)], prompt_rc=1)
@@ -365,6 +393,90 @@ class InboxTests(unittest.TestCase):
         self.assertEqual(len(world.comments), 1)
         self.assertIn("delivery-scheduler-w1-p1", world.comments[0])
         self.assertIn("todos/1/mark_as_done", world.done)
+
+    def test_status_uses_gitlab_labels_instead_of_delivered_index_and_shared_title(self) -> None:
+        world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")], notes=[note(6, body="/status")])
+        world.index_status = "delivered"
+        world.agent_title = "π > #99 已交付"
+        make(world).poll()
+        self.assertEqual(world.detail_queries, ["projects/10/issues/7"])
+        self.assertEqual(len(world.comments), 1)
+        self.assertIn("状态:开发中", world.comments[0])
+        self.assertNotIn(world.index_status, world.comments[0])
+        self.assertNotIn("#99", world.comments[0])
+        self.assertEqual((world.prompts, world.launched), ([], []))
+
+    def test_status_closed_takes_priority_over_stale_labels(self) -> None:
+        world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")], notes=[note(6, body="/status")])
+        world.issue_state = "closed"
+        world.issue_labels = ["状态:等你处理"]
+        make(world).poll()
+        self.assertEqual(len(world.comments), 1)
+        self.assertIn("已关闭", world.comments[0])
+        self.assertNotIn(world.issue_labels[0], world.comments[0])
+        self.assertEqual(world.prompts, [])
+
+    def test_status_query_failure_does_not_fall_back_to_old_progress(self) -> None:
+        for state, rc in (("opened", 1), (None, 0)):
+            with self.subTest(state=state, rc=rc):
+                world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")], notes=[note(6, body="/status")])
+                world.issue_state, world.issue_rc = state, rc
+                world.index_status = "delivered"
+                world.agent_title = "π > #99 已交付"
+                make(world).poll()
+                self.assertEqual(world.detail_queries, ["projects/10/issues/7"])
+                self.assertEqual(len(world.comments), 1)
+                self.assertIn(URL, world.comments[0])
+                self.assertIn("查询失败", world.comments[0])
+                self.assertNotIn(world.index_status, world.comments[0])
+                self.assertNotIn("#99", world.comments[0])
+                self.assertNotIn(world.issue_labels[0], world.comments[0])
+                self.assertEqual((world.prompts, world.launched), ([], []))
+
+    def test_status_uses_target_project_even_with_same_iid_and_shared_repo(self) -> None:
+        other = "https://git.example/another/project/-/issues/7"
+        item = todo("mentioned", project="another/project", url=f"{other}#note_6")
+        item["target"]["project_id"] = 20
+        world = FakeWorld([item], notes=[note(6, body="/status")], owners={other: ("frontend-web-v1-7", "w1:p1")})
+        world.issue_details = {"projects/10/issues/7": {"state": "closed", "labels": []},
+                               "projects/20/issues/7": {"state": "opened", "labels": ["状态:测试中"]}}
+        config = CONFIG | {"projects": {"frontend/web-v1": REPO, "another/project": REPO}}
+        INBOX.Inbox(config, {}, run=world).poll()
+        self.assertEqual(world.detail_queries, ["projects/20/issues/7"])
+        self.assertIn(other, world.comments[0])
+        self.assertIn("状态:测试中", world.comments[0])
+        self.assertNotIn("已关闭", world.comments[0])
+
+    def test_referenced_issue_does_not_retarget_reply_or_approval(self) -> None:
+        other = "https://git.example/frontend/web-v1/-/issues/99"
+        world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")],
+                          notes=[note(6, body=f"参考 {other} 的处理，同意合并")],
+                          owners={URL: ("frontend-web-v1-7", "w1:p1"), other: ("frontend-web-v1-99", "w2:p1")})
+        inbox = make(world)
+        inbox.poll()
+        self.assertEqual(world.prompt_panes, ["w1:p1"])
+        self.assertIn(f"{URL}#note_6", world.prompts[0])
+        self.assertIn(world.notes[0]["body"], world.prompts[0])
+        self.assertEqual(world.launched, [])
+        self.assertEqual(set(inbox.state["followed"]), {URL})
+        self.assertIn(URL, world.comments[0])
+        self.assertNotIn(other, world.comments[0])
+
+    def test_status_without_labels_or_live_owner_never_uses_index_progress(self) -> None:
+        for owners in ({}, {URL: ("frontend-web-v1-7", None)}):
+            with self.subTest(owners=owners):
+                world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")],
+                                  notes=[note(6, body="/status")], owners=owners)
+                world.issue_labels = ["herdr-auto"]
+                world.index_status = "delivered"
+                make(world).poll()
+                self.assertEqual(world.detail_queries, ["projects/10/issues/7"])
+                self.assertEqual(len(world.comments), 1)
+                self.assertIn(URL, world.comments[0])
+                self.assertNotIn(world.index_status, world.comments[0])
+                self.assertNotIn("herdr-auto", world.comments[0])
+                self.assertNotIn("已关闭", world.comments[0])
+                self.assertEqual((world.prompts, world.launched), ([], []))
 
     def test_blocked_scheduler_is_reported_once_per_episode(self) -> None:
         state = self.origin_state()

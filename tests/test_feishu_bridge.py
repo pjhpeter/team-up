@@ -39,6 +39,8 @@ class World:
         self.downloads: list[tuple] = []
         self.thread_of: dict[str, str] = {}  # 被机器人在话题里回复过的消息 → thread_id
         self.reply_failures = 0  # 接下来几次飞书回帖返回失败
+        self.threads: dict[str, list] = {}  # thread_id → 话题消息（历史格式）
+        self.unreadable_threads: set[str] = set()
 
     def __call__(self, cmd, input=None, env=None, cwd=None, **_):
         if cmd[0] == "lark-cli":
@@ -106,7 +108,10 @@ class World:
                 return ok({"ok": False, "error": {"code": 230027, "message": "access denied"}})
             return ok({"ok": True, "data": {"messages": self.history.get(chat, [])}})
         if cmd[1:3] == ["im", "+threads-messages-list"]:
-            return ok({"ok": True, "data": {"messages": []}})
+            thread = cmd[cmd.index("--thread") + 1]
+            if thread in self.unreadable_threads:
+                return ok({"ok": False, "error": {"message": "access denied"}})
+            return ok({"ok": True, "data": {"messages": self.threads.get(thread, [])}})
         raise AssertionError(f"unexpected lark {cmd}")
 
     def gitlab_comment(self, iid: int, body: str, name: str = "交付调度者", system: bool = False) -> None:
@@ -168,6 +173,45 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.state["threads"]["om_1"]["iid"], 8)
         self.assertEqual(self.w.replies[0]["to"], "om_1")
         self.assertIn("#8", self.w.replies[0]["text"])
+
+    def test_image_before_requirement_creates_issue_with_attachment(self) -> None:
+        # 实时事件和历史补漏使用不同图片标记，两者都不能挡住后面的需求。
+        for index, marker in enumerate(("[Image: img_first]", "![Image](img_first)")):
+            with self.subTest(marker=marker):
+                mid = f"om_image_first_{index}"
+                self.b.handle(msg(mid, f"{marker}\n需求：排查为什么会出现这个页面？"))
+                creates = [w for w in self.w.writes if w[1].endswith("/issues")]
+                self.assertEqual(len(creates), index + 1)
+                fields = creates[-1][2]
+                self.assertEqual(fields["title"], "排查为什么会出现这个页面？")
+                self.assertIn("![img_first.jpg](/uploads/x/img_first.jpg)", fields["description"])
+                self.assertEqual(self.w.downloads[-1], (mid, "img_first"))
+                self.assertIn(f"#{8 + index}", self.w.replies[-1]["text"])
+
+    def test_file_before_issue_command_binds_without_creating(self) -> None:
+        for index, command in enumerate(("#7", "需求：https://git.example.com/frontend/web-v1/-/issues/7")):
+            with self.subTest(command=command):
+                self.b.handle(msg(f"om_bind_file_{index}",
+                                  f'<file key="file_log" name="日志.zip"/>\n{command} 排查附件'))
+                self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
+                self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
+                self.assertEqual(self.w.writes[-1][2]["body"],
+                                 "@pjhagent 排查附件\n\n![日志.zip](/uploads/x/日志.zip)\n\n_（来自飞书）_")
+
+    def test_requirement_with_only_attachment_keeps_creating(self) -> None:
+        self.b.handle(msg("om_attachment_only", "需求：[Image: img_only]"))
+        creates = [w for w in self.w.writes if w[1].endswith("/issues")]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0][2]["title"], "（见附件）")
+        self.assertIn("![img_only.jpg](/uploads/x/img_only.jpg)", creates[0][2]["description"])
+
+    def test_attachment_does_not_turn_prose_or_empty_requirement_into_command(self) -> None:
+        for index, text in enumerate(("[Image: img_prose]\n这里写着需求：不是发起命令", "需求：")):
+            with self.subTest(text=text):
+                self.b.handle(msg(f"om_not_command_{index}", text, chat=f"oc_not_command_{index}"))
+                self.assertEqual(self.w.writes, [])
+                self.assertEqual(self.w.downloads, [])
+                self.assertEqual(self.w.replies[-1]["text"], FB.HELP_TEXT)
 
     def test_thread_reply_becomes_user_comment_and_command_stays_bare(self) -> None:
         self.b.handle(msg("om_1", "/需求 修个按钮"))
@@ -548,6 +592,41 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.w.downloads, [("om_zip", "file_v3_00174_zip", "file", "历史面板 · 可交互-html.zip")])
         self.assertEqual(self.uploads, [("frontend/web-v1", "历史面板 · 可交互-html.zip")])
         self.assertEqual(list(self.b.media_dir.iterdir()), [])  # 中转文件搬完就删
+
+    def test_demand_in_someone_elses_thread_carries_earlier_text(self) -> None:
+        # 2026-11-12 实测（#479）：同事在话题里描述问题，我回「需求：处理这个问题」，问题描述曾被丢掉
+        def item(mid, text, name, sender_type="user", sender="ou_qi", mentions=None):
+            return {"message_id": mid, "chat_id": "oc_g", "content": text, "create_time": "2026-11-12 19:20",
+                    "mentions": mentions or [], "thread_id": "omt_q",
+                    "sender": {"id": sender, "name": name, "sender_type": sender_type}}
+        bot = [{"id": BOT, "key": "@_user_1", "name": "嘉辉的Agent"}]
+        self.w.messages["om_q"] = "@嘉辉的Agent \n![Image](img_v3_q)\n组织管理员看不到所有团队"
+        self.w.threads["omt_q"] = [
+            item("om_q", self.w.messages["om_q"], "祁子德", mentions=bot),
+            item("om_deny", "你 @ 我也没用", "嘉辉的Agent", sender_type="app", sender="cli_x"),
+            item("om_s", "第二行补充\n附图 [Image: img_v3_s]", "施楚宇"),
+            item("om_req", "@嘉辉的Agent 需求：处理这个问题", "彭嘉辉", sender=ME, mentions=bot),
+            item("om_later", "这条在需求之后", "施楚宇"),
+        ]
+        self.b.handle(msg("om_req", "需求：处理这个问题", root="om_q", thread="omt_q", chat="oc_g",
+                          chat_type="group", mentions=bot))
+        desc = [w for w in self.w.writes if w[1].endswith("/issues")][0][2]["description"]
+        self.assertTrue(desc.startswith("处理这个问题\n\n**话题里的前文**"))
+        self.assertIn("> **祁子德**（2026-11-12 19:20）：组织管理员看不到所有团队 [图片]", desc)
+        self.assertIn("> **施楚宇**（2026-11-12 19:20）：第二行补充\n> 附图 [图片]", desc)
+        self.assertNotIn("嘉辉的Agent", desc)
+        self.assertNotIn("你 @ 我也没用", desc)
+        self.assertNotIn("这条在需求之后", desc)
+        self.assertEqual(desc.count("处理这个问题"), 1)
+        self.assertEqual(sorted(self.w.downloads), [("om_q", "img_v3_q"), ("om_s", "img_v3_s")])
+        self.assertLess(desc.index("**话题里的前文**"), desc.index("![img_v3_q.jpg]"))
+
+    def test_unreadable_thread_still_creates_issue(self) -> None:
+        self.w.unreadable_threads.add("omt_x")
+        self.b.handle(msg("om_req", "需求：看下这个", root="om_root", thread="omt_x"))
+        desc = [w for w in self.w.writes if w[1].endswith("/issues")][0][2]["description"]
+        self.assertTrue(desc.startswith("看下这个\n\n---"))
+        self.assertIn("#8", self.w.replies[-1]["text"])
 
     def test_any_file_kind_in_thread_reply_becomes_comment(self) -> None:
         self.b.handle(msg("om_1", "需求：做个东西"))

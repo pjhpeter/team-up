@@ -35,6 +35,7 @@ import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 import fcntl
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,11 @@ import sys
 import time
 from typing import Any, Iterator, Mapping, Sequence
 
+_TOPICS_SPEC = importlib.util.spec_from_file_location("feishu_topics", Path(__file__).with_name("feishu_topics.py"))
+assert _TOPICS_SPEC is not None and _TOPICS_SPEC.loader is not None
+_TOPICS = importlib.util.module_from_spec(_TOPICS_SPEC)
+_TOPICS_SPEC.loader.exec_module(_TOPICS)
+
 NAME_PREFIX = "delivery-scheduler-"
 REUSABLE_STATES = frozenset({"idle", "done"})
 # INDEX 状态列以这些词开头即视为收尾；其余（in-progress/held/blocked/active/queued…）都算未收尾，
@@ -51,7 +57,8 @@ REUSABLE_STATES = frozenset({"idle", "done"})
 TERMINAL_STATUS = ("done", "delivered", "closed", "cancelled")
 INDEX_RELATIVE = Path(".hwf/tmp/INDEX.md")
 # GitLab 收件箱记录仍打开的发起 issue；发起 issue 只由用户关闭，关闭前其调度者一直被占用（2026-10-22 用户指示）。
-INBOX_STATE = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf")) / "state" / "gitlab-inbox.json"
+HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
+INBOX_STATE = HWF_HOME / "state" / "gitlab-inbox.json"
 # 入口选中调度者后的占座记录：pane id → 选中时间戳；见文件头「占座」。
 CLAIMS_PATH = INBOX_STATE.parent / "scheduler-claims.json"
 CLAIM_TTL_S = 600  # 与收件箱的 LAUNCH_COOLDOWN_S 一致：新调度者通常几分钟内写好 INDEX
@@ -269,6 +276,9 @@ def owner_of(url: str, repo: str, agents: Sequence[Mapping[str, Any]]) -> dict[s
     index = read_index(repo)
     # 同一任务被接手时会追加新行（新调度者），取最后一行才是现在的负责人。
     owner = next((row for row in reversed(index) if row.task == task), None)
+    # 独立话题已经登记、调度者还没登记的窗口期，来源 STATE 的提及不是所有权。
+    if owner is None and task and _TOPICS.is_registered_topic(HWF_HOME, url):
+        return {"task": task, "pane": None, "live_pane": None, "scheduler": None, "status": "queued"}
     if owner is None:
         owner = next((row for row in rows if state_mentions(repo, row, url)), None)
     if owner is None:

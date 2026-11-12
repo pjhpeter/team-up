@@ -63,6 +63,7 @@ SEEN_CAP = 2000
 HELP_COOLDOWN_S = 600
 NOTE_RETRIES = 3  # 一条评论连续发送失败几次后改发 GitLab 链接
 FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
+CONTEXT_TEXT_CAP = 6000  # 建单时带上的话题前文总字数上限，超出只留最近的
 FOLDED = re.compile(r"<details>.*?</details>", re.S)  # 评论里折叠的全文
 CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
 # lark-cli 把消息里的附件渲染成这些标记（见 lark-im 文档 messages-resources-download）：
@@ -120,8 +121,16 @@ def load_json(path: Path, default: Any) -> Any:
 def save_json(path: Path, data: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1))
+    with tmp.open("w") as out:
+        json.dump(data, out, ensure_ascii=False, indent=1)
+        out.flush()
+        os.fsync(out.fileno())
     tmp.replace(path)  # 原子替换
+    fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def cap_list(items: list, cap: int = SEEN_CAP) -> list:
@@ -343,19 +352,34 @@ class Bridge:
         linked = self.state["thread_ids"].get(tid) if tid else None
         if not linked and root and root != mid and root in self.state["threads"]:
             linked = root
+        # 只有开头明确选另一个 issue 才分流；普通正文提到编号仍是当前话题的回复。
+        command_text = self.strip_images(text)
+        c = CREATE_RE.match(command_text)
+        candidate = command_text[c.end():] if c else command_text
+        m = BIND_RE.match(candidate)
+        if linked and m:
+            iid = int(m.group(1) or m.group(2))
+            if m.group(2):
+                url = re.match(r"https?://[^\s,，。;；]+", candidate.strip()).group(0)
+                try:
+                    iid = topics_module().issue_id(self.cfg, url)
+                except topics_module().TopicError:
+                    self.reply(mid, "该链接不属于当前配置的项目；本话题绑定不变，这条消息未转发。", f"wrong-project-{mid}")
+                    return
+            if iid != self.state["threads"][linked]["iid"]:
+                topics_module().redirect(self, linked, msg, iid)
+                return
         if linked:
             self.follow_up(linked, msg, text)
             return
         # 引用回复（主对话里的「回复 xxx」）不算话题，按普通消息处理；真在话题里但还没关联的，发「需求：」也认
         # 「需求：」后面紧跟已有 issue 的链接或 #编号，是让 Agent 处理那张单，关联它而不是新建
-        c = CREATE_RE.match(text)
-        m = BIND_RE.match(text[c.end():] if c else text)
+        # 图文消息可能先放附件；命令只看文字，上传仍从原始 msg 提取附件。
         if m:
             self.bind(mid, chat, int(m.group(1) or m.group(2)), m.string[m.end():].strip(), user, msg)
             return
-        m = CREATE_RE.match(text)
-        if m and text[m.end():].strip():
-            self.create(mid, chat, text[m.end():].strip(), user, msg.get("sender_name") or user, msg)
+        if c and (command_text[c.end():].strip() or find_attachments(text)):
+            self.create(mid, chat, command_text[c.end():].strip(), user, msg.get("sender_name") or user, msg)
             return
         if tid:
             self.reply(mid, "这条话题还没关联 issue。在这里发「需求：…」新建，或发「#编号」关联已有 issue。", f"orphan-{mid}")
@@ -448,14 +472,59 @@ class Bridge:
         if tid:
             self.state["thread_ids"][tid] = key
 
+    def thread_context(self, msg: dict[str, Any]) -> tuple[str, list[tuple[str, list[dict[str, str]]]]]:
+        """在别人的话题里发「需求：」时，把这条之前的人类发言原样带上，否则 Agent 只看得到「处理这个问题」。
+        返回（引用块 Markdown，前文里的附件）；读不到就返回空，不影响建单。"""
+        tid = msg.get("thread_id") or ""
+        if not tid:
+            return "", []  # 主聊天区的引用回复没有话题，被引用那条的附件已由 images_markdown 处理
+        try:
+            data = self.lark(["im", "+threads-messages-list", "--thread", tid, "--order", "asc",
+                              "--no-reactions", "--page-all", "--page-limit", "4"])
+        except BridgeError as e:
+            log(f"read thread context {tid} failed: {e}")
+            return "", []
+        lines: list[str] = []
+        attachments: list[tuple[str, list[dict[str, str]]]] = []
+        for item in (data.get("data") or {}).get("messages", []):
+            m = normalize_history(item)
+            if m["message_id"] == msg["message_id"]:
+                break
+            if m["sender_type"] != "user":
+                continue
+            raw = self.clean_text(m)
+            found = find_attachments(raw)
+            if found:
+                attachments.append((m["message_id"], found))
+            marks = ["[图片]" if a["kind"] == "image" else f"[文件 {a['name'] or '未命名'}]" for a in found]
+            body = " ".join([strip_attachments(raw), *marks]).strip()
+            if not body:
+                continue
+            when = (item.get("create_time") or "").strip()
+            head = f"**{m['sender_name'] or m['sender_id'] or '?'}**" + (f"（{when}）" if when else "")
+            lines.append("\n".join(f"> {l}" if l else ">" for l in f"{head}：{body}".splitlines()))
+        if not lines:
+            return "", attachments
+        kept: list[str] = []
+        total = 0
+        for line in reversed(lines):
+            total += len(line)
+            if kept and total > CONTEXT_TEXT_CAP:
+                kept.append("> …更早的消息省略")
+                break
+            kept.append(line)
+        return "**话题里的前文**（从飞书原样搬来）：\n\n" + "\n>\n".join(reversed(kept)), attachments
+
     def create(self, mid: str, chat: str, text: str, user: str, name: str,
                msg: Optional[dict[str, Any]] = None) -> None:
-        images = self.images_markdown(msg, self.project, self.take_pending_images(chat)) if msg else ""
+        context, context_files = self.thread_context(msg) if msg else ("", [])
+        images = self.images_markdown(msg, self.project, self.take_pending_images(chat) + context_files) if msg else ""
         text = self.strip_images(text) or "（见附件）"
         title = text.splitlines()[0].strip()
         title = title[:60] + ("…" if len(title) > 60 else "")
         agent_id = self.api(f"users?username={quote(self.agent)}")[0]["id"]
-        desc = (f"{text}\n\n{images + chr(10) + chr(10) if images else ''}---\n来自飞书（{name}，{datetime.fromtimestamp(self.now()):%Y-%m-%d %H:%M}）。"
+        desc = (f"{text}\n\n{context + chr(10) + chr(10) if context else ''}"
+                f"{images + chr(10) + chr(10) if images else ''}---\n来自飞书（{name}，{datetime.fromtimestamp(self.now()):%Y-%m-%d %H:%M}）。"
                 "在飞书话题里回复会同步成这里的评论，这里的评论也会同步回飞书。")
         issue = self.api(f"projects/{quote(self.project, safe='')}/issues", "POST", {
             "title": title, "description": desc, "labels": self.label, "assignee_id": str(agent_id)},
@@ -497,7 +566,7 @@ class Bridge:
         mid = msg["message_id"]
         t = self.state["threads"][root]
         if t.get("closed"):
-            self.reply(mid, "这张 issue 已关闭。要继续请发新的「需求：…」，或「#编号」关联别的 issue。", f"closed-{mid}")
+            self.reply(mid, "这张 issue 已关闭，这里只保留归档。要继续请回主聊天发新的「需求：…」，或「#编号」进入别的独立话题。", f"closed-{mid}")
             return
         # /go、/status、/new 这类指令要整条只有指令，收件箱才认得，所以不加尾注。
         if text.startswith("/"):
@@ -514,11 +583,17 @@ class Bridge:
     # ---------- GitLab → 飞书 ----------
     def poll_gitlab(self) -> None:
         for root, t in list(self.state["threads"].items()):
-            if t.get("closed"):
+            if t.get("closed") or t.get("topic_pending"):
                 continue
             pid = quote(t["project"], safe="")
-            # 从最新往前取一页，只要比水位新的，再按时间正序发；一轮间隔内不会超过 50 条。
-            notes = self.api(f"projects/{pid}/issues/{t['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
+            # 请求登记后可能停机很久，逐页追到水位，不能只保留最新 50 条。
+            notes, page = [], 1
+            while True:
+                batch = self.api(f"projects/{pid}/issues/{t['iid']}/notes?sort=desc&order_by=created_at&per_page=50&page={page}")
+                notes.extend(n for n in batch if n["id"] > t.get("last_note", 0))
+                if len(batch) < 50 or any(n["id"] <= t.get("last_note", 0) for n in batch):
+                    break
+                page += 1
             for n in sorted(notes, key=lambda x: x["id"]):
                 if n["id"] <= t.get("last_note", 0):
                     continue
@@ -591,7 +666,10 @@ class Bridge:
                 log(f"catch-up skip thread {root}: {e}")
                 continue
             for item in (data.get("data") or {}).get("messages", []):
-                self.handle(normalize_history(item, default_root=root))
+                msg = normalize_history(item, default_root=root)
+                if t["chat_id"] in self.state["group_chats"]:
+                    msg["chat_type"] = "group"
+                self.handle(msg)
 
 
 _PROACTIVE: Any = None
@@ -608,6 +686,22 @@ def proactive_module() -> Any:
         spec.loader.exec_module(module)
         _PROACTIVE = module
     return _PROACTIVE
+
+
+_TOPICS: Any = None
+
+
+def topics_module() -> Any:
+    """测试用 importlib 按路径加载桥时，也从脚本同目录加载话题队列。"""
+    global _TOPICS
+    if _TOPICS is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("feishu_topics", Path(__file__).resolve().parent / "feishu_topics.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _TOPICS = module
+    return _TOPICS
 
 
 def normalize_event(e: dict[str, Any]) -> dict[str, Any]:
@@ -699,17 +793,37 @@ def consume_events(out: "queue.Queue[dict]") -> None:
 
 def main(argv: Optional[list[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--check", action="store_true", help="检查配置、令牌与飞书机器人后退出")
+    mode = ap.add_mutually_exclusive_group()
+    mode.add_argument("--check", action="store_true", help="检查配置、令牌与飞书机器人后退出")
+    mode.add_argument("--split-topic", nargs=2, metavar=("SOURCE_ISSUE_URL", "TARGET_ISSUE_URL"), help="登记独立话题请求，不直接发送")
+    mode.add_argument("--topic-status", metavar="TARGET_ISSUE_URL", help="只读查询话题请求与结果")
     args = ap.parse_args(argv)
     try:
         cfg = load_config()
+        topics = topics_module()
+        directory = STATE_PATH.parent / "feishu-topics"
+        if args.topic_status or args.split_topic:
+            try:
+                if args.topic_status:
+                    result = topics.status(cfg, directory, args.topic_status)
+                else:
+                    # 只读 GitLab 获取登记水位，不读写运行中的 feishu-bridge.json。
+                    client = Bridge(cfg, {})
+                    result = topics.register(cfg, directory, *args.split_topic, client.api)
+                print(json.dumps(result, ensure_ascii=False))
+                return 0 if result["status"] in ("queued", "sending", "ready", "archived") else 1
+            except (topics.TopicError, BridgeError, OSError, ValueError) as error:
+                print(json.dumps({"status": "error", "error": str(error)}, ensure_ascii=False))
+                return 1
+        # --check 不消费队列；常驻桥必须先拿锁，再读取运行状态。
+        consumer_lock = topics.lock_bridge(STATE_PATH) if not args.check else None
         token = keychain_token(cfg.get("gitlab_token_keychain"))
         state = load_json(STATE_PATH, {})
         bridge = Bridge(cfg, state, user_token=token)
         bot = bridge.lark(["api", "GET", "/open-apis/bot/v3/info"])
         cfg.setdefault("bot_open_id", (bot.get("data") or {}).get("open_id"))
         who = bridge.api("user", as_user=True)["username"] if token else None
-    except BridgeError as e:
+    except (BridgeError, topics_module().TopicError) as e:
         print(f"失败：{e}", file=sys.stderr)
         return 1
     print(f"GitLab {cfg['gitlab_host']}，新 issue 建在 {cfg['default_project']}，指派给 {bridge.agent}；"
@@ -722,6 +836,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("没有用户 GitLab 令牌，见脚本开头说明", file=sys.stderr)
         return 1
     signal.signal(signal.SIGTERM, stop_children)
+    topic_queue = topics.Topics(bridge, directory, lambda: save_json(STATE_PATH, state))
+    topic_queue.consume()
     signal.signal(signal.SIGINT, stop_children)
     events: "queue.Queue[dict]" = queue.Queue()
     threading.Thread(target=consume_events, args=(events,), daemon=True).start()
@@ -747,6 +863,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if time.time() >= next_poll:
             next_poll = time.time() + poll
             try:
+                topic_queue.consume()
                 bridge.poll_gitlab()
             except (BridgeError, KeyError, ValueError) as err:
                 log(f"poll failed: {err}")

@@ -47,6 +47,10 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 群里给机器人下指令时，每句话（包括话题里的回复）都要 @机器人；私聊不用。白名单外的人找机器人，它从 10 句俏皮话里随机回一句（如「给钱我主人，我帮你干活」），什么都不做。
 
+图片或文件可以和指令一起发送，放在文字前后都可以；第一段文字仍需以「需求：」、`/需求`、`#编号` 或 issue 链接开头，附件会一起带进 issue。改了飞书桥脚本后，需要在原来的窗格按 Ctrl+C，再运行 `python3 ~/.hwf/scripts/feishu-bridge.py` 才会生效；之前已回复用法说明的消息不会自动重试，请在原话题里重新发送需求文字。
+
+从一个需求拆出独立 issue 时，各自使用独立飞书话题：原话题只留新话题链接，结果、截图和确认各归各。调度者按 `PROTOCOL.md`「独立需求与飞书话题」登记并核对建立结果；原话题不会因提到别的编号而切换绑定。`/status` 读取对应 GitLab issue 的当前状态；普通「已收到」回执只代表已转交，不代表执行或交付完成。
+
 每人接一套：用 lark-cli 建好机器人应用、存一个本人 GitLab 令牌、写本机配置 `~/.hwf/feishu-bridge.local.json`，然后在一个 Herdr 窗格里常驻 `python3 ~/.hwf/scripts/feishu-bridge.py`。完整步骤、用法和排查见 Wiki [飞书接入](https://git.bootingai.net/ai-hub/skills/workflow/team-up/-/wikis/飞书接入)。
 
 ## 主动接活（observe 档）

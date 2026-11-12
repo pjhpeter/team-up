@@ -32,7 +32,7 @@
 交付存在但调度者已退出，或没有任何交付负责该 issue，就把评论作为需求走 team-up 入口（调度者按 INDEX 接续
 或当作新需求）。转交失败不推进水位，下一轮重试，消息不丢、也不重复。
 发起 issue 只由用户关闭（2026-10-22 用户指示）：关闭前其调度者不接其他需求（find-scheduler 读本状态文件）；
-关闭后收件箱通知该调度者收尾，并停止跟踪。
+关闭后收件箱转交关闭事实，由调度者按协议核对剩余工作；关闭事件本身不证明交付完成。
 """
 
 from __future__ import annotations
@@ -76,8 +76,6 @@ STATUS_WORDS = {"working": "正在干活", "idle": "空闲", "done": "空闲",
 FOLLOW_OVERLAP_S = 300
 FOLLOWED_CAP = 100  # 用户 @ 过本账号的非发起 issue，一次 iids[] 查询能装下的量
 CLOSED_CAP = 200  # 已关闭的发起 issue 只为“用户重开后接着跟踪”保留，留最近的即可。
-STATUS_RECORD_CAP = 160  # 进度回复里 INDEX 状态的最大字数，详细内容在 STATE.md
-TITLE_PREFIX = re.compile(r"^[π\s>\u2800-\u28ff]+")  # omp 标题前缀与转圈字符，如 "π ⠹ " / "π > "
 # 发起 issue 描述里指定调度者参数的行：`/model jc-gpt/gpt-6.1-sol`、`/thinking high`（2026-10-22 用户指示）。
 PARAM_LINE = re.compile(r"^\s*/(model|thinking)\s+(\S+)\s*$", re.IGNORECASE)
 # 卡住界面的单选题：选项行是「编号.」或「○ ●」开头，光标行前有「❯」等标记；外框「│」先去掉。
@@ -138,29 +136,36 @@ class Inbox:
             raise InboxError(f"find-scheduler exited {result.returncode}: {result.stderr.strip()}")
         return json.loads(result.stdout)
 
-    def agent_state(self, pane: str) -> tuple[str, str]:
-        """(herdr 状态, 终端标题)。标题是调度者自己维护的“正在做什么”，查不到时返回空串。"""
+    def agent_state(self, pane: str) -> str:
+        """只读会话进程状态；终端标题可能属于同一调度者的其他任务。"""
         result = self._exec(["herdr", "agent", "get", pane])
         if result.returncode != 0:
-            return "unknown", ""
+            return "unknown"
         agent = json.loads(result.stdout)["result"]["agent"]
-        title = str(agent.get("terminal_title_stripped") or "")
-        return str(agent.get("agent_status") or "unknown"), TITLE_PREFIX.sub("", title).strip()
+        return str(agent.get("agent_status") or "unknown")
 
-    def status_text(self, repo: str, url: str) -> str:
-        """给用户看的一句话进度：哪个调度者、它现在什么状态、在做什么、任务记录写到哪。"""
+    def status_text(self, repo: str, url: str, where: Mapping[str, Any]) -> str:
+        """任务进度只读目标 issue；调度者进程状态另列，不能把共享会话当成任务进度。"""
+        # 复用评论入口已经解析好的项目和编号，不从调度者任务名或其他 issue 的编号猜归属。
+        issue = self.api(f"projects/{where['project_id']}/issues/{where['iid']}")
+        state = issue.get("state")
+        if state == "closed":
+            progress = "已关闭（不代表已验收或交付完成）"
+        elif state == "opened":
+            labels = [label for label in issue.get("labels", []) if label.startswith("状态:")]
+            progress = "打开中；" + ("、".join(labels) if labels else "未设置状态标签")
+        else:
+            raise InboxError(f"Issue state unavailable for {url}")
+        result = f"目标 issue {url}：{progress}。"
         info = self.owner_info(repo, url)
         if info["task"] is None:
-            return "这个 issue 现在没有对应的交付记录。"
-        record = info["status"].strip()
-        record = f"任务记录：{record[:STATUS_RECORD_CAP]}{'…' if len(record) > STATUS_RECORD_CAP else ''}"
+            return result + "会话状态：没有对应的调度者记录。"
         pane = info["live_pane"]
         if pane is None:
-            return f"负责的调度者 `{info['scheduler']}` 已经退出。{record}"
-        status, title = self.agent_state(pane)
-        doing = f"，正在：{title}" if status == "working" and title else ""  # 空闲时标题是上一件事，不展示
+            return result + f"会话状态：负责的调度者 `{info['scheduler']}` 已退出。"
+        status = self.agent_state(pane)
         other = "（它手上还有别的任务，新消息会交给空闲调度者接手）" if info["pane"] is None else ""
-        return f"调度者 `{info['scheduler']}` {STATUS_WORDS.get(status, status)}{doing}{other}。{record}"
+        return result + f"会话状态：调度者 `{info['scheduler']}` {STATUS_WORDS.get(status, status)}{other}。"
 
     def launch(self, repo: str, task: str, key: str, url: str | None = None) -> bool:
         """走 team-up 入口；key（任务标识或 issue URL）冷却期内不重复走，返回是否已发出。
@@ -221,7 +226,7 @@ class Inbox:
         self.prompt(pane, (
             f"[GitLab 收件箱] 用户要求清空上下文，你已在新会话中。你是任务 {task} 的调度者：按 "
             "~/.hwf/PROTOCOL.md 开头「调度者阅读指引与省词元」读必读章节，用 herdr agent get 核对登记身份（不要改名），再按 .hwf/tmp/INDEX.md 与该任务 "
-            "STATE.md 接续；在 STATE 记录新会话。任务已收尾就停下等用户关闭发起 issue，不做别的。"))
+            "STATE.md 接续；在 STATE 记录新会话。结束回合或收到关闭通知前，按协议「阶段通过不等于交付完成」和 §9「关闭前核对」核验剩余工作。"))
         return result.stdout
 
     def comment(self, where: Mapping[str, Any], body: str) -> None:
@@ -234,16 +239,16 @@ class Inbox:
         """发给负责该 issue 的调度者；没有在线负责人时把消息作为需求走入口（按 mode 决定对话还是交付）。
 
         返回给用户的回执（None 表示没送出，下一轮重试）。调度者在一个回合里时消息要排队到回合结束，
-        可能几分钟才回复，回执让用户在远程立即知道消息已到、它现在在干什么。
+        可能几分钟才回复；回执只确认消息转交，不代表已执行或完成。
         """
         task, pane = self.owner(repo, url)
         if pane:
             if not self.prompt(pane, text):
                 return None
-            return f"已收到，已转给{self.status_text(repo, url)}它做完手头这一步就会在这里回复。"
+            return f"已收到，已转交目标 issue {url} 的消息，等待调度者回复。"
         if not self.launch(repo, self.entry_task(text, mode), task or url, url):
             return None
-        return "已收到。现在没有在线的调度者负责这里，已交给新的调度者接手，它启动后会在这里回复。"
+        return f"已收到目标 issue {url} 的消息。目前没有在线负责人，已转交调度入口，等待接手后回复。"
 
     @staticmethod
     def entry_task(text: str, mode: str) -> str:
@@ -333,7 +338,12 @@ class Inbox:
         """
         origin = self.state["origins"].get(url)
         if self.is_command(note["body"], STATUS_COMMANDS):
-            self.comment(where, f"@{note['author']['username']} {self.status_text(repo, url)}")
+            try:
+                status = self.status_text(repo, url, where)
+            except InboxError as exc:
+                log(f"Status query failed for {url}: {exc}")
+                status = f"目标 issue {url} 的状态查询失败，无法确认当前进度；请稍后重试 /status。"
+            self.comment(where, f"@{note['author']['username']} {status}")
             return True
         if origin is not None and origin.get("blocked_dialog") and note["author"]["username"] == origin["initiator"]:
             number = self.choice_of(note["body"])
@@ -363,6 +373,10 @@ class Inbox:
         return (
             f"[GitLab 收件箱] {kind}（{mode}）：@{note['author']['username']} 在 {url}#note_{note['id']} 评论：\n"
             f"{note['body']}\n"
+            f"这条回复只属于上方所附 issue（{url}）。正文提到其他编号不改变归属，"
+            "不得因此移交到其他 issue，也不得把本条的同意、确认或合并授权用于其他 issue。"
+            "如果确实提出了独立新需求，按 ~/.hwf/PROTOCOL.md 的拆分流程建立独立 issue 和话题，"
+            "在来源话题留下跳转链接，不得在当前会话悄悄接管新需求。"
             "按 ~/.hwf/PROTOCOL.md「GitLab 收件箱」处理这条用户消息。"
         )
 
@@ -522,18 +536,20 @@ class Inbox:
             origin["last_note_id"] = note["id"]
             save_state(self.state)
         if issue.get("state") != "opened":
-            # 用户关闭发起 issue = 交付结束，调度者从此可接新需求；通知它收尾（失败只记录，不阻塞释放）。
+            # 关闭是平台状态，不是交付结论；是否收尾由调度者核对证据与用户取消意图后决定。
             _, pane = self.owner(origin["repo"], url)
             if pane:
-                self.prompt(pane, f"[GitLab 收件箱] 用户已关闭发起 issue {url}：把 INDEX 中该任务状态改为 "
-                                  "closed（若还不是收尾状态），停止推进，并按 ~/.hwf/PROTOCOL.md §9「成员收尾与收尾回执」"
-                                  "关闭测试服务、成员 pane 与 worktree，在发起 issue 发收尾回执。")
+                self.prompt(pane, f"[GitLab 收件箱] 检测到发起 issue 已关闭 {url}。先按 ~/.hwf/PROTOCOL.md "
+                                  "§9「关闭前核对」核验交付证据和剩余工作；关闭事件本身不代表验收或交付完成。"
+                                  "仍有未完成项且用户未明确取消时，在原 issue 说明缺项，请用户重开继续或明确取消，"
+                                  "INDEX 保持 blocked，保留成员与 worktree；测试服务仍按每轮规则清理。"
+                                  "只有确认交付完成或用户明确取消后，才执行 §9「成员收尾与收尾回执」。")
             closed: dict[str, Any] = self.state["closed_origins"]
             closed[url] = self.state["origins"].pop(url)  # 保留水位：用户重开后接着处理关闭后的评论。
             for stale in list(closed)[:-CLOSED_CAP]:
                 del closed[stale]
             save_state(self.state)
-            log(f"origin closed by user: {url}")
+            log(f"origin closed: {url}")
             return
         self.watch_blocked(url, origin)
 
@@ -544,7 +560,7 @@ class Inbox:
         读不出就只提醒一次去电脑上处理。恢复后清除，下次卡住再提醒。
         """
         _, pane = self.owner(origin["repo"], url)
-        status = self.agent_state(pane)[0] if pane else ""
+        status = self.agent_state(pane) if pane else ""
         if status != "blocked":
             if origin.get("blocked_notified") or origin.get("blocked_dialog"):
                 origin["blocked_notified"] = False
@@ -592,7 +608,7 @@ class Inbox:
         """发起人回数字：核对调度者仍卡在同一道题，再按方向键移到该项并回车；结果回帖。不重试按键。"""
         user = note["author"]["username"]
         _, pane = self.owner(origin["repo"], url)
-        if not pane or self.agent_state(pane)[0] != "blocked":
+        if not pane or self.agent_state(pane) != "blocked":
             origin.pop("blocked_dialog", None)
             save_state(self.state)
             self.comment(origin, f"@{user} 调度者已经不在选择界面了，这次没有按键。要它做什么请直接说。")
@@ -626,7 +642,7 @@ class Inbox:
             return True
         log(f"{url}: chose option {number} for {user} on {pane}")
         self.sleep(CHOICE_SETTLE_S)
-        still = self.agent_state(pane)[0] == "blocked" and (parse_dialog(self.read_screen(pane)) or {}).get(
+        still = self.agent_state(pane) == "blocked" and (parse_dialog(self.read_screen(pane)) or {}).get(
             "fingerprint") == dialog["fingerprint"]
         if still:
             self.comment(origin, f"@{user} 已按第 {number} 项「{option['label']}」，但界面还停在这道题上，"

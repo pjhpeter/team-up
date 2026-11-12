@@ -38,7 +38,14 @@ fi
 
 # 3. 依赖检查
 python3 -c 'import yaml' 2>/dev/null && echo "[已有]   python3 + PyYAML（只有测试用到）" || echo "[注意]   测试需要 PyYAML：python3 -m pip install pyyaml"
-for c in herdr glab omp claude codex; do
+for c in herdr glab omp claude codex droid; do
   command -v "$c" >/dev/null 2>&1 && echo "[已有]   $c" || echo "[注意]   没装 $c（角色配置里用到）"
 done
+# 极简模式的开发者（dev-mini 等）用 droid：herdr 要靠集成看出它忙还是空闲，新 worktree 要已被信任才不会卡在弹窗
+if command -v droid >/dev/null 2>&1; then
+  herdr integration status 2>/dev/null | grep -q '^droid: current' && echo "[已有]   herdr 的 droid 集成" \
+    || echo "[注意]   运行 herdr integration install droid（极简模式的开发者用 droid）"
+  grep -q "$HOME/.herdr/worktrees\"" "$HOME/.factory/settings.json" 2>/dev/null && echo "[已有]   droid 已信任 ~/.herdr/worktrees" \
+    || echo "[注意]   在 droid 里信任 $HOME/.herdr/worktrees（~/.factory/settings.json 的 trustedFolders），否则新 worktree 会卡在信任弹窗"
+fi
 echo "装好了。每个要接入的仓库跑一次：python3 $HWF/scripts/init-project.py <仓库路径> --apply"

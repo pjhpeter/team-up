@@ -10,7 +10,8 @@
 
 步骤：
 1. 读角色配置：全局插件配置 → <仓库>/.hwf/config.yaml → <仓库>/.hwf/config.local.yaml，后者按整条 profile 覆盖。
-   成员 profile 的参数里必须带模型（--model / -m），否则拒绝启动（协议：成员不得依赖执行体默认模型）。
+   成员 profile 的参数里必须带模型（--model / -m；droid 写在 --settings 文件的 sessionDefaultSettings.model），
+   否则拒绝启动（协议：成员不得依赖执行体默认模型）。
 2. 认调度者：当前 pane（HERDR_PANE_ID）上的登记名必须是 delivery-scheduler-*，且所在 tab 已用 name-tab.py
    命名为 `#<编号> 调度 …`（或 `待建issue 调度 …`），否则拒绝。
 3. 找本团队同角色成员：登记名为 `i<编号>-<profile>[-n]`（无 issue 时 `new-<profile>[-n]`，旧名
@@ -102,7 +103,7 @@ def load_profile(name: str, layers: Sequence[Path]) -> dict[str, Any]:
         raise ClaimError("调度者由 team-up 入口启动，不用本脚本领取")
     args = [str(a) for a in profile.get("args") or []]
     if not model_of(args):
-        raise ClaimError(f"角色 {name} 的配置没写模型（--model / -m），成员不得用执行体默认模型")
+        raise ClaimError(f"角色 {name} 的配置没写模型（--model / -m 或 --settings 文件），成员不得用执行体默认模型")
     return {"kind": str(profile["kind"]), "args": args}
 
 
@@ -112,7 +113,28 @@ def model_of(args: Sequence[str]) -> Optional[str]:
             return args[i + 1]
         if arg.startswith("--model="):
             return arg.split("=", 1)[1]
+    path = settings_path(args)
+    return settings_model(path) if path else None
+
+
+def settings_path(args: Sequence[str]) -> Optional[Path]:
+    """交互式 droid 没有 --model 参数，模型与思考档只能写在 `--settings` 运行时设置文件里。"""
+    for i, arg in enumerate(args):
+        if arg == "--settings" and i + 1 < len(args):
+            return Path(args[i + 1]).expanduser()
+        if arg.startswith("--settings="):
+            return Path(arg.split("=", 1)[1]).expanduser()
     return None
+
+
+def settings_model(path: Path) -> Optional[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    session = data.get("sessionDefaultSettings") if isinstance(data, dict) else None
+    model = session.get("model") if isinstance(session, dict) else None
+    return str(model) if model else None
 
 
 def override_model(args: Sequence[str], model: str) -> list[str]:
@@ -125,8 +147,9 @@ def override_model(args: Sequence[str], model: str) -> list[str]:
         if arg.startswith("--model="):
             out[i] = f"--model={model}"
             return out
+    if settings_path(out):
+        raise ClaimError("这个角色的模型写在 --settings 文件里，不能临时替换；按用户授权改领其他角色")
     raise ClaimError("配置里找不到模型参数，无法替换")
-
 
 def pane_label(profile: str, args: Sequence[str], task: str) -> str:
     model = (model_of(args) or "").rsplit("/", 1)[-1]

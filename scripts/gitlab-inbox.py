@@ -297,7 +297,7 @@ class Inbox:
             forwarded = bool(rest) and self.deliver(repo, url, self.message(url, note, True), DELIVER) is not None
             self.comment(where, f"@{user} 这个 issue 已经在交付流程中了。" + ("补充说明已转给调度者。" if forwarded else ""))
             return True
-        flow = ("用户明确要求极简模式：按 ~/.hwf/PROTOCOL.md「极简模式」只做开发并提交 MR 到 release-<根编号>，不做复杂度判定"
+        flow = ("用户明确要求极简模式：按 ~/.hwf/PROTOCOL.md「极简模式」领取 dev-mini 开发并提交 MR 到 release-<根编号>，不做复杂度判定"
                 if minimal else "按 ~/.hwf/PROTOCOL.md 从 §0 复杂度判定开始")
         go = (f"[GitLab 收件箱] 用户在 {url}#note_{note['id']} 发出 /go：从对话模式切换到交付流程，"
               f"{flow}交付这个 issue（发起人 @{user}）。"

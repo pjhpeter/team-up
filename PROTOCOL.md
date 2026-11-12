@@ -87,6 +87,8 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 
 **成员模型（2026-11-11 用户指示）**：固定使用 GPT 的成员全部使用 codex：`arch-lite`、`code-review` 用 `gpt-6-astra` + thinking medium，`precheck` 用 `gpt-6-astra` + thinking low；`dev`、`dev-fe`、`dev-be`、`test` 用 `gpt-6.1-sol` + thinking medium，`test-writer` 用同模型 + thinking high，`test-herdr` 用同模型 + thinking low。`arch` 默认使用 omp + `devin/claude-opus-5-5` + thinking medium，同时承担独立方案评审；只有用户明确指定其他模型时才按其指定使用，不自行更换。用户指定的适用范围结束后，恢复全局默认模型；`scheduler` 仍跟随发起会话，不固定模型。以全局插件配置为准，不得擅自替换。方案作者 arch-lite 与方案评审者 arch 分别领取会话，方案作者不兼任自己的独立评审者；换 profile 或换模型本身不构成独立。测试人员可以写用例、测试脚本和证据，不兼任被验代码的开发者。模型不可用时报告实际阻塞，不能未经用户授权替换指定模型。precheck 只出证据、不出结论；阶段终审人保留结论权与最终闸门：方案评审为 arch，测试用例评审为 code-review（独立会话），代码最终风险闸门为 arch。临时替换模型见双层评审第 11 条。
 
+**极简模式的开发者（2026-11-12 用户指示）**：极简模式下开发者一律领取 `dev-mini`（分前后端时 `dev-fe-mini`、`dev-be-mini`），使用 droid + `claude-opus-5-5` + thinking low；非极简模式仍用 `dev`、`dev-fe`、`dev-be`。以全局插件配置为准。
+
 **`scheduler` 绝对不得亲自做实际工作**（2026-10-21 用户指示）：方案编写、开发、测试、评审、取证、浏览器验收等成员职责范围内的工作，一律领取或创建对应角色并派活；scheduler 只做调度、阶段推进、任务记录、GitLab issue 管理、通知与验收，不得以“更快”“更省”“成员忙”或“顺手改一下”为由代做。除协议明确分配给 scheduler 的 spec、issue、任务记录和通知外，不得亲自产出交付物。
 
 **`scheduler` 绝对不得使用子代理（subagent）干活或监听**（2026-11-06 用户指示）：成员的工作只能派给 herdr 里的成员。调度者不得调用 `task`、`Agent`、`spawn_agent` 等任何子代理工具，也不得用 `omp -p`、`claude -p`、`codex exec` 等命令临时另起 Agent；取证、查资料、读源码、核对分支这类“小事”同样不例外。成员忙或没有合适角色时，按「调度者初始化与角色复用」新建成员，不得以任何理由改用子代理。等待成员只用后台 `herdr agent wait`，不用子代理监听。已经用了子代理：立刻停止，其结果不算交付物，不写入证据，重新派给对应成员，并在 STATE 记一笔。
@@ -308,7 +310,7 @@ omp 扩展 `~/.omp/agent/extensions/hwf-scheduler-watch-guard.ts` 会在调度�
 **流程**：
 
 1. scheduler 读取 issue 与需求，按「根 issue 汇总分支」创建或复用 `release-<根编号>`，从它切出开发分支并建独立 worktree（按「每个调度者一个 tab」与「隔离」规则），确定可写范围；不派 arch、不做复杂度判定。
-2. 派一个 dev（新会话）按 issue 实现：只做需求要求的改动，跑相关 lint、type-check 与聚焦检查（不跑全量测试），在本 worktree 提交并 push。
+2. 用 `member-start.py dev-mini` 派一个开发者（新会话；前后端都要改时分别领取 `dev-fe-mini`、`dev-be-mini`，不领 `dev`/`dev-fe`/`dev-be`）按 issue 实现：只做需求要求的改动，跑相关 lint、type-check 与聚焦检查（不跑全量测试），在本 worktree 提交并 push。
 3. scheduler 用 `glab mr create` 创建目标为 `release-<根编号>` 的 MR：标题与描述用中文，描述写清改了什么、关联 issue、dev 实际跑过的检查与结果、未验证项（必须写明“极简模式：未经代码评审与自动化测试”）。回读 MR 确认目标分支、源分支与 diff 正确。极简模式不合并该 MR，也不合入 develop。
 4. 在发起 issue（有则）评论 MR 链接，并在评论、会话回复与 ntfy 里把 MR 链接放在第一行；INDEX 状态写 `done（极简模式：MR 已提交，待用户处理）`，按 07-completion 发通知后停下。
 

@@ -125,6 +125,21 @@ class ProfileTest(Case):
         with self.assertRaisesRegex(MS.ClaimError, "入口启动"):
             MS.load_profile("scheduler", [self.dir / "global.yaml"])
 
+    def test_droid_model_comes_from_settings_file(self) -> None:
+        settings = self.dir / "droid.json"
+        settings.write_text('{"sessionDefaultSettings": {"model": "claude-opus-5-5", "reasoningEffort": "low"}}',
+                            encoding="utf-8")
+        cfg = self.dir / "droid.yaml"
+        cfg.write_text(f"profiles:\n  dev-mini: {{kind: droid, args: ['--settings', '{settings}', '--auto', 'high']}}\n"
+                       "  bad: {kind: droid, args: ['--settings', '/nope.json']}\n", encoding="utf-8")
+        profile = MS.load_profile("dev-mini", [cfg])
+        self.assertEqual(MS.model_of(profile["args"]), "claude-opus-5-5")
+        self.assertEqual(MS.pane_label("dev-mini", profile["args"], "#453"), "dev-mini-claude-opus-5-5-#453")
+        with self.assertRaisesRegex(MS.ClaimError, "没写模型"):
+            MS.load_profile("bad", [cfg])
+        with self.assertRaisesRegex(MS.ClaimError, "--settings"):
+            MS.override_model(profile["args"], "x/y")
+
     def test_label(self) -> None:
         self.assertEqual(MS.pane_label("dev", ["--model", "jc-gpt/gpt-6.1-sol"], "#453"), "dev-gpt-6.1-sol-#453")
 
@@ -208,6 +223,10 @@ class ClaimTest(Case):
     def test_dev_does_not_claim_dev_fe(self) -> None:
         fake = FakeHerdr([SCHED, agent("delivery-dev-fe-w1-pv", "w1:pV", kind="omp"),
                           agent("i453-dev-fe", "w1:pW", kind="omp")])
+        self.assertEqual(self.run_claim(fake, "dev")["action"], "created")
+
+    def test_dev_does_not_claim_dev_mini(self) -> None:
+        fake = FakeHerdr([SCHED, agent("i453-dev-mini", "w1:pM", kind="droid")])
         self.assertEqual(self.run_claim(fake, "dev")["action"], "created")
 
     def test_pre_issue_member_renamed_once_issue_exists(self) -> None:

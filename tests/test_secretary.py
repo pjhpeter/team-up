@@ -30,8 +30,11 @@ class World(TFB.World):
         self.agent_status = "working"
         self.omp_out = ""
         self.omp_cmds: list[list[str]] = []
+        self.label_events: list[dict] = []
 
     def __call__(self, cmd, input=None, env=None, cwd=None, **kw):
+        if cmd[0] == "glab" and "/resource_label_events" in cmd[cmd.index("-X") + 2]:
+            return ok(self.label_events)
         if cmd[0] == sys.executable and cmd[1].endswith("find-scheduler.py"):
             return ok(self.owner)
         if cmd[:3] == ["herdr", "agent", "get"]:
@@ -42,9 +45,16 @@ class World(TFB.World):
             return subprocess.CompletedProcess(cmd, 0, self.omp_out, "")
         return super().__call__(cmd, input, env, cwd, **kw)
 
-    def agent_note(self, iid: int, body: str) -> None:
+    def agent_note(self, iid: int, body: str, at: str = "") -> None:
         self.gitlab_comment(iid, body)
         self.issues[iid]["notes"][-1]["author"]["username"] = "pjhagent"
+        if at:
+            self.issues[iid]["notes"][-1]["created_at"] = at
+
+    def ship(self, iid: int, at: str) -> None:
+        self.issues[iid]["labels"] = ["状态:待上线"]
+        self.label_events.append({"action": "remove", "label": {"name": "状态:开发中"}, "created_at": at})
+        self.label_events.append({"action": "add", "label": {"name": "状态:待上线"}, "created_at": at})
 
 
 class SecretaryTest(unittest.TestCase):
@@ -195,6 +205,24 @@ class SecretaryTest(unittest.TestCase):
         self.w.agent_note(7, "整项完成，MR 等你合并")
         self.sec.poll()
         self.assertEqual(len(self.forwarded()), 1)
+
+    def test_ship_label_without_asking_user_is_flagged(self) -> None:
+        self.w.agent_note(7, "@pengjh 方案选 A 还是 B？", at="2026-11-12T08:00:00.000+08:00")  # 早先的 @ 不算
+        self.w.agent_note(7, "全部完成，main MR 已建好", at="2026-11-12T10:00:00.000+08:00")
+        self.w.ship(7, "2026-11-12T10:00:05.000+08:00")
+        self.assertIn("已待上线，但调度者没 @你 请求授权合并", "\n".join(self.sec.overview()))
+
+    def test_ship_label_with_request_shortly_before_is_fine(self) -> None:
+        self.w.agent_note(7, "@pengjh 整项交付完成，请授权合并 MR", at="2026-11-12T01:50:00Z")
+        self.w.ship(7, "2026-11-12T10:00:00.000+08:00")  # 评论先发、10 分钟后才改标签
+        self.assertNotIn("没 @你", "\n".join(self.sec.overview()))
+
+    def test_ship_label_after_user_reply_or_without_events_is_not_flagged(self) -> None:
+        self.w.issues[7]["labels"] = ["状态:待上线"]  # 查不到标签记录：不报
+        self.assertNotIn("没 @你", "\n".join(self.sec.overview()))
+        self.w.ship(7, "2026-11-12T10:00:00.000+08:00")
+        self.w.gitlab_comment(7, "可以合并了")
+        self.assertNotIn("没 @你", "\n".join(self.sec.overview()))
 
     def test_verbose_issue_forwards_everything(self) -> None:
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {URL7: {

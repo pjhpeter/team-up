@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 SPEC = importlib.util.spec_from_file_location(
     "test_feishu_bridge_shared", Path(__file__).resolve().parent / "test_feishu_bridge.py")
@@ -261,6 +262,35 @@ class SecretaryTest(unittest.TestCase):
     def test_closed_origin_drops_out_of_watch(self) -> None:
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))
         self.sec.poll()
+        self.assertEqual(self.state["secretary"]["issues"], {})
+
+    def test_notes_posted_right_before_close_are_forwarded_before_dropping(self) -> None:
+        self.w.agent_note(7, "测试通过，攒着等巡检")
+        self.sec.poll()
+        self.assertEqual(self.forwarded(), [])
+        self.w.agent_note(7, "生产验证通过")
+        self.w.agent_note(7, "交付收尾")
+        self.w.issues[7]["state"] = "closed"
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))  # 关闭后同一轮就掉出名单
+        self.sec.poll()
+        texts = [s["text"] for s in self.forwarded()]
+        self.assertEqual(len(texts), 3)
+        self.assertIn("攒着等巡检", texts[0])
+        self.assertIn("交付收尾", texts[2])
+        self.assertEqual(self.state["secretary"]["issues"], {})
+        self.assertEqual(self.state["secretary"]["held"], {})
+        self.sec.poll()
+        self.assertEqual(len(self.forwarded()), 3)
+
+    def test_dropped_issue_is_kept_when_notes_cannot_be_read(self) -> None:
+        self.w.agent_note(7, "交付收尾")
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))
+        with unittest.mock.patch.object(self.sec, "notes_of", side_effect=FB.BridgeError("timeout")):
+            with self.assertRaises(FB.BridgeError):
+                self.sec.poll()
+        self.assertIn(URL7, self.state["secretary"]["issues"])
+        self.sec.poll()
+        self.assertIn("交付收尾", self.forwarded()[-1]["text"])
         self.assertEqual(self.state["secretary"]["issues"], {})
 
 

@@ -163,25 +163,25 @@ class Secretary:
         issues, held = self.state["issues"], self.state["held"]
         watched = self.watched()
         for url in [u for u in issues if u not in watched]:
+            # 关闭后才掉出名单：调度者常发完最后几条评论就立刻关 issue（#481），先把没转的补发完再放手。
+            # 读评论失败就抛出去、记录不删，下一轮再补。
+            known = issues[url]
+            pending = held.get(url, []) + self.fresh_entries(url, known, self.notes_of(known), forward)
+            for entry in pending:
+                self.forward(url, known, entry)
             del issues[url]
             held.pop(url, None)
         for url, w in watched.items():
             known = issues.get(url)
             pid = quote(w["project"], safe="")
-            notes = self.bridge.api(f"projects/{pid}/issues/{w['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
+            notes = self.notes_of(w)
             if known is None:
                 issue = self.bridge.api(f"projects/{pid}/issues/{w['iid']}")
                 issues[url] = {**w, "title": issue.get("title", ""), "last_note": max([n["id"] for n in notes] or [0]),
                                "last_agent_at": self.bridge.now()}
                 continue  # 第一次看到只记水位，不回放旧评论
             known.update(w)
-            fresh = []
-            for n in sorted((n for n in notes if n["id"] > known["last_note"]), key=lambda n: n["id"]):
-                if forward and self.should_forward(n):
-                    known["last_agent_at"] = self.bridge.now()
-                    fresh.append(n)
-                known["last_note"] = n["id"]
-            pending = held.get(url, []) + [self.held_entry(url, known, n) for n in fresh]
+            pending = held.get(url, []) + self.fresh_entries(url, known, notes, forward)
             if not pending:
                 continue
             if w.get("notify") == "verbose" or self.urgent(pid, w["iid"]):
@@ -190,6 +190,20 @@ class Secretary:
                     self.forward(url, known, entry)
             else:
                 held[url] = pending
+
+    def notes_of(self, w: Mapping[str, Any]) -> list[dict[str, Any]]:
+        pid = quote(w["project"], safe="")
+        return self.bridge.api(f"projects/{pid}/issues/{w['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
+
+    def fresh_entries(self, url: str, known: dict[str, Any], notes: list[dict[str, Any]], forward: bool) -> list[dict[str, Any]]:
+        """水位之后要转的 Agent 发言，同时推进水位。"""
+        fresh = []
+        for n in sorted((n for n in notes if n["id"] > known["last_note"]), key=lambda n: n["id"]):
+            if forward and self.should_forward(n):
+                known["last_agent_at"] = self.bridge.now()
+                fresh.append(n)
+            known["last_note"] = n["id"]
+        return [self.held_entry(url, known, n) for n in fresh]
 
     def urgent(self, pid: str, iid: int) -> bool:
         info = self.bridge.api(f"projects/{pid}/issues/{iid}")

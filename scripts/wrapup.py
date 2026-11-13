@@ -19,7 +19,9 @@
    不满足的保留并写明原因（保留不算失败）。
 4. test-account.py release --task 释放本任务的测试账号。
 5. 在 issue 发「收尾回执」评论并回读，同时追加到 STATE.md。
-6. 以上全部通过，才把 INDEX 本任务行的状态改成 --status。
+6. 给了 --close-request（用户明确要求关闭的那条评论）且以上全部通过，才关闭 --issue 并回读；没给就不关。
+   调度者不得用 glab/API 自己关闭发起 issue：#481 调度者上下文压缩后忘了规则，没人要求就关了，收尾也是手写的。
+7. 以上全部通过，才把 INDEX 本任务行的状态改成 --status。
 
 退出码：0 收尾完成、INDEX 已改；1 有残留或失败（INDEX 未改，调度者按协议「需要用户确认」通知用户）；2 参数错误。
 --dry-run 只打印将做什么：不关服务、不关 pane、不删 worktree、不释放账号、不发评论、不改 INDEX。
@@ -126,6 +128,30 @@ def owner_row(repo: str, task: str) -> Any:
     if not rows:
         raise WrapupError(f"{repo}/{_FS.INDEX_RELATIVE} 里没有任务 {task}")
     return rows[-1]  # 同一任务被接手时会追加新行，最后一行是现在的负责人
+
+
+def check_close_request(issue: Issue, link: str) -> str:
+    """--close-request 必须是本 issue 下由真人（不是本 Agent 账号）发的评论；返回发评论的人。"""
+    match = re.fullmatch(r"(?P<issue>.+)#note_(?P<note>\d+)", link.strip())
+    if not match:
+        raise WrapupError(f"--close-request 要写用户要求关闭的那条评论链接（…#note_<编号>）：{link}")
+    target = parse_issue(match["issue"])
+    if (target.host, target.project, target.iid) != (issue.host, issue.project, issue.iid):
+        raise WrapupError(f"--close-request 的评论不在 {issue.url} 下：{link}")
+    me = str(glab_api(issue.host, "GET", "user").get("username") or "")
+    note = glab_api(issue.host, "GET", f"projects/{quote(issue.project, safe='')}/issues/{issue.iid}/notes/{match['note']}")
+    author = str((note.get("author") or {}).get("username") or "")
+    if note.get("system") or not author or author == me:
+        raise WrapupError(f"--close-request 必须是用户本人发的评论，这条是 {author or '系统'} 发的：{link}")
+    return author
+
+
+def close_issue(issue: Issue) -> None:
+    path = f"projects/{quote(issue.project, safe='')}/issues/{issue.iid}"
+    glab_api(issue.host, "PUT", path, "state_event=close")
+    state = glab_api(issue.host, "GET", path).get("state")
+    if state != "closed":
+        raise WrapupError(f"关闭 {issue.url} 后回读状态是 {state}")
 
 
 # ---------- 第 1 步：测试服务 ----------
@@ -462,6 +488,7 @@ def wrapup(opts: argparse.Namespace) -> int:
         raise WrapupError(f"INDEX 里 {opts.task} 的调度者是 {row.scheduler or '（空）'}，不是 {scheduler}；只能收尾自己的任务")
     tag = "【预演】" if opts.dry_run else ""
     problems: list[str] = []
+    requester = check_close_request(issue, opts.close_request) if opts.close_request else ""
 
     worktrees = task_worktrees(opts.task)
     paths = [wt.path for wt in worktrees if not wt.bare]
@@ -519,11 +546,16 @@ def wrapup(opts: argparse.Namespace) -> int:
     print(f"{tag}4. 测试账号：{accounts}")
 
     body = receipt_text(services, members, removed, worktrees, accounts, opts.dry_run)
+    if requester:
+        body += (f"\n- issue：{'收尾未完成，先不关闭' if problems else '按 @' + requester + ' 的要求关闭'}"
+                 f"（{opts.close_request.strip()}）")
     if problems:
         body += "\n- **收尾未完成**：" + "；".join(problems)
     print(f"{tag}5. 收尾回执：\n{body}")
     if opts.dry_run:
-        print(f"{tag}6. 将把 INDEX 中 {opts.task} 的状态改为：{opts.status}")
+        if requester:
+            print(f"{tag}6. 将按 @{requester} 的要求关闭 {issue.url}")
+        print(f"{tag}7. 将把 INDEX 中 {opts.task} 的状态改为：{opts.status}")
         return 0
     try:
         link = post_receipt(issue, body)
@@ -532,11 +564,17 @@ def wrapup(opts: argparse.Namespace) -> int:
     except (WrapupError, ValueError) as error:
         problems.append(f"回执：{error}")
         print(f"回执未发出：{error}", file=sys.stderr)
+    if requester and not problems:
+        try:
+            close_issue(issue)
+            print(f"6. 已按 @{requester} 的要求关闭 {issue.url}，回读 state=closed")
+        except (WrapupError, ValueError) as error:
+            problems.append(f"关闭 issue：{error}")
     if problems:
         print("收尾未完成，INDEX 未改。按协议「需要用户确认」把残留告诉用户：\n- " + "\n- ".join(problems))
         return 1
     write_index_status(repo, opts.task, scheduler, opts.status)
-    print(f"6. INDEX 已改为：{opts.status}")
+    print(f"7. INDEX 已改为：{opts.status}")
     return 0
 
 
@@ -549,6 +587,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--status", required=True, help="收尾后写进 INDEX 的状态，以 done/delivered/closed/cancelled 开头")
     parser.add_argument("--port", type=int, action="append", default=[], help="本交付用过、需要回读的端口，可重复")
     parser.add_argument("--scheduler", help="调度者登记名；默认取当前 pane 上的调度者")
+    parser.add_argument("--close-request", help="用户明确要求关闭 issue 的那条评论链接；给了才在收尾全部通过后关闭 --issue，"
+                                                "不给就不关")
     parser.add_argument("--dry-run", action="store_true", help="只打印将做什么，不做任何改动")
     opts = parser.parse_args(argv)
     try:

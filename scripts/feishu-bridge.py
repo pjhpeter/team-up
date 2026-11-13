@@ -14,8 +14,9 @@
   「需求：<内容>」或「/需求 <内容>」  → 在 default_project 建 issue（打开关标签、指派给 Agent 账号），回帖 issue 链接
   「#123 <可选内容>」或贴 issue 链接   → 把这条消息的话题关联到已有 issue，内容写成评论（带 @Agent 以便转交）
   在上面两种消息的话题里回复         → 写成该 issue 的评论；/go、/status、/new、/免打扰、/详尽 等指令原样生效
-  「/秘书」                          → 开一个秘书话题，统一转达所有需求的进度（见 secretary.py）
-  其他顶层消息                       → 回一段用法说明（同一会话 10 分钟内只回一次）
+  私聊里对秘书转达的消息点「回复」   → 写成那个需求 issue 的评论（私聊窗口就是秘书，见 secretary.py）
+  私聊里的其他话                     → 交给秘书：「进度」回总览，「帮助」回用法，其余当提问回答
+  群里的其他顶层消息                 → 回一段用法说明（同一会话 10 分钟内只回一次）
 发到 GitLab 的内容用用户自己的 GitLab 令牌（钥匙串里取），这样收件箱才认得是用户本人在说话。
 
 依赖：lark-cli（首次使用按引导建好机器人应用，只用机器人身份）、glab。
@@ -101,9 +102,11 @@ HELP_TEXT = (
     "2. 发「#123 <补充>」→ 关联已有 issue，之后在话题里回复就会同步过去\n"
     "3. 在话题里回复 /go 开工、/status 看进度、/new 让调度者重开会话\n"
     "4. 嫌消息多就回复 /免打扰（只在步骤完成、交付完成和要你处理时发），想看每一步就回复 /详尽\n"
-    "5. 发 /秘书 开一个秘书话题，所有需求的进度都在那里统一跟进\n"
+    "5. 私聊窗口就是秘书：各需求的进度都会转到这里，对转达点「回复」就能回给那个需求，发「进度」看总览，其他话直接问\n"
     "在群里每句话（包括话题里的回复）都要 @我，我才收得到"
 )
+
+HELP_WORDS = frozenset({"帮助", "用法", "/help", "help"})
 
 Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 Uploader = Callable[[str, Path], str]  # (project, 本地文件) → 可直接放进评论的 Markdown
@@ -189,7 +192,7 @@ class Bridge:
 
     @property
     def secretary(self) -> Any:
-        """秘书话题（见 secretary.py）；按需创建，只读命令（--split-topic 等）不会碰到它。"""
+        """秘书（私聊窗口，见 secretary.py）；按需创建，只读命令（--split-topic 等）不会碰到它。"""
         if self._secretary is None:
             self._secretary = secretary_module().Secretary(self)
         return self._secretary
@@ -359,12 +362,12 @@ class Bridge:
             self.reply(mid, random.choice(DENY_TEXTS), f"deny-{mid}")
             return
         text = self.clean_text(msg)
-        if self.strip_images(text).strip().lower() in secretary_module().START_COMMANDS:
-            self.secretary.start(chat, mid)
-            return
-        if self.secretary.owns(msg):
-            self.secretary.handle(msg, text)
-            return
+        private = msg.get("chat_type") != "group" and chat not in self.state["group_chats"]
+        if private:
+            self.secretary.learn(chat)
+            if self.secretary.is_relay(msg):
+                self.secretary.handle(msg, text)
+                return
         root, tid = msg.get("root_id") or "", msg.get("thread_id") or ""
         linked = self.state["thread_ids"].get(tid) if tid else None
         if not linked and root and root != mid and root in self.state["threads"]:
@@ -407,6 +410,12 @@ class Bridge:
             self.state["pending_images"].setdefault(chat, []).extend(
                 {"mid": mid, "ts": self.now(), **a} for a in attachments)
             self.reply(mid, IMAGE_HINT, f"img-hint-{mid}", in_thread=False)
+            return
+        if private and not c and self.strip_images(text).strip().lower() not in HELP_WORDS:
+            self.secretary.handle(msg, text)
+            return
+        if private:
+            self.reply(mid, HELP_TEXT, f"help-{mid}")
             return
         last = self.state["help_sent"].get(chat, 0)
         if self.now() - last >= HELP_COOLDOWN_S:
@@ -674,9 +683,6 @@ class Bridge:
                         continue  # 非观察群里没 @ 机器人的话不是对它说的
                 self.handle(msg)
         roots = [(root, t["chat_id"]) for root, t in self.state["threads"].items() if not t.get("closed")]
-        sec = self.state.get("secretary") or {}
-        if sec.get("root"):
-            roots.append((sec["root"], sec.get("chat_id", "")))
         for root, chat_id in roots:
             try:
                 data = self.lark(["im", "+threads-messages-list", "--thread", root, "--order", "asc",

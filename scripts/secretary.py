@@ -1,21 +1,22 @@
-"""秘书：在飞书里一个固定话题统一转达各交付的消息、每小时巡检、回答提问、转发用户的快速回复。
+"""秘书：和机器人的私聊窗口就是秘书，统一转达各交付的消息、每小时巡检、回答提问、转发用户的快速回复。
 
 问题：每个交付各有一张 issue 和一个飞书话题，同时跑的交付一多，用户要在好几个话题之间来回看。
-办法：飞书桥里挂一个秘书，所有交付的 Agent 评论都同时转到一个「秘书」话题；没有新消息时每小时巡检一次，
-有变化或异常才汇报；用户在秘书话题里对某条转达点「回复」，就把话转成那张 issue 的评论。
+办法：私聊窗口本来就是提需求的入口，让它同时当秘书：所有交付的 Agent 评论都同时发到私聊主窗口；没有新消息时
+每小时巡检一次，有变化或异常才汇报；用户对某条转达点「回复」，就把话转成那张 issue 的评论。各交付自己的
+话题照常保留（默认免打扰），想看某个需求的完整经过时去话题里看。
 
 只由 feishu-bridge.py 调用（同一进程、同一份飞书连接与状态文件），不单独运行：
-  开启：在和机器人的私聊里发 `/秘书`，机器人新开一个秘书话题（再发一次就换一个新话题，旧的不再更新）。
-  秘书话题里：
+  开启：白名单用户第一次在私聊里说话，桥就记下这个私聊窗口，之后的转达和巡检都发到这里，不需要命令。
+  私聊主窗口里（话题里的消息仍归各自的 issue）：
     对某条转达点「回复」          → 写成那张 issue 的评论（/go、/status、/免打扰 等指令原样生效）
-    「#123 <内容>」               → 写成 #123 的评论
-    「/status」「进度」「汇总」    → 立刻回一份总览
+    「需求：…」「#123 …」         → 照旧由桥建单或关联（不经过秘书）
+    「进度」「汇总」「/status」    → 立刻回一份总览
+    「帮助」「/help」              → 用法说明
     其他话                        → 当作提问，用模型按当前总览和最近转达回答；模型不可用时回总览
 看哪些 issue：收件箱登记的发起 issue（state/gitlab-inbox.json 的 origins）加上飞书桥里还没关闭的话题。
 只转 Agent 账号发的评论；收件箱的「已收到」回执不转，免得用户每回一句就多一条。
 巡检只读：GitLab GET、find-scheduler --owner-of、herdr agent get、本机 INDEX/STATE 修改时间。
 """
-
 from __future__ import annotations
 
 import importlib.util
@@ -30,7 +31,6 @@ from typing import Any, Mapping, Optional
 from urllib.parse import quote
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
-START_COMMANDS = frozenset({"/秘书", "/secretary"})
 STATUS_WORDS = frozenset({"/status", "进度", "汇总", "总览"})
 PATROL_S = 3600
 IDLE_ALERT_S = 3 * 3600  # 在途交付超过这么久没有任何动静，巡检里标出来
@@ -38,7 +38,6 @@ MSG_MAP_CAP = 500
 RECENT_CAP = 20
 SUMMARY_CAP = 600  # 转达只放开头一段，全文给链接
 RECEIPT = re.compile(r"^(@\S+\s+)?已收到")  # 收件箱回执，不转达
-ISSUE_HEAD = re.compile(r"^\s*#(\d+)[\s,，。:：;；]*")
 FOLDED = re.compile(r"<details>.*?</details>", re.S)
 WAITING_LABEL = "状态:等你处理"
 STATUS_TEXT = {"working": "正在干活", "idle": "空闲", "done": "空闲", "blocked": "卡在确认界面", "unknown": "状态不明"}
@@ -49,11 +48,11 @@ SYSTEM_PROMPT = (
 )
 
 INTRO = (
-    "我是秘书，这个话题统一跟进所有在跑的需求：\n"
+    "以后我也是你的秘书，所有在跑的需求都在这个窗口跟进：\n"
     "1. 各需求的 Agent 一发言，我就转到这里\n"
     "2. 没有新消息时每小时看一次，有变化或卡住了才汇报\n"
     "3. 对某条转达点「回复」，我把你的话转给那个需求；也可以发「#编号 内容」\n"
-    "4. 发「进度」看总览，或者直接问我"
+    "4. 发「进度」看总览，发「帮助」看用法，其他话直接问我"
 )
 
 
@@ -81,38 +80,41 @@ class Secretary:
         self.bridge, self.home = bridge, home
         self.state: dict[str, Any] = bridge.state.setdefault("secretary", {})
         self.state.setdefault("issues", {})   # issue URL → {project, iid, repo, title, last_note, last_agent_at}
-        self.state.setdefault("msgs", {})     # 秘书话题里的转达消息 id → issue URL（快速回复用）
+        self.state.setdefault("msgs", {})     # 私聊里的转达消息 id → issue URL（快速回复用）
         self.state.setdefault("recent", [])   # 最近转达的摘要，回答提问时当材料
         cfg = dict(DEFAULT_MODEL)
         cfg.update(bridge.cfg.get("secretary") or {})
         self.cfg = cfg
 
-    # ---------- 话题 ----------
+    # ---------- 私聊窗口 ----------
     @property
-    def root(self) -> str:
-        return str(self.state.get("root") or "")
+    def chat(self) -> str:
+        return str(self.state.get("chat_id") or "")
 
-    def owns(self, msg: Mapping[str, Any]) -> bool:
-        if not self.root:
-            return False
-        tid = msg.get("thread_id") or ""
-        return bool((tid and tid == self.state.get("thread_id")) or (msg.get("root_id") or "") == self.root)
+    def learn(self, chat: str) -> None:
+        """白名单用户在私聊里说话时调用：记下（或换成）这个私聊窗口；第一次记下时发一段说明。"""
+        if not chat or chat == self.chat:
+            return
+        first = not self.chat
+        self.state.update(chat_id=chat, last_patrol=self.bridge.now(), last_digest="")
+        if first:
+            self.say(INTRO, f"sec-intro-{chat}")
 
-    def start(self, chat: str, mid: str) -> None:
-        data = self.bridge.lark(["im", "+messages-send", "--chat-id", chat, "--markdown", "-",
-                                 "--idempotency-key", f"sec-root-{mid}"[:50]], stdin="**秘书：所有需求的进度都在这个话题里**")
-        root = (data.get("data") or {}).get("message_id")
-        if not root:
-            raise RuntimeError("秘书话题没建成：飞书没有返回消息 id")
-        self.state.update(chat_id=chat, root=root, thread_id="", msgs={}, last_patrol=self.bridge.now(),
-                          last_digest="")
-        self.say(INTRO, f"sec-intro-{root}")
-        items = (self.bridge.lark(["im", "+messages-mget", "--message-ids", root]).get("data") or {}).get("messages")
-        self.state["thread_id"] = (items or [{}])[0].get("thread_id") or ""
-        self.poll(forward=False)
+    def target(self, msg: Mapping[str, Any]) -> Optional[str]:
+        """对某条转达点了「回复」（引用回复或在它下面开的话题）就返回那个需求的 issue URL。"""
+        msgs = self.state["msgs"]
+        for key in (msg.get("reply_to"), msg.get("root_id")):
+            if key and key in msgs:
+                return msgs[key]
+        return None
+
+    def is_relay(self, msg: Mapping[str, Any]) -> bool:
+        return msg.get("chat_id") == self.chat and self.target(msg) is not None
 
     def say(self, markdown: str, key: str) -> str:
-        return self.bridge.reply(self.root, markdown, key) or ""
+        data = self.bridge.lark(["im", "+messages-send", "--chat-id", self.chat, "--markdown", "-",
+                                 "--idempotency-key", key[:50]], stdin=markdown)
+        return str((data.get("data") or {}).get("message_id") or "")
 
     # ---------- 看哪些 issue ----------
     def repos(self) -> dict[str, str]:
@@ -140,7 +142,7 @@ class Secretary:
 
     # ---------- 转达 ----------
     def poll(self, forward: bool = True) -> None:
-        if not self.root:
+        if not self.chat:
             return
         issues = self.state["issues"]
         watched = self.watched()
@@ -174,7 +176,7 @@ class Secretary:
         if len(body) > SUMMARY_CAP:
             body = body[:SUMMARY_CAP].rstrip() + "…"
         head = f"**[#{issue['iid']}]({link}) {issue.get('title', '')}**"
-        mid = self.say(f"{head}\n{body}\n\n_对这条点「回复」就能直接回给这个需求_", f"sec-{issue['iid']}-{n['id']}")
+        mid = self.say(f"{head}\n{body}", f"sec-{issue['iid']}-{n['id']}")
         if mid:
             msgs = self.state["msgs"]
             msgs[mid] = url
@@ -185,7 +187,7 @@ class Secretary:
     # ---------- 巡检 ----------
     def patrol(self, force: bool = False) -> Optional[str]:
         """到点（或 force）就看一遍；内容和上次发的不同才发。返回发出的文本。"""
-        if not self.root:
+        if not self.chat:
             return None
         if not force and self.bridge.now() - float(self.state.get("last_patrol") or 0) < PATROL_S:
             return None
@@ -253,16 +255,11 @@ class Secretary:
         except OSError:
             return 0.0
 
-    # ---------- 用户在秘书话题里说话 ----------
+    # ---------- 用户在私聊里对秘书说话 ----------
     def handle(self, msg: Mapping[str, Any], text: str) -> None:
+        """私聊主窗口里桥没认出的话：对转达的「回复」转给需求，「进度」回总览，其余当提问。"""
         mid = msg["message_id"]
-        target = self.state["msgs"].get(msg.get("reply_to") or "")
-        m = ISSUE_HEAD.match(text)
-        if target is None and m:
-            iid = int(m.group(1))
-            target = next((u for u, i in self.state["issues"].items() if i["iid"] == iid),
-                          self.bridge.issue_url(self.bridge.project, iid))
-            text = text[m.end():].strip()
+        target = self.target(msg)
         if target is not None:
             self.relay(target, msg, text)
             return

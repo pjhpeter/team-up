@@ -1,10 +1,9 @@
-"""聚焦验证秘书：只转 Agent 发言、快速回复回到对应 issue、#编号转话、巡检有变化才发、提问失败回总览。"""
+"""聚焦验证秘书（私聊窗口）：只转 Agent 发言、对转达点回复回到对应 issue、巡检有变化才发、提问失败回总览。"""
 
 from __future__ import annotations
 
 import importlib.util
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -27,21 +26,17 @@ class World(TFB.World):
     def __init__(self) -> None:
         super().__init__()
         self.issues[7].update(labels=["状态:开发中"])
-        self.sent: list[dict] = []
         self.owner = {"task": "frontend-web-v1-7", "live_pane": "w1:p1", "status": "in-progress"}
         self.agent_status = "working"
         self.omp_out = ""
 
     def __call__(self, cmd, input=None, env=None, cwd=None, **kw):
-        if cmd[0] == "lark-cli" and cmd[1:3] == ["im", "+messages-send"]:
-            self.sent.append({"chat": cmd[cmd.index("--chat-id") + 1], "text": input})
-            return ok({"ok": True, "data": {"message_id": "om_sec_root"}})
         if cmd[0] == sys.executable and cmd[1].endswith("find-scheduler.py"):
             return ok(self.owner)
         if cmd[:3] == ["herdr", "agent", "get"]:
             return ok({"result": {"agent": {"agent_status": self.agent_status}}})
-        if cmd[0] == "omp":
-            return subprocess.CompletedProcess(cmd, 0 if self.omp_out else 1, self.omp_out, "")
+        if cmd[0] == "omp" and self.omp_out:
+            return subprocess.CompletedProcess(cmd, 0, self.omp_out, "")
         return super().__call__(cmd, input, env, cwd, **kw)
 
     def agent_note(self, iid: int, body: str) -> None:
@@ -65,15 +60,26 @@ class SecretaryTest(unittest.TestCase):
         self.b = FB.Bridge(cfg, self.state, run=self.w, user_token="tok", now=lambda: self.now,
                            upload=lambda p, f: "", media_dir=self.home / "media")
         self.b._secretary = SEC.Secretary(self.b, home=self.home)
-        self.b.handle(msg("om_start", "/秘书"))
+        self.b.handle(msg("om_hi", "帮助"))  # 私聊里第一次说话就记下这个窗口
         self.sec = self.b.secretary
+        self.sec.poll()
 
-    def test_start_creates_topic_and_only_sets_watermark(self) -> None:
-        self.assertEqual(self.w.sent[0]["chat"], "oc_1")
-        self.assertEqual(self.state["secretary"]["root"], "om_sec_root")
-        self.assertIn("我是秘书", self.w.replies[0]["text"])
+    def forwarded(self) -> list[dict]:
+        return self.w.sent[1:]
+
+    def test_first_private_message_learns_chat_and_only_sets_watermark(self) -> None:
+        self.assertEqual(self.state["secretary"]["chat_id"], "oc_1")
+        self.assertEqual(len(self.w.sent), 1)  # 只有一段说明，旧评论不回放
+        self.assertIn("秘书", self.w.sent[0]["text"])
+        self.assertEqual(self.w.replies[-1]["text"], FB.HELP_TEXT)
         self.assertEqual(self.state["secretary"]["issues"][URL7]["last_note"], 70)
-        self.assertEqual(len(self.w.replies), 1)  # 旧评论不回放
+        self.b.handle(msg("om_hi2", "帮助"))
+        self.assertEqual(len(self.w.sent), 1)  # 同一窗口不重复发说明
+
+    def test_group_message_does_not_become_secretary_chat(self) -> None:
+        self.b.handle(msg("om_g", "进度", chat="oc_g", chat_type="group", mentions=[{"id": TFB.BOT}]))
+        self.assertEqual(self.state["secretary"]["chat_id"], "oc_1")
+        self.assertEqual(self.w.replies[-1]["text"], FB.HELP_TEXT)
 
     def test_forwards_agent_notes_but_not_receipts_user_or_system(self) -> None:
         self.w.agent_note(7, "步骤 1 完成：列表改版\n\n<details>全文</details>")
@@ -81,33 +87,42 @@ class SecretaryTest(unittest.TestCase):
         self.w.gitlab_comment(7, "我自己说的话")
         self.w.gitlab_comment(7, "改了标签", system=True)
         self.sec.poll()
-        forwarded = [r for r in self.w.replies if r["to"] == "om_sec_root"][1:]
-        self.assertEqual(len(forwarded), 1)
-        self.assertIn("#7", forwarded[0]["text"])
-        self.assertIn("步骤 1 完成", forwarded[0]["text"])
-        self.assertNotIn("全文", forwarded[0]["text"])
+        self.assertEqual(len(self.forwarded()), 1)
+        sent = self.forwarded()[0]
+        self.assertEqual(sent["chat"], "oc_1")
+        self.assertIn("#7", sent["text"])
+        self.assertIn("步骤 1 完成", sent["text"])
+        self.assertNotIn("全文", sent["text"])
         self.sec.poll()  # 水位已推进，不重复
-        self.assertEqual(len([r for r in self.w.replies if r["to"] == "om_sec_root"]), 2)
+        self.assertEqual(len(self.forwarded()), 1)
 
     def test_reply_to_forwarded_message_becomes_issue_comment(self) -> None:
         self.w.agent_note(7, "方案要你确认：1. 选 A 2. 选 B")
         self.sec.poll()
         forwarded = list(self.state["secretary"]["msgs"])[0]
-        self.b.handle(msg("om_u1", "1", root="om_sec_root", reply_to=forwarded))
+        self.b.handle(msg("om_u1", "1", reply_to=forwarded))
         method, path, fields, as_user = self.w.writes[-1]
         self.assertEqual((method, path, as_user), ("POST", "projects/frontend/web-v1/issues/7/notes", True))
         self.assertTrue(fields["body"].startswith("@pjhagent 1"))
         self.assertIn("已转给", self.w.replies[-1]["text"])
 
+    def test_thread_under_forwarded_message_also_relays(self) -> None:
+        self.w.agent_note(7, "要你看一下")
+        self.sec.poll()
+        forwarded = list(self.state["secretary"]["msgs"])[0]
+        self.b.handle(msg("om_u4", "看过了", root=forwarded, thread="omt_x"))
+        self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
+        self.assertIn("看过了", self.w.writes[-1][2]["body"])
+
     def test_command_reply_keeps_command_bare(self) -> None:
         self.w.agent_note(7, "可以开工吗")
         self.sec.poll()
         forwarded = list(self.state["secretary"]["msgs"])[0]
-        self.b.handle(msg("om_u2", "/go", root="om_sec_root", reply_to=forwarded))
+        self.b.handle(msg("om_u2", "/go", reply_to=forwarded))
         self.assertEqual(self.w.writes[-1][2]["body"], "@pjhagent /go")
 
-    def test_issue_number_prefix_routes_to_that_issue(self) -> None:
-        self.b.handle(msg("om_u3", "#7 先别合并", root="om_sec_root"))
+    def test_issue_number_prefix_still_binds_through_bridge(self) -> None:
+        self.b.handle(msg("om_u3", "#7 先别合并"))
         self.assertIn("先别合并", self.w.writes[-1][2]["body"])
         self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
 
@@ -116,6 +131,7 @@ class SecretaryTest(unittest.TestCase):
         self.now += 3600
         first = self.sec.patrol()
         self.assertIn("调度者正在干活", first)
+        self.assertEqual(self.w.sent[-1]["chat"], "oc_1")
         self.now += 3600
         self.assertIsNone(self.sec.patrol())  # 没变化不发
         self.w.agent_status = "blocked"
@@ -133,16 +149,16 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("超过 3 小时没有动静", text)
 
     def test_status_word_replies_overview(self) -> None:
-        self.b.handle(msg("om_q1", "进度", root="om_sec_root"))
+        self.b.handle(msg("om_q1", "进度"))
         self.assertIn("**总览**", self.w.replies[-1]["text"])
         self.assertIn("#7", self.w.replies[-1]["text"])
 
     def test_question_uses_model_and_falls_back_to_overview(self) -> None:
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": "#7 在开发"}]}})
-        self.b.handle(msg("om_q2", "现在哪个最急？", root="om_sec_root"))
+        self.b.handle(msg("om_q2", "现在哪个最急？"))
         self.assertEqual(self.w.replies[-1]["text"], "#7 在开发")
         self.w.omp_out = ""
-        self.b.handle(msg("om_q3", "还有吗？", root="om_sec_root"))
+        self.b.handle(msg("om_q3", "还有吗？"))
         self.assertIn("这会儿没法回答", self.w.replies[-1]["text"])
 
     def test_closed_origin_drops_out_of_watch(self) -> None:

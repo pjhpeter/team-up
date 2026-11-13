@@ -821,6 +821,65 @@ class WaitingLabelTests(unittest.TestCase):
                          ["projects/10/issues/7?add_labels=状态:开发中&remove_labels=状态:等你处理"])
 
 
+class ProtocolChangeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="hwf-inbox-")
+        patcher = patch.object(INBOX, "STATE_PATH", Path(tmp) / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        rows = [type("Row", (), {"scheduler": "delivery-scheduler-a"})(), type("Row", (), {"scheduler": ""})()]
+        fake_fs = type("FS", (), {"active_rows": staticmethod(lambda repo: rows)})
+        fs_patcher = patch.object(INBOX, "find_scheduler_module", lambda: fake_fs)
+        fs_patcher.start()
+        self.addCleanup(fs_patcher.stop)
+
+    def world(self, rev: str) -> FakeWorld:
+        world = FakeWorld([])
+        inner = world.__call__
+        agents = [{"name": "delivery-scheduler-a", "pane_id": "w1:p1"}, {"name": "delivery-scheduler-idle", "pane_id": "w1:p9"},
+                  {"name": "i1-dev", "pane_id": "w1:p2"}]
+
+        def call(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+            if argv[0] == "git":
+                return subprocess.CompletedProcess(argv, 0, rev + "\n", "")
+            if argv[:3] == ["herdr", "agent", "list"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"result": {"agents": agents}}), "")
+            return inner(argv, **kw)
+        world.call = call  # type: ignore[attr-defined]
+        return world
+
+    def run_round(self, world: FakeWorld, state: dict[str, Any]) -> None:
+        INBOX.Inbox(CONFIG, state, run=world.call).poll()  # type: ignore[attr-defined]
+
+    def test_first_run_only_records_revision(self) -> None:
+        state: dict[str, Any] = {}
+        world = self.world("aaaa1111")
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "aaaa1111")
+        self.assertEqual(world.prompts, [])
+
+    def test_new_revision_notifies_busy_schedulers_once(self) -> None:
+        state: dict[str, Any] = {"protocol_rev": "aaaa1111"}
+        world = self.world("bbbb2222")
+        self.run_round(world, state)
+        self.assertEqual(world.prompt_panes, ["w1:p1"])  # 没有未收尾交付的调度者不打扰
+        self.assertIn("git -C ~/.hwf diff aaaa1111 bbbb2222 -- PROTOCOL.md", world.prompts[0])
+        self.run_round(world, state)
+        self.assertEqual(len(world.prompts), 1)
+
+    def test_find_scheduler_module_really_loads(self) -> None:
+        with patch.object(INBOX, "_FIND_SCHEDULER", None):
+            fs = INBOX.Inbox.__init__.__globals__["find_scheduler_module"]()
+        self.assertTrue(callable(fs.active_rows))
+
+    def test_unknown_revision_changes_nothing(self) -> None:
+        state: dict[str, Any] = {"protocol_rev": "aaaa1111"}
+        world = self.world("")
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "aaaa1111")
+        self.assertEqual(world.prompts, [])
+
+
 if __name__ == "__main__":
     unittest.main()
 

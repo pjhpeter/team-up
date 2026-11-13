@@ -1,8 +1,8 @@
 """秘书：和机器人的私聊窗口就是秘书，统一转达各交付的消息、每小时巡检、回答提问、转发用户的快速回复。
 
 问题：每个交付各有一张 issue 和一个飞书话题，同时跑的交付一多，用户要在好几个话题之间来回看。
-办法：私聊窗口本来就是提需求的入口，让它同时当秘书：所有交付的 Agent 评论都同时发到私聊主窗口；没有新消息时
-每小时巡检一次，有变化或异常才汇报；用户对某条转达点「回复」，就把话转成那张 issue 的评论。各交付自己的
+办法：私聊窗口本来就是提需求的入口，让它同时当秘书：要用户处理或整项做完的需求，Agent 评论马上发到私聊主窗口，
+其余进展攒进每小时巡检（调度者不守免打扰时也不刷屏）；巡检有变化或异常才汇报；用户对某条转达点「回复」，就把话转成那张 issue 的评论。各交付自己的
 话题照常保留（默认免打扰），想看某个需求的完整经过时去话题里看。
 
 只由 feishu-bridge.py 调用（同一进程、同一份飞书连接与状态文件），不单独运行：
@@ -42,6 +42,8 @@ RECEIPT = re.compile(r"^(@\S+\s+)?已收到")  # 收件箱回执，不转达
 FOLDED = re.compile(r"<details>.*?</details>", re.S)
 BARE_ISSUE = re.compile(r"(?<![\[\w/&])#(\d+)(?!\d)")  # 已在链接里的「[#12]」、网址里的不算
 WAITING_LABEL = "状态:等你处理"
+URGENT_LABELS = (WAITING_LABEL, "状态:待上线")  # 免打扰下也马上转：要用户处理、整项做完等合并
+HELD_LINE_CAP = 80
 ASK_LINE = re.compile(r"^\s*转给\s*#(\d+)\s*[:：]\s*(.+)", re.S)  # 模型要替用户传话时的格式
 NOTES_PER_ISSUE = 3
 NOTE_CAP = 400
@@ -58,8 +60,8 @@ SYSTEM_PROMPT = (
 
 INTRO = (
     "以后我也是你的秘书，所有在跑的需求都在这个窗口跟进：\n"
-    "1. 各需求的 Agent 一发言，我就转到这里\n"
-    "2. 没有新消息时每小时看一次，有变化或卡住了才汇报\n"
+    "1. 要你处理、或整项做完等合并的消息，我马上转到这里\n"
+    "2. 其他进展每小时汇总一次（某个需求发过 /详尽 就每条都马上转）；有变化或卡住了才汇报\n"
     "3. 对某条转达点「回复」，我把你的话转给那个需求；也可以发「#编号 内容」\n"
     "4. 想问某个需求的调度者，直接说「帮我问 481 的调度…」，我替你问，回复会转到这里\n"
     "5. 发「进度」看总览，发「帮助」看用法，其他话直接问我"
@@ -91,6 +93,7 @@ class Secretary:
         self.state: dict[str, Any] = bridge.state.setdefault("secretary", {})
         self.state.setdefault("issues", {})   # issue URL → {project, iid, repo, title, last_note, last_agent_at}
         self.state.setdefault("msgs", {})     # 私聊里的转达消息 id → issue URL（快速回复用）
+        self.state.setdefault("held", {})     # issue URL → 免打扰下攒着、等巡检一起发的 Agent 发言
         self.state.setdefault("recent", [])   # 最近转达的摘要，回答提问时当材料
         cfg = dict(DEFAULT_MODEL)
         cfg.update(bridge.cfg.get("secretary") or {})
@@ -142,7 +145,8 @@ class Secretary:
         except (OSError, ValueError):
             origins = {}
         for url, o in origins.items():
-            found[url] = {"project": o["project"], "iid": int(o["iid"]), "repo": o.get("repo") or repos.get(o["project"], "")}
+            found[url] = {"project": o["project"], "iid": int(o["iid"]), "repo": o.get("repo") or repos.get(o["project"], ""),
+                          "notify": o.get("notify", "")}
         for t in self.bridge.state.get("threads", {}).values():
             if t.get("closed"):
                 continue
@@ -152,12 +156,15 @@ class Secretary:
 
     # ---------- 转达 ----------
     def poll(self, forward: bool = True) -> None:
+        """免打扰：要用户处理或整项完成的需求，Agent 发言马上转；其余先攒着，标签一变成要用户处理就立刻补发，
+        否则并进每小时巡检。调度者常先发评论、几秒后才改标签，所以攒着的每轮都重看一次标签。详尽模式一律马上转。"""
         if not self.chat:
             return
-        issues = self.state["issues"]
+        issues, held = self.state["issues"], self.state["held"]
         watched = self.watched()
         for url in [u for u in issues if u not in watched]:
             del issues[url]
+            held.pop(url, None)
         for url, w in watched.items():
             known = issues.get(url)
             pid = quote(w["project"], safe="")
@@ -168,11 +175,31 @@ class Secretary:
                                "last_agent_at": self.bridge.now()}
                 continue  # 第一次看到只记水位，不回放旧评论
             known.update(w)
+            fresh = []
             for n in sorted((n for n in notes if n["id"] > known["last_note"]), key=lambda n: n["id"]):
                 if forward and self.should_forward(n):
                     known["last_agent_at"] = self.bridge.now()
-                    self.forward(url, known, n)
+                    fresh.append(n)
                 known["last_note"] = n["id"]
+            pending = held.get(url, []) + [self.held_entry(url, known, n) for n in fresh]
+            if not pending:
+                continue
+            if w.get("notify") == "verbose" or self.urgent(pid, w["iid"]):
+                held.pop(url, None)
+                for entry in pending:
+                    self.forward(url, known, entry)
+            else:
+                held[url] = pending
+
+    def urgent(self, pid: str, iid: int) -> bool:
+        info = self.bridge.api(f"projects/{pid}/issues/{iid}")
+        labels = info.get("labels") or []
+        return info.get("state") != "opened" or any(l in labels for l in URGENT_LABELS)
+
+    def held_entry(self, url: str, issue: Mapping[str, Any], n: Mapping[str, Any]) -> dict[str, Any]:
+        body = FOLDED.sub("", (n.get("body") or "").strip()).strip()
+        self.state["recent"] = (self.state["recent"] + [f"#{issue['iid']} {issue.get('title', '')}：{body[:200]}"])[-RECENT_CAP:]
+        return {"id": n["id"], "body": body}
 
     def should_forward(self, n: Mapping[str, Any]) -> bool:
         author = (n.get("author") or {}).get("username")
@@ -180,37 +207,49 @@ class Secretary:
         return (not n.get("system") and author == self.bridge.agent
                 and n["id"] not in self.bridge.state.get("posted_notes", []) and not RECEIPT.match(body))
 
-    def forward(self, url: str, issue: Mapping[str, Any], n: Mapping[str, Any]) -> None:
-        link = f"{url}#note_{n['id']}"
-        body = FOLDED.sub("", (n.get("body") or "").strip()).strip()
+    def forward(self, url: str, issue: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
+        link = f"{url}#note_{entry['id']}"
+        body = entry["body"]
         if len(body) > SUMMARY_CAP:
             body = body[:SUMMARY_CAP].rstrip() + "…"
         head = f"**[#{issue['iid']}]({link}) {issue.get('title', '')}**"
-        mid = self.say(f"{head}\n{body}", f"sec-{issue['iid']}-{n['id']}")
+        mid = self.say(f"{head}\n{body}", f"sec-{issue['iid']}-{entry['id']}")
         if mid:
             msgs = self.state["msgs"]
             msgs[mid] = url
             for old in list(msgs)[:-MSG_MAP_CAP]:
                 del msgs[old]
-        self.state["recent"] = (self.state["recent"] + [f"#{issue['iid']} {issue.get('title', '')}：{body[:200]}"])[-RECENT_CAP:]
+
+    def held_lines(self) -> list[str]:
+        lines = []
+        for url, entries in sorted(self.state["held"].items(), key=lambda kv: self.state["issues"].get(kv[0], {}).get("iid", 0)):
+            issue = self.state["issues"].get(url) or {}
+            last = entries[-1]
+            first = next((l.strip(" *#") for l in last["body"].splitlines() if l.strip()), "")[:HELD_LINE_CAP]
+            lines.append(f"- [#{issue.get('iid', '')}]({url}#note_{last['id']}) {issue.get('title', '')}："
+                         f"{len(entries)} 条新进展，最新一条：{first}")
+        return lines
 
     # ---------- 巡检 ----------
     def patrol(self, force: bool = False) -> Optional[str]:
-        """到点（或 force）就看一遍；内容和上次发的不同才发。返回发出的文本。"""
+        """到点（或 force）就看一遍；内容和上次发的不同才发。攒着的进展并在这里发，发完清空。返回发出的文本。"""
         if not self.chat:
             return None
         if not force and self.bridge.now() - float(self.state.get("last_patrol") or 0) < PATROL_S:
             return None
         self.state["last_patrol"] = self.bridge.now()
         lines = self.overview()
+        progress = self.held_lines()
         digest = "\n".join(lines)
-        if digest == self.state.get("last_digest"):
+        if digest == self.state.get("last_digest") and not progress:
             return None
         self.state["last_digest"] = digest
-        text = f"**每小时巡检（{time.strftime('%H:%M', time.localtime(self.bridge.now()))}）**\n" + (digest or "现在没有在跑的需求。")
+        text = f"**每小时巡检（{time.strftime('%H:%M', time.localtime(self.bridge.now()))}）**\n" + ("\n".join(lines) or "现在没有在跑的需求。")
+        if progress:
+            text += "\n\n**这一小时的进展**（点编号看全文）\n" + "\n".join(progress)
         self.say(text, f"sec-patrol-{int(self.bridge.now())}")
+        self.state["held"] = {}
         return text
-
     def overview(self) -> list[str]:
         lines = []
         for url, issue in sorted(self.state["issues"].items(), key=lambda kv: kv[1]["iid"]):

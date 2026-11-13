@@ -12,7 +12,8 @@
     「需求：…」「#123 …」         → 照旧由桥建单或关联（不经过秘书）
     「进度」「汇总」「/status」    → 立刻回一份总览
     「帮助」「/help」              → 用法说明
-    其他话                        → 当作提问，用模型按当前总览和最近转达回答；模型不可用时回总览
+    「帮我问 481 的调度…」         → 模型判断是要传话，以用户名义写成那张 issue 的评论，调度者回复照常转回来
+    其他话                        → 当作提问，用模型按总览、各需求最近评论和最近转达回答；模型不可用时回总览
 看哪些 issue：收件箱登记的发起 issue（state/gitlab-inbox.json 的 origins）加上飞书桥里还没关闭的话题。
 只转 Agent 账号发的评论；收件箱的「已收到」回执不转，免得用户每回一句就多一条。
 巡检只读：GitLab GET、find-scheduler --owner-of、herdr agent get、本机 INDEX/STATE 修改时间。
@@ -41,12 +42,18 @@ RECEIPT = re.compile(r"^(@\S+\s+)?已收到")  # 收件箱回执，不转达
 FOLDED = re.compile(r"<details>.*?</details>", re.S)
 BARE_ISSUE = re.compile(r"(?<![\[\w/&])#(\d+)(?!\d)")  # 已在链接里的「[#12]」、网址里的不算
 WAITING_LABEL = "状态:等你处理"
+ASK_LINE = re.compile(r"^\s*转给\s*#(\d+)\s*[:：]\s*(.+)", re.S)  # 模型要替用户传话时的格式
+NOTES_PER_ISSUE = 3
+NOTE_CAP = 400
 STATUS_TEXT = {"working": "正在干活", "idle": "空闲", "done": "空闲", "blocked": "卡在确认界面", "unknown": "状态不明"}
 DEFAULT_MODEL = {"model": "jc-gpt/gpt-6-luna", "thinking": "medium", "timeout_s": 120}
 SYSTEM_PROMPT = (
-    "你是用户的交付秘书，替他盯着多个由 Agent 团队推进的需求。只根据给你的「任务总览」和「最近转达」回答，"
+    "你是用户的交付秘书，替他盯着多个由 Agent 团队推进的需求。只根据给你的「任务总览」「各需求最近的评论」「最近转达」回答，"
     "不知道就说不知道，不编造进度。问怎么用（发起任务、关联 issue、群里怎么叫你等）就按「机器人用法」回答，"
     "不要让用户自己去 GitLab 建单。用中文大白话，先给结论，控制在 10 行内；需要用户动手的事写清楚去哪个 issue 做什么。"
+    "用户明确要你去问、去转告、去吩咐某个需求的调度者时（例如「帮我问 481 的调度…」「告诉 478 先别合并」），"
+    "只输出一行「转给 #编号：要对调度者说的话」，把用户的意思写成对调度者说的一句完整的话，不要再输出别的；"
+    "用户只是问你问题时照常回答，不要替他去问。"
 )
 
 INTRO = (
@@ -54,7 +61,8 @@ INTRO = (
     "1. 各需求的 Agent 一发言，我就转到这里\n"
     "2. 没有新消息时每小时看一次，有变化或卡住了才汇报\n"
     "3. 对某条转达点「回复」，我把你的话转给那个需求；也可以发「#编号 内容」\n"
-    "4. 发「进度」看总览，发「帮助」看用法，其他话直接问我"
+    "4. 想问某个需求的调度者，直接说「帮我问 481 的调度…」，我替你问，回复会转到这里\n"
+    "5. 发「进度」看总览，发「帮助」看用法，其他话直接问我"
 )
 
 
@@ -270,9 +278,9 @@ class Secretary:
             lines = self.overview()
             self.bridge.reply(mid, "**总览**\n" + ("\n".join(lines) or "现在没有在跑的需求。"), f"sec-status-{mid}", in_thread=thread)
             return
-        self.bridge.reply(mid, self.answer(text), f"sec-answer-{mid}", in_thread=thread)
+        self.answer(msg, text)
 
-    def relay(self, url: str, msg: Mapping[str, Any], text: str) -> None:
+    def relay(self, url: str, msg: Mapping[str, Any], text: str, ack: str = "") -> None:
         mid = msg["message_id"]
         thread = bool(msg.get("thread_id"))
         issue = self.state["issues"].get(url)
@@ -288,35 +296,70 @@ class Secretary:
             "\n\n".join(x for x in (text, images) if x) + "\n\n_（来自飞书秘书）_"
         self.bridge.note_as_user(project, iid, f"@{self.bridge.agent} {body}")
         title = f" {issue.get('title', '')}" if issue else ""
-        self.bridge.reply(mid, f"已转给 [#{iid}]({url}){title}。", f"sec-relayed-{mid}", in_thread=thread)
+        self.bridge.reply(mid, f"已转给 [#{iid}]({url}){title}。{ack}", f"sec-relayed-{mid}", in_thread=thread)
 
     def linkify(self, text: str) -> str:
         """把正在跟进的需求的「#编号」换成 issue 链接；模型回答时常把总览里的链接丢掉。"""
         urls = {str(i["iid"]): u for u, i in self.state["issues"].items()}
         return BARE_ISSUE.sub(lambda m: f"[#{m.group(1)}]({urls[m.group(1)]})" if m.group(1) in urls else m.group(0), text)
 
-    def answer(self, question: str) -> str:
-        lines = self.overview()
-        material = ("## 任务总览\n" + ("\n".join(lines) or "（没有在跑的需求）") + "\n\n## 最近转达\n"
-                    + ("\n".join(self.state["recent"]) or "（无）") + f"\n\n## 机器人用法\n{getattr(self.bridge, 'help_text', '')}"
-                    + f"\n\n## 用户的问题\n{question}")
+    def recent_notes(self) -> list[str]:
+        """各需求最近几条有内容的评论，回答「为什么」时常靠它（秘书启动前的评论不在最近转达里）。"""
+        out = []
+        for url, issue in sorted(self.state["issues"].items(), key=lambda kv: kv[1]["iid"]):
+            pid = quote(issue["project"], safe="")
+            try:
+                notes = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}/notes?sort=desc&order_by=created_at&per_page=10")
+            except Exception:
+                continue
+            kept = [n for n in notes if not n.get("system") and not RECEIPT.match((n.get("body") or "").strip())][:NOTES_PER_ISSUE]
+            for n in reversed(kept):
+                author = (n.get("author") or {}).get("username") or (n.get("author") or {}).get("name") or ""
+                who = "Agent" if author == self.bridge.agent else "用户"
+                body = FOLDED.sub("", (n.get("body") or "").strip()).strip()[:NOTE_CAP]
+                out.append(f"- #{issue['iid']} {who}（{str(n.get('created_at') or '')[:16]}）：{body}")
+        return out
+
+    def ask_model(self, material: str) -> Optional[str]:
         cmd = ["omp", "-p", "--model", self.cfg["model"], "--thinking", self.cfg["thinking"], "--no-session",
                "--mode", "json", "--tools", "read", "--no-context-files", "--no-skills", "--no-rules",
                "--no-extensions", "--no-lsp", "--system-prompt", SYSTEM_PROMPT, material]
         try:
             r = self.bridge.run(cmd, capture_output=True, text=True, timeout=int(self.cfg["timeout_s"]),
                                 check=False, stdin=subprocess.DEVNULL)
-            reply = ""
-            for line in (r.stdout or "").splitlines():
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if ev.get("type") == "turn_end":
-                    content = (ev.get("message") or {}).get("content") or []
-                    reply = "".join(c.get("text", "") for c in content if c.get("type") == "text")
-            if reply.strip():
-                return self.linkify(reply.strip())
         except (OSError, subprocess.SubprocessError):
-            pass
-        return "这会儿没法回答，先给你当前总览：\n" + ("\n".join(lines) or "现在没有在跑的需求。")
+            return None
+        reply = ""
+        for line in (r.stdout or "").splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if ev.get("type") == "turn_end":
+                content = (ev.get("message") or {}).get("content") or []
+                reply = "".join(c.get("text", "") for c in content if c.get("type") == "text")
+        return reply.strip() or None
+
+    def answer(self, msg: Mapping[str, Any], question: str) -> None:
+        """当提问回答；用户要秘书去问、去转告某个需求时，模型回「转给 #编号：…」，就以用户名义写到那张 issue。"""
+        mid, thread = msg["message_id"], bool(msg.get("thread_id"))
+        lines = self.overview()
+        material = ("## 任务总览\n" + ("\n".join(lines) or "（没有在跑的需求）")
+                    + "\n\n## 各需求最近的评论\n" + ("\n".join(self.recent_notes()) or "（无）")
+                    + "\n\n## 最近转达\n" + ("\n".join(self.state["recent"]) or "（无）")
+                    + f"\n\n## 机器人用法\n{getattr(self.bridge, 'help_text', '')}"
+                    + f"\n\n## 用户的问题\n{question}")
+        reply = self.ask_model(material)
+        if reply is None:
+            self.bridge.reply(mid, "这会儿没法回答，先给你当前总览：\n" + ("\n".join(lines) or "现在没有在跑的需求。"),
+                              f"sec-answer-{mid}", in_thread=thread)
+            return
+        ask = ASK_LINE.match(reply)
+        if ask:
+            iid = int(ask.group(1))
+            url = next((u for u, i in self.state["issues"].items() if i["iid"] == iid),
+                       self.bridge.issue_url(self.bridge.project, iid))
+            said = f"{ask.group(2).strip()}\n\n> 用户原话：{question}"
+            self.relay(url, msg, said, ack="调度者回复后我会转到这里。")
+            return
+        self.bridge.reply(mid, self.linkify(reply), f"sec-answer-{mid}", in_thread=thread)

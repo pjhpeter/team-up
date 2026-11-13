@@ -570,22 +570,27 @@ class InboxTests(unittest.TestCase):
         make(world, state).poll()
         self.assertIn("交付模式", world.prompts[-1])
 
-    def test_go_minimal_skips_complexity_and_keeps_rest_as_extra(self) -> None:
-        for body, extra in (("@pjhagent /go 极简 先只改文案", "先只改文案"), ("/go minimal", ""), ("/go 极简模式", "")):
+    def test_go_debug_skips_complexity_and_keeps_rest_as_extra(self) -> None:
+        cases = (("@pjhagent /go debug 先只改文案", "先只改文案"), ("/go 改bug 按钮点不动", "按钮点不动"),
+                 ("/go 改 bug", ""), ("/go Debug 模式", ""), ("/go debug模式", ""),
+                 ("/go 极简 先只改文案", "先只改文案"), ("/go minimal", ""))
+        for body, extra in cases:
             state = self.origin_state()
             state["origins"][URL]["mode"] = INBOX.CHAT
             world = FakeWorld([], notes=[note(6) | {"body": body}])
             make(world, state).poll()
-            self.assertIn("极简模式", world.prompts[0])
+            self.assertIn("debug 模式", world.prompts[0], body)
             self.assertNotIn("§0 复杂度判定开始", world.prompts[0])
             if extra:
                 self.assertIn(f"用户补充：{extra}", world.prompts[0])
-            self.assertIn("极简模式", world.comments[0])
+            else:
+                self.assertNotIn("用户补充", world.prompts[0], body)
+            self.assertIn("debug 模式", world.comments[0])
 
-    def test_go_with_other_extra_is_not_minimal(self) -> None:
+    def test_go_with_other_extra_is_not_debug(self) -> None:
         state = self.origin_state()
         state["origins"][URL]["mode"] = INBOX.CHAT
-        world = FakeWorld([], notes=[note(6) | {"body": "/go 这个不要走极简"}])
+        world = FakeWorld([], notes=[note(6) | {"body": "/go 这个不要走debug"}])
         make(world, state).poll()
         self.assertIn("§0 复杂度判定开始", world.prompts[0])
 

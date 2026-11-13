@@ -227,7 +227,10 @@ class Secretary:
         parts = ["、".join(labels) or ("已关闭" if info.get("state") == "closed" else "没有进度标签")]
         alerts = []
         if WAITING_LABEL in labels:
-            alerts.append("等你处理")
+            if self.user_spoke_last(issue):
+                parts.append("你已回复，等调度者接着处理")
+            else:
+                alerts.append("等你处理")
         owner = self.owner(issue.get("repo") or "", url)
         if owner.get("task"):
             pane = owner.get("live_pane")
@@ -243,6 +246,16 @@ class Secretary:
                 alerts.append(f"超过 {IDLE_ALERT_S // 3600} 小时没有动静")
         line = f"- [#{issue['iid']}]({url}) {issue.get('title', '')}：{'；'.join(parts)}"
         return line + ("\n  ⚠️ " + "；".join(alerts) if alerts else "")
+
+    def user_spoke_last(self, issue: Mapping[str, Any]) -> bool:
+        """最新一条有内容的评论是用户发的：球在调度者那边，标签只是还没改（收件箱会改回，这里兜底不误报）。"""
+        pid = quote(issue["project"], safe="")
+        notes = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}/notes?sort=desc&order_by=created_at&per_page=10")
+        for n in notes:
+            if n.get("system") or RECEIPT.match((n.get("body") or "").strip()):
+                continue
+            return (n.get("author") or {}).get("username") != self.bridge.agent
+        return False
 
     def owner(self, repo: str, url: str) -> dict[str, Any]:
         if not repo:

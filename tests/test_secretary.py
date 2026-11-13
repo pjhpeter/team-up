@@ -147,6 +147,16 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("等你处理", text)
         self.assertIn("卡在确认界面", text)
 
+    def test_waiting_label_after_user_reply_is_not_an_alert(self) -> None:
+        self.w.issues[7]["labels"] = ["状态:等你处理"]
+        self.w.agent_note(7, "要你在 A、B 里选一个")
+        self.assertIn("⚠️ 等你处理", "\n".join(self.sec.overview()))
+        self.w.gitlab_comment(7, "选 A")
+        self.w.agent_note(7, "已收到，已转交目标 issue 的消息，等待调度者回复。")  # 回执不算
+        line = "\n".join(self.sec.overview())
+        self.assertIn("你已回复，等调度者接着处理", line)
+        self.assertNotIn("⚠️", line)
+
     def test_patrol_flags_exited_scheduler_and_silence(self) -> None:
         self.w.owner = {"task": "frontend-web-v1-7", "live_pane": None, "status": "in-progress"}
         self.now += 4 * 3600

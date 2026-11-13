@@ -39,12 +39,14 @@ RECENT_CAP = 20
 SUMMARY_CAP = 600  # 转达只放开头一段，全文给链接
 RECEIPT = re.compile(r"^(@\S+\s+)?已收到")  # 收件箱回执，不转达
 FOLDED = re.compile(r"<details>.*?</details>", re.S)
+BARE_ISSUE = re.compile(r"(?<![\[\w/&])#(\d+)(?!\d)")  # 已在链接里的「[#12]」、网址里的不算
 WAITING_LABEL = "状态:等你处理"
 STATUS_TEXT = {"working": "正在干活", "idle": "空闲", "done": "空闲", "blocked": "卡在确认界面", "unknown": "状态不明"}
 DEFAULT_MODEL = {"model": "jc-gpt/gpt-6-luna", "thinking": "medium", "timeout_s": 120}
 SYSTEM_PROMPT = (
     "你是用户的交付秘书，替他盯着多个由 Agent 团队推进的需求。只根据给你的「任务总览」和「最近转达」回答，"
-    "不知道就说不知道，不编造进度。用中文大白话，先给结论，控制在 10 行内；需要用户动手的事写清楚去哪个 issue 做什么。"
+    "不知道就说不知道，不编造进度。问怎么用（发起任务、关联 issue、群里怎么叫你等）就按「机器人用法」回答，"
+    "不要让用户自己去 GitLab 建单。用中文大白话，先给结论，控制在 10 行内；需要用户动手的事写清楚去哪个 issue 做什么。"
 )
 
 INTRO = (
@@ -288,10 +290,16 @@ class Secretary:
         title = f" {issue.get('title', '')}" if issue else ""
         self.bridge.reply(mid, f"已转给 [#{iid}]({url}){title}。", f"sec-relayed-{mid}", in_thread=thread)
 
+    def linkify(self, text: str) -> str:
+        """把正在跟进的需求的「#编号」换成 issue 链接；模型回答时常把总览里的链接丢掉。"""
+        urls = {str(i["iid"]): u for u, i in self.state["issues"].items()}
+        return BARE_ISSUE.sub(lambda m: f"[#{m.group(1)}]({urls[m.group(1)]})" if m.group(1) in urls else m.group(0), text)
+
     def answer(self, question: str) -> str:
         lines = self.overview()
         material = ("## 任务总览\n" + ("\n".join(lines) or "（没有在跑的需求）") + "\n\n## 最近转达\n"
-                    + ("\n".join(self.state["recent"]) or "（无）") + f"\n\n## 用户的问题\n{question}")
+                    + ("\n".join(self.state["recent"]) or "（无）") + f"\n\n## 机器人用法\n{getattr(self.bridge, 'help_text', '')}"
+                    + f"\n\n## 用户的问题\n{question}")
         cmd = ["omp", "-p", "--model", self.cfg["model"], "--thinking", self.cfg["thinking"], "--no-session",
                "--mode", "json", "--tools", "read", "--no-context-files", "--no-skills", "--no-rules",
                "--no-extensions", "--no-lsp", "--system-prompt", SYSTEM_PROMPT, material]
@@ -308,7 +316,7 @@ class Secretary:
                     content = (ev.get("message") or {}).get("content") or []
                     reply = "".join(c.get("text", "") for c in content if c.get("type") == "text")
             if reply.strip():
-                return reply.strip()
+                return self.linkify(reply.strip())
         except (OSError, subprocess.SubprocessError):
             pass
         return "这会儿没法回答，先给你当前总览：\n" + ("\n".join(lines) or "现在没有在跑的需求。")

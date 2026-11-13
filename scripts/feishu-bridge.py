@@ -166,6 +166,8 @@ def safe_filename(name: str, fallback: str) -> str:
 
 
 class Bridge:
+    help_text = HELP_TEXT  # 秘书回答「怎么用」时当材料
+
     def __init__(self, config: dict[str, Any], state: dict[str, Any], run: Runner = subprocess.run,
                  user_token: str = "", now: Callable[[], float] = time.time,
                  upload: Optional[Uploader] = None, media_dir: Path = MEDIA_DIR):

@@ -29,12 +29,15 @@ class World(TFB.World):
         self.owner = {"task": "frontend-web-v1-7", "live_pane": "w1:p1", "status": "in-progress"}
         self.agent_status = "working"
         self.omp_out = ""
+        self.omp_cmds: list[list[str]] = []
 
     def __call__(self, cmd, input=None, env=None, cwd=None, **kw):
         if cmd[0] == sys.executable and cmd[1].endswith("find-scheduler.py"):
             return ok(self.owner)
         if cmd[:3] == ["herdr", "agent", "get"]:
             return ok({"result": {"agent": {"agent_status": self.agent_status}}})
+        if cmd[0] == "omp":
+            self.omp_cmds.append(cmd)
         if cmd[0] == "omp" and self.omp_out:
             return subprocess.CompletedProcess(cmd, 0, self.omp_out, "")
         return super().__call__(cmd, input, env, cwd, **kw)
@@ -160,11 +163,24 @@ class SecretaryTest(unittest.TestCase):
     def test_question_uses_model_and_falls_back_to_overview(self) -> None:
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": "#7 在开发"}]}})
         self.b.handle(msg("om_q2", "现在哪个最急？"))
-        self.assertEqual(self.w.replies[-1]["text"], "#7 在开发")
+        self.assertEqual(self.w.replies[-1]["text"], f"[#7]({URL7}) 在开发")
         self.assertFalse(self.w.replies[-1]["in_thread"])
         self.w.omp_out = ""
         self.b.handle(msg("om_q3", "还有吗？"))
         self.assertIn("这会儿没法回答", self.w.replies[-1]["text"])
+
+    def test_model_answer_links_known_issue_numbers(self) -> None:
+        answer = "**#7 旧单**：开发中；[#7](x) 已有链接不重复；#70 不认识；见 note#7a"
+        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": answer}]}})
+        self.b.handle(msg("om_q4", "现在有哪些需求？"))
+        self.assertEqual(self.w.replies[-1]["text"],
+                         f"**[#7]({URL7}) 旧单**：开发中；[#7](x) 已有链接不重复；#70 不认识；见 note#7a")
+
+    def test_question_material_includes_bot_usage(self) -> None:
+        self.b.handle(msg("om_q5", "我要新发起一个任务应该怎么做？"))
+        material = self.w.omp_cmds[-1][-1]
+        self.assertIn("## 机器人用法", material)
+        self.assertIn("需求：<要做的事>", material)
 
     def test_closed_origin_drops_out_of_watch(self) -> None:
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))

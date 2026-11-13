@@ -24,6 +24,8 @@
      任何 issue 里只有 `/status` 的评论由收件箱直接回复进度，不打扰调度者。
      只有 `/免打扰`（`/quiet`）或 `/详尽`（`/verbose`）的评论切换本交付的通知模式：转给调度者记入 STATE，
      收件箱回一条确认，调度者不再另发确认评论。
+  用户回复「状态:等你处理」的 issue 时，收件箱按标签历史把它改回进入等待前的阶段，并告诉调度者（仍要用户处理时由调度者改回）。
+  ~/.hwf/PROTOCOL.md 有新提交时，提醒名下有未收尾交付的在线调度者看改动（它们只在启动时读协议）。
   每条转交的评论都会立即得到回执（转给谁、它在不在干活、在做什么）；调度者卡在确认界面时在发起 issue @发起人一次。
   卡住时能读出界面上的单选题，就把题目和编号选项贴出来；发起人回复一个数字（如 `1`、`选 2`），收件箱核对界面
   没变后替他按键选中，并回帖结果（2026-11-03 用户指示：不在电脑旁也能在飞书里作答）。
@@ -93,6 +95,8 @@ DIALOG_TYPING = re.compile(r"type your own|type something|tell claude what to do
 CHOICE_REPLY = re.compile(r"^(?:选(?:择)?\s*)?(?:第\s*)?(\d{1,2})\s*(?:项|个)?$")
 FEISHU_SUFFIX = "_（来自飞书）_"
 CHOICE_SETTLE_S = 3  # 按键后等界面刷新再读屏核对
+STAGE_PREFIX = "状态:"
+WAITING_LABEL = "状态:等你处理"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")  # omp --thinking 可选值
 
 
@@ -120,6 +124,7 @@ class Inbox:
         self.run = run
         self.sleep: Callable[[float], None] = time.sleep
         self.me: str = ""
+        self.labels_seen: dict[str, list[str]] = {}  # 本轮查到的发起 issue 标签，省一次查询
 
     # ---- 外部命令 ----
 
@@ -361,6 +366,35 @@ class Inbox:
         self.comment(where, f"@{user} 开始跑交付流程{'（极简模式：只开发并提交 MR 到 release-<根编号>，不评审不测试）' if minimal else ''}。{receipt}")
         return True
 
+    def resume_stage(self, url: str, where: Mapping[str, Any]) -> str:
+        """用户回复了「等你处理」的 issue：把进度标签改回进入等待前的阶段，返回给调度者的说明（没改返回空）。
+
+        调度者常忘了在用户答复后改回（2026-11-13 #481 停在等你处理 40 分钟，秘书一直以为要用户处理），
+        所以由收件箱兜底；用户的回复若只是追问、仍要他处理，调度者再改回 `状态:等你处理`。
+        找不到之前的阶段（例如登记池一建就是等你处理）就不动。失败只记日志，不影响转交。
+        """
+        labels = where.get("labels")
+        if labels is None:
+            labels = self.labels_seen.get(url)
+        if labels is not None and WAITING_LABEL not in labels:
+            return ""
+        base = f"projects/{where['project_id']}/issues/{where['iid']}"
+        try:
+            if labels is None:
+                labels = (self.api(base) or {}).get("labels", [])
+                if WAITING_LABEL not in labels:
+                    return ""
+            stage = previous_stage(self.api(f"{base}/resource_label_events?per_page=100") or [])
+            if stage is None:
+                return ""
+            self.api(f"{base}?add_labels={quote(stage)}&remove_labels={quote(WAITING_LABEL)}", "PUT")
+        except InboxError as exc:
+            log(f"resume stage failed for {url}: {exc}")
+            return ""
+        self.labels_seen[url] = [l for l in labels if l != WAITING_LABEL] + [stage]
+        log(f"{url}: {WAITING_LABEL} → {stage} after user reply")
+        return (f"\n用户已回复，收件箱已把这张 issue 的进度标签从「{WAITING_LABEL}」改回「{stage}」。"
+                f"看完这条回复如果仍需要用户处理，改回「{WAITING_LABEL}」；根 issue 另有进度标签时按实际阶段一并更新。")
     def handle_note(self, url: str, repo: str, note: Mapping[str, Any], where: Mapping[str, Any]) -> bool:
         """评论统一入口。返回 False 表示下一轮重试。
 
@@ -378,15 +412,18 @@ class Inbox:
         if origin is not None and origin.get("blocked_dialog") and note["author"]["username"] == origin["initiator"]:
             number = self.choice_of(note["body"])
             if number is not None:
+                self.resume_stage(url, where)
                 return self.handle_choice(url, origin, note, number)
         words = self.words(note["body"])
         if words and words[0].lower() in GO_COMMANDS:
+            self.resume_stage(url, where)
             return self.handle_go(url, repo, note, where)
         if origin is not None and self.is_command(note["body"], RESET_COMMANDS):
             return self.handle_reset(url, origin, note)
         if self.is_command(note["body"], frozenset(NOTIFY_COMMANDS)):
             return self.handle_notify(url, repo, note, where)
-        receipt = self.deliver(repo, url, self.message(url, note, origin is not None), self.mode_of(url))
+        resumed = self.resume_stage(url, where)
+        receipt = self.deliver(repo, url, self.message(url, note, origin is not None) + resumed, self.mode_of(url))
         if receipt is None:
             return False
         self.comment(where, receipt)
@@ -554,6 +591,7 @@ class Inbox:
     def poll_origin(self, url: str, origin: dict[str, Any]) -> None:
         base = f"projects/{origin['project_id']}/issues/{origin['iid']}"
         issue = self.api(base)
+        self.labels_seen[url] = list(issue.get("labels") or [])
         # 先处理新评论再看是否关闭：GitLab「评论并关闭」会同时产生评论和关闭，先关会丢掉这条评论
         # （例如 `/new`）。评论没处理完就不做关闭收尾，下一轮接着来，调度者在此期间保持占用。
         notes = self.api(f"{base}/notes?sort=desc&per_page=100")
@@ -685,11 +723,52 @@ class Inbox:
         self.comment(origin, f"@{user} 已替你选了第 {number} 项：{option['label']}。")
         return True
 
+    # ---- 协议更新 ----
+
+    def protocol_rev(self) -> str:
+        result = self._exec(["git", "-C", str(HWF_HOME), "log", "-1", "--format=%H", "--", "PROTOCOL.md"])
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def busy_schedulers(self) -> list[str]:
+        """名下有未收尾交付、仍在线的调度者 pane。"""
+        fs = find_scheduler_module()
+        names = {row.scheduler for repo in self.projects.values() for row in fs.active_rows(repo) if row.scheduler}
+        if not names:
+            return []
+        result = self._exec(["herdr", "agent", "list"])
+        if result.returncode != 0:
+            raise InboxError(f"herdr agent list failed: {result.stderr.strip()}")
+        agents = json.loads(result.stdout)["result"]["agents"]
+        return sorted(a["pane_id"] for a in agents if a.get("name") in names and a.get("pane_id"))
+
+    def notify_protocol_change(self) -> None:
+        """PROTOCOL.md 有新提交时提醒在跑的调度者重读改动：它们只在启动时读协议，
+        新规则（例如 2026-11-13 的免打扰）对已在跑的交付不生效，#478 因此一直按旧习惯每个小阶段都发评论。
+        首次运行只记版本；查不到在线调度者时不推进版本，下一轮重试。"""
+        rev = self.protocol_rev()
+        old = self.state.get("protocol_rev")
+        if not rev or rev == old:
+            return
+        if old:
+            try:
+                panes = self.busy_schedulers()
+            except Exception as exc:  # 提醒是附带的，任何失败都不能拖垮这一轮收件箱
+                log(f"protocol change notice skipped this round: {exc!r}")
+                return
+            text = (f"[GitLab 收件箱] ~/.hwf/PROTOCOL.md 有更新（{old[:8]} → {rev[:8]}），你启动时读的是旧版。"
+                    f"当前这一步告一段落后，运行 `git -C ~/.hwf diff {old} {rev} -- PROTOCOL.md` 看改了什么，"
+                    "之后按新规则继续本交付（STATE 里需要补的字段一并补上）。这条提醒不用发评论。")
+            for pane in panes:
+                self.prompt(pane, text)
+            log(f"protocol {old[:8]} → {rev[:8]}: notified {panes}")
+        self.state["protocol_rev"] = rev
+        save_state(self.state)
     # ---- 一轮 ----
 
     def poll(self) -> None:
         if not self.me:
             self.me = self.api("user")["username"]
+        self.notify_protocol_change()
         # 先接回重开的发起 issue：同一轮里的 @ 待办（如 `/new @本账号`）才会按发起 issue 处理。
         self.track_reopened()
         todos = self.api("todos?state=pending&type=Issue&per_page=100")
@@ -751,6 +830,36 @@ def parse_dialog(screen: str) -> dict[str, Any] | None:
     text = " ".join(question)
     fingerprint = json.dumps([text, [o["label"] for o in options]], ensure_ascii=False)
     return {"question": text, "options": options, "cursor": cursor, "fingerprint": fingerprint}
+
+
+def previous_stage(events: Sequence[Mapping[str, Any]]) -> str | None:
+    """按标签历史找进入最近一次「等你处理」之前的进度阶段；之前没有别的进度标签就返回 None。"""
+    last_other: str | None = None
+    before_wait: str | None = None
+    for event in sorted(events, key=lambda e: (e.get("created_at") or "", e.get("id") or 0)):
+        name = ((event.get("label") or {}).get("name")) or ""
+        if not name.startswith(STAGE_PREFIX) or event.get("action") != "add":
+            continue
+        if name == WAITING_LABEL:
+            before_wait = last_other
+        else:
+            last_other = name
+    return before_wait
+
+_FIND_SCHEDULER: Any = None
+
+
+def find_scheduler_module() -> Any:
+    global _FIND_SCHEDULER
+    if _FIND_SCHEDULER is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("find_scheduler", Path(__file__).with_name("find-scheduler.py"))
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("find_scheduler", module)  # dataclass 要从 sys.modules 找到所在模块
+        spec.loader.exec_module(module)
+        _FIND_SCHEDULER = module
+    return _FIND_SCHEDULER
 
 
 def parse_time(text: str) -> float:

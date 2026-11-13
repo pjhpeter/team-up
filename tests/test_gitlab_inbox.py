@@ -78,6 +78,9 @@ class FakeWorld:
         self.params: list[tuple[str, str]] = []  # 每次走入口传的 (模型, 思考强度)
         self.prompts: list[str] = []
         self.done: list[str] = []
+        self.label_events: list[dict[str, Any]] = []  # resource_label_events
+        self.label_updates: list[str] = []  # PUT 改标签
+        self.label_update_rc = 0
 
     def __call__(self, argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
         out, rc = "", 0
@@ -87,6 +90,12 @@ class FakeWorld:
                 self.comments.append(unquote(path.split("body=", 1)[1]))
             elif method == "POST":
                 self.done.append(path)
+            elif method == "PUT":
+                rc = self.label_update_rc
+                self.label_updates.append(unquote(path))
+                out = "{}" if rc == 0 else "403 Forbidden"
+            elif "/resource_label_events" in path:
+                out = json.dumps(self.label_events)
             elif path == "user":
                 out = json.dumps({"username": "pjhagent"})
             elif path.startswith("todos?"):
@@ -732,6 +741,143 @@ class InboxTests(unittest.TestCase):
         world.authored = [self.issue()]
         make(world, state).poll()
         self.assertEqual(len(world.prompts), 1)
+
+
+def label_event(action: str, name: str, at: str) -> dict[str, Any]:
+    return {"action": action, "label": {"name": name}, "created_at": at}
+
+
+# #481 实际的标签历史（2026-11-13）：两次进出「等你处理」，最后一次之前是「开发中」
+EVENTS_481 = [label_event("add", "需求", "2026-11-12T12:41"), label_event("add", "状态:待开始", "2026-11-12T12:41"),
+              label_event("add", "状态:等你处理", "2026-11-13T05:29"), label_event("remove", "状态:待开始", "2026-11-13T05:29"),
+              label_event("add", "状态:开发中", "2026-11-13T05:32"), label_event("remove", "状态:等你处理", "2026-11-13T05:32"),
+              label_event("add", "状态:等你处理", "2026-11-13T05:36"), label_event("remove", "状态:开发中", "2026-11-13T05:36")]
+
+
+class WaitingLabelTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="hwf-inbox-")
+        patcher = patch.object(INBOX, "STATE_PATH", Path(tmp) / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def origin_state(self) -> dict[str, Any]:
+        return {"origins": {URL: {"project": "frontend/web-v1", "project_id": 10, "iid": 7, "repo": REPO,
+                                  "initiator": "pengjh", "last_note_id": 5}}}
+
+    def test_previous_stage_follows_the_latest_wait(self) -> None:
+        self.assertEqual(INBOX.previous_stage(EVENTS_481), "状态:开发中")
+        self.assertIsNone(INBOX.previous_stage([label_event("add", "状态:等你处理", "2026-01-01")]))
+
+    def test_user_reply_on_waiting_issue_restores_stage_and_tells_scheduler(self) -> None:
+        world = FakeWorld([], notes=[note(6, body="我已经信任了"), note(7, body="还有一句")])
+        world.issue_labels = ["需求", "状态:等你处理"]
+        world.label_events = EVENTS_481
+        make(world, self.origin_state()).poll()
+        self.assertEqual(world.label_updates,
+                         ["projects/10/issues/7?add_labels=状态:开发中&remove_labels=状态:等你处理"])  # 第二条不再改
+        self.assertEqual(len(world.prompts), 2)
+        self.assertIn("改回「状态:开发中」", world.prompts[0])
+        self.assertIn("仍需要用户处理，改回「状态:等你处理」", world.prompts[0])
+        self.assertNotIn("改回「状态:开发中」", world.prompts[1])
+
+    def test_waiting_since_creation_is_left_alone(self) -> None:
+        world = FakeWorld([], notes=[note(6)])
+        world.issue_labels = ["状态:等你处理"]
+        world.label_events = [label_event("add", "状态:等你处理", "2026-01-01")]
+        make(world, self.origin_state()).poll()
+        self.assertEqual(world.label_updates, [])
+        self.assertEqual(len(world.prompts), 1)
+
+    def test_not_waiting_needs_no_extra_queries(self) -> None:
+        world = FakeWorld([], notes=[note(6)])
+        world.label_events = EVENTS_481
+        make(world, self.origin_state()).poll()
+        self.assertEqual(world.label_updates, [])
+        self.assertNotIn("改回", world.prompts[0])
+
+    def test_label_update_failure_still_delivers(self) -> None:
+        world = FakeWorld([], notes=[note(6)])
+        world.issue_labels = ["状态:等你处理"]
+        world.label_events = EVENTS_481
+        world.label_update_rc = 1
+        make(world, self.origin_state()).poll()
+        self.assertEqual(len(world.prompts), 1)
+        self.assertNotIn("改回", world.prompts[0])
+        self.assertEqual(len(world.comments), 1)  # 回执照发
+
+    def test_status_command_does_not_touch_label(self) -> None:
+        world = FakeWorld([], notes=[note(6, body="/status")])
+        world.issue_labels = ["状态:等你处理"]
+        world.label_events = EVENTS_481
+        make(world, self.origin_state()).poll()
+        self.assertEqual(world.label_updates, [])
+
+    def test_mention_on_waiting_issue_uses_todo_labels(self) -> None:
+        world = FakeWorld([todo("mentioned", url=f"{URL}#note_6", labels=("状态:等你处理",))], notes=[note(6)])
+        world.label_events = EVENTS_481
+        make(world).poll()
+        self.assertEqual(world.label_updates,
+                         ["projects/10/issues/7?add_labels=状态:开发中&remove_labels=状态:等你处理"])
+
+
+class ProtocolChangeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="hwf-inbox-")
+        patcher = patch.object(INBOX, "STATE_PATH", Path(tmp) / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        rows = [type("Row", (), {"scheduler": "delivery-scheduler-a"})(), type("Row", (), {"scheduler": ""})()]
+        fake_fs = type("FS", (), {"active_rows": staticmethod(lambda repo: rows)})
+        fs_patcher = patch.object(INBOX, "find_scheduler_module", lambda: fake_fs)
+        fs_patcher.start()
+        self.addCleanup(fs_patcher.stop)
+
+    def world(self, rev: str) -> FakeWorld:
+        world = FakeWorld([])
+        inner = world.__call__
+        agents = [{"name": "delivery-scheduler-a", "pane_id": "w1:p1"}, {"name": "delivery-scheduler-idle", "pane_id": "w1:p9"},
+                  {"name": "i1-dev", "pane_id": "w1:p2"}]
+
+        def call(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+            if argv[0] == "git":
+                return subprocess.CompletedProcess(argv, 0, rev + "\n", "")
+            if argv[:3] == ["herdr", "agent", "list"]:
+                return subprocess.CompletedProcess(argv, 0, json.dumps({"result": {"agents": agents}}), "")
+            return inner(argv, **kw)
+        world.call = call  # type: ignore[attr-defined]
+        return world
+
+    def run_round(self, world: FakeWorld, state: dict[str, Any]) -> None:
+        INBOX.Inbox(CONFIG, state, run=world.call).poll()  # type: ignore[attr-defined]
+
+    def test_first_run_only_records_revision(self) -> None:
+        state: dict[str, Any] = {}
+        world = self.world("aaaa1111")
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "aaaa1111")
+        self.assertEqual(world.prompts, [])
+
+    def test_new_revision_notifies_busy_schedulers_once(self) -> None:
+        state: dict[str, Any] = {"protocol_rev": "aaaa1111"}
+        world = self.world("bbbb2222")
+        self.run_round(world, state)
+        self.assertEqual(world.prompt_panes, ["w1:p1"])  # 没有未收尾交付的调度者不打扰
+        self.assertIn("git -C ~/.hwf diff aaaa1111 bbbb2222 -- PROTOCOL.md", world.prompts[0])
+        self.run_round(world, state)
+        self.assertEqual(len(world.prompts), 1)
+
+    def test_find_scheduler_module_really_loads(self) -> None:
+        with patch.object(INBOX, "_FIND_SCHEDULER", None):
+            fs = INBOX.Inbox.__init__.__globals__["find_scheduler_module"]()
+        self.assertTrue(callable(fs.active_rows))
+
+    def test_unknown_revision_changes_nothing(self) -> None:
+        state: dict[str, Any] = {"protocol_rev": "aaaa1111"}
+        world = self.world("")
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "aaaa1111")
+        self.assertEqual(world.prompts, [])
 
 
 if __name__ == "__main__":

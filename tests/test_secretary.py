@@ -67,6 +67,9 @@ class SecretaryTest(unittest.TestCase):
         self.sec = self.b.secretary
         self.sec.poll()
 
+    def waiting(self) -> None:
+        self.w.issues[7]["labels"] = ["状态:等你处理"]
+
     def forwarded(self) -> list[dict]:
         return self.w.sent[1:]
 
@@ -86,6 +89,7 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(self.w.replies[-1]["text"], FB.HELP_TEXT)
 
     def test_forwards_agent_notes_but_not_receipts_user_or_system(self) -> None:
+        self.waiting()
         self.w.agent_note(7, "步骤 1 完成：列表改版\n\n<details>全文</details>")
         self.w.agent_note(7, "已收到，已转交目标 issue 的消息，等待调度者回复。")
         self.w.gitlab_comment(7, "我自己说的话")
@@ -101,6 +105,7 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(len(self.forwarded()), 1)
 
     def test_reply_to_forwarded_message_becomes_issue_comment(self) -> None:
+        self.waiting()
         self.w.agent_note(7, "方案要你确认：1. 选 A 2. 选 B")
         self.sec.poll()
         forwarded = list(self.state["secretary"]["msgs"])[0]
@@ -112,6 +117,7 @@ class SecretaryTest(unittest.TestCase):
         self.assertFalse(self.w.replies[-1]["in_thread"])
 
     def test_thread_under_forwarded_message_also_relays(self) -> None:
+        self.waiting()
         self.w.agent_note(7, "要你看一下")
         self.sec.poll()
         forwarded = list(self.state["secretary"]["msgs"])[0]
@@ -121,6 +127,7 @@ class SecretaryTest(unittest.TestCase):
         self.assertTrue(self.w.replies[-1]["in_thread"])  # 本来就在话题里，回执也留在话题里
 
     def test_command_reply_keeps_command_bare(self) -> None:
+        self.waiting()
         self.w.agent_note(7, "可以开工吗")
         self.sec.poll()
         forwarded = list(self.state["secretary"]["msgs"])[0]
@@ -146,6 +153,55 @@ class SecretaryTest(unittest.TestCase):
         text = self.sec.patrol()
         self.assertIn("等你处理", text)
         self.assertIn("卡在确认界面", text)
+
+    def test_waiting_label_after_user_reply_is_not_an_alert(self) -> None:
+        self.w.issues[7]["labels"] = ["状态:等你处理"]
+        self.w.agent_note(7, "要你在 A、B 里选一个")
+        self.assertIn("⚠️ 等你处理", "\n".join(self.sec.overview()))
+        self.w.gitlab_comment(7, "选 A")
+        self.w.agent_note(7, "已收到，已转交目标 issue 的消息，等待调度者回复。")  # 回执不算
+        line = "\n".join(self.sec.overview())
+        self.assertIn("你已回复，等调度者接着处理", line)
+        self.assertNotIn("⚠️", line)
+
+    def test_quiet_holds_progress_and_patrol_sums_it_up(self) -> None:
+        self.w.agent_note(7, "**国内冒烟首轮未通过**：站点可用，验收点未执行")
+        self.w.agent_note(7, "**国内冒烟第2轮**：仍未进入验收")
+        self.sec.poll()
+        self.assertEqual(self.forwarded(), [])  # 开发中的进展不马上推
+        self.sec.poll()
+        self.assertEqual(self.forwarded(), [])
+        self.now += 3600
+        text = self.sec.patrol()
+        self.assertIn("这一小时的进展", text)
+        self.assertIn("2 条新进展", text)
+        self.assertIn("国内冒烟第2轮", text)
+        self.assertEqual(self.state["secretary"]["held"], {})
+        self.now += 3600
+        self.assertIsNone(self.sec.patrol())  # 发过就清空，不重复汇报
+
+    def test_held_notes_flush_when_label_turns_waiting(self) -> None:
+        self.w.agent_note(7, "需要你在 A、B 里选一个")
+        self.sec.poll()
+        self.assertEqual(self.forwarded(), [])
+        self.waiting()  # 调度者几秒后才改标签
+        self.sec.poll()
+        self.assertEqual(len(self.forwarded()), 1)
+        self.assertIn("A、B 里选一个", self.forwarded()[0]["text"])
+        self.assertEqual(self.state["secretary"]["held"], {})
+
+    def test_ready_to_ship_or_closed_forwards_immediately(self) -> None:
+        self.w.issues[7]["labels"] = ["状态:待上线"]
+        self.w.agent_note(7, "整项完成，MR 等你合并")
+        self.sec.poll()
+        self.assertEqual(len(self.forwarded()), 1)
+
+    def test_verbose_issue_forwards_everything(self) -> None:
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {URL7: {
+            "project": "frontend/web-v1", "iid": 7, "repo": str(self.home / "repo"), "notify": "verbose"}}}))
+        self.w.agent_note(7, "代码评审通过")
+        self.sec.poll()
+        self.assertEqual(len(self.forwarded()), 1)
 
     def test_patrol_flags_exited_scheduler_and_silence(self) -> None:
         self.w.owner = {"task": "frontend-web-v1-7", "live_pane": None, "status": "in-progress"}

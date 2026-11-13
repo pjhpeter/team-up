@@ -14,6 +14,7 @@
   「需求：<内容>」或「/需求 <内容>」  → 在 default_project 建 issue（打开关标签、指派给 Agent 账号），回帖 issue 链接
   「#123 <可选内容>」或贴 issue 链接   → 把这条消息的话题关联到已有 issue，内容写成评论（带 @Agent 以便转交）
   在上面两种消息的话题里回复         → 写成该 issue 的评论；/go、/status、/new、/免打扰、/详尽 等指令原样生效
+  「/秘书」                          → 开一个秘书话题，统一转达所有需求的进度（见 secretary.py）
   其他顶层消息                       → 回一段用法说明（同一会话 10 分钟内只回一次）
 发到 GitLab 的内容用用户自己的 GitLab 令牌（钥匙串里取），这样收件箱才认得是用户本人在说话。
 
@@ -100,6 +101,7 @@ HELP_TEXT = (
     "2. 发「#123 <补充>」→ 关联已有 issue，之后在话题里回复就会同步过去\n"
     "3. 在话题里回复 /go 开工、/status 看进度、/new 让调度者重开会话\n"
     "4. 嫌消息多就回复 /免打扰（只在步骤完成、交付完成和要你处理时发），想看每一步就回复 /详尽\n"
+    "5. 发 /秘书 开一个秘书话题，所有需求的进度都在那里统一跟进\n"
     "在群里每句话（包括话题里的回复）都要 @我，我才收得到"
 )
 
@@ -183,6 +185,14 @@ class Bridge:
         state.setdefault("group_chats", [])  # 收到过群消息的 chat_id（补漏时群里只处理 @ 机器人的）
         state.setdefault("thread_ids", {})   # 飞书话题 thread_id → threads 的键（话题里任何一条消息都带 thread_id）
         state.setdefault("pending_images", {})  # chat_id → [{mid, key, kind, name, ts}] 单独发、还没用上的图片/文件
+        self._secretary: Any = None
+
+    @property
+    def secretary(self) -> Any:
+        """秘书话题（见 secretary.py）；按需创建，只读命令（--split-topic 等）不会碰到它。"""
+        if self._secretary is None:
+            self._secretary = secretary_module().Secretary(self)
+        return self._secretary
 
     # ---------- 外部命令 ----------
     def sh(self, cmd: list[str], stdin: Optional[str] = None, env: Optional[dict] = None,
@@ -219,13 +229,13 @@ class Bridge:
             raise BridgeError(f"lark-cli {args[:2]} 失败：{data.get('error')}")
         return data
 
-    def reply(self, message_id: str, markdown: str, key: Optional[str] = None, in_thread: bool = True) -> None:
+    def reply(self, message_id: str, markdown: str, key: Optional[str] = None, in_thread: bool = True) -> Optional[str]:
         args = ["im", "+messages-reply", "--message-id", message_id, "--markdown", "-"]
         if in_thread:
             args.insert(4, "--reply-in-thread")
         if key:
             args += ["--idempotency-key", key[:50]]
-        self.lark(args, stdin=markdown)
+        return (self.lark(args, stdin=markdown).get("data") or {}).get("message_id")
 
     def http_upload(self, project: str, path: Path) -> str:
         """以用户身份把文件传到 GitLab 项目附件（glab api 不支持上传文件），返回 Markdown。"""
@@ -349,6 +359,12 @@ class Bridge:
             self.reply(mid, random.choice(DENY_TEXTS), f"deny-{mid}")
             return
         text = self.clean_text(msg)
+        if self.strip_images(text).strip().lower() in secretary_module().START_COMMANDS:
+            self.secretary.start(chat, mid)
+            return
+        if self.secretary.owns(msg):
+            self.secretary.handle(msg, text)
+            return
         root, tid = msg.get("root_id") or "", msg.get("thread_id") or ""
         linked = self.state["thread_ids"].get(tid) if tid else None
         if not linked and root and root != mid and root in self.state["threads"]:
@@ -657,9 +673,11 @@ class Bridge:
                     if chat not in self.observe_chats and not any(map(self.is_bot_mention, msg["mentions"])):
                         continue  # 非观察群里没 @ 机器人的话不是对它说的
                 self.handle(msg)
-        for root, t in list(self.state["threads"].items()):
-            if t.get("closed"):
-                continue
+        roots = [(root, t["chat_id"]) for root, t in self.state["threads"].items() if not t.get("closed")]
+        sec = self.state.get("secretary") or {}
+        if sec.get("root"):
+            roots.append((sec["root"], sec.get("chat_id", "")))
+        for root, chat_id in roots:
             try:
                 data = self.lark(["im", "+threads-messages-list", "--thread", root, "--order", "asc",
                                   "--no-reactions", "--page-all", "--page-limit", "5"])
@@ -668,7 +686,7 @@ class Bridge:
                 continue
             for item in (data.get("data") or {}).get("messages", []):
                 msg = normalize_history(item, default_root=root)
-                if t["chat_id"] in self.state["group_chats"]:
+                if chat_id in self.state["group_chats"]:
                     msg["chat_type"] = "group"
                 self.handle(msg)
 
@@ -687,6 +705,22 @@ def proactive_module() -> Any:
         spec.loader.exec_module(module)
         _PROACTIVE = module
     return _PROACTIVE
+
+
+_SECRETARY: Any = None
+
+
+def secretary_module() -> Any:
+    global _SECRETARY
+    if _SECRETARY is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("secretary", Path(__file__).resolve().parent / "secretary.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules.setdefault("secretary", module)
+        spec.loader.exec_module(module)
+        _SECRETARY = module
+    return _SECRETARY
 
 
 _TOPICS: Any = None
@@ -868,6 +902,11 @@ def main(argv: Optional[list[str]] = None) -> int:
                 bridge.poll_gitlab()
             except (BridgeError, KeyError, ValueError) as err:
                 log(f"poll failed: {err}")
+            try:
+                bridge.secretary.poll()
+                bridge.secretary.patrol()
+            except Exception as err:  # 秘书出错不能拖垮桥本身
+                log(f"secretary failed: {err!r}")
             save_json(STATE_PATH, state)
 
 

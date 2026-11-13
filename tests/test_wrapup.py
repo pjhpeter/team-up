@@ -116,13 +116,28 @@ class FakeHerdr:
 class FakeGlab:
     def __init__(self) -> None:
         self.notes: dict[int, str] = {}
+        self.authored = {50: {"author": {"username": "pengjh"}}, 51: {"author": {"username": "pjhagent"}},
+                         52: {"author": {"username": "pengjh"}, "system": True}}
+        self.issue_state = "opened"
+        self.close_sticks = True
 
     def __call__(self, host: str, method: str, path: str, *fields: str) -> dict:
+        if path == "user":
+            return {"username": "pjhagent"}
+        if method == "PUT":
+            assert fields == ("state_event=close",), fields
+            self.issue_state = "closed" if self.close_sticks else self.issue_state
+            return {}
+        if path.endswith("/issues/47"):
+            return {"state": self.issue_state}
         if method == "POST":
             note_id = 900 + len(self.notes)
             self.notes[note_id] = fields[0].split("=", 1)[1]
             return {"id": note_id}
-        return {"id": int(path.rsplit("/", 1)[1]), "body": self.notes[int(path.rsplit("/", 1)[1])]}
+        note_id = int(path.rsplit("/", 1)[1])
+        if note_id in self.authored:
+            return self.authored[note_id]
+        return {"id": note_id, "body": self.notes[note_id]}
 
 
 class Case(unittest.TestCase):
@@ -299,6 +314,43 @@ class WrapupTest(Case):
         self.assertIn(f"将删除 {self.wt}/{TASK}-dev", out)
         self.assertNotIn(("test-account.py", "release", "--task", TASK), self.scripts)
         self.assertEqual(self.index_status(), "in-progress（开发中）")
+
+    def test_without_close_request_issue_stays_open(self) -> None:
+        code, out = self.run_wrapup(FakeHerdr(self.team()))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.glab.issue_state, "opened")
+
+    def test_close_request_from_user_closes_issue_after_receipt(self) -> None:
+        code, out = self.run_wrapup(FakeHerdr(self.team()), "--close-request", f"{ISSUE}#note_50")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.glab.issue_state, "closed")
+        self.assertIn(f"按 @pengjh 的要求关闭（{ISSUE}#note_50）", next(iter(self.glab.notes.values())))
+        self.assertTrue(self.index_status().startswith("done"))
+
+    def test_close_request_must_be_users_note_on_this_issue(self) -> None:
+        for link in (f"{ISSUE}#note_51", f"{ISSUE}#note_52", ISSUE,
+                     "https://git.example.com/group/proj/-/work_items/48#note_50"):
+            herdr = FakeHerdr(self.team())
+            with patch("sys.stderr", io.StringIO()):
+                code, _ = self.run_wrapup(herdr, "--close-request", link)
+            self.assertEqual(code, 1, link)
+            self.assertEqual((herdr.closed, self.glab.notes, self.glab.issue_state), ([], {}, "opened"), link)
+        self.assertTrue(self.index_status().startswith("in-progress"))
+
+    def test_residue_keeps_issue_open_even_with_close_request(self) -> None:
+        self.services = done(1, "RESIDUE: port 3167 busy (pid=55)\n")
+        self.git.add(f"{self.wt}/{TASK}-dev", branch="fix/47", **{"in": {"origin/main"}})
+        code, _ = self.run_wrapup(FakeHerdr([agent(SCHED, "w1:pS")]), "--close-request", f"{ISSUE}#note_50")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.glab.issue_state, "opened")
+        self.assertIn("收尾未完成，先不关闭", next(iter(self.glab.notes.values())))
+
+    def test_close_readback_failure_keeps_index(self) -> None:
+        self.glab.close_sticks = False
+        code, out = self.run_wrapup(FakeHerdr(self.team()), "--close-request", f"{ISSUE}#note_50")
+        self.assertEqual(code, 1, out)
+        self.assertIn("关闭 issue", out)
+        self.assertTrue(self.index_status().startswith("in-progress"))
 
     def test_receipt_readback_mismatch_keeps_index(self) -> None:
         def bad_glab(host: str, method: str, path: str, *fields: str) -> dict:

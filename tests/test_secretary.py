@@ -29,6 +29,8 @@ class World(TFB.World):
         self.issues[7].update(labels=["状态:开发中"])
         self.owner = {"task": "frontend-web-v1-7", "live_pane": "w1:p1", "status": "in-progress"}
         self.agent_status = "working"
+        self.agents: list[dict] = []
+        self.send_failures = 0  # 接下来几次往私聊发消息返回失败
         self.omp_out = ""
         self.omp_cmds: list[list[str]] = []
         self.label_events: list[dict] = []
@@ -38,6 +40,11 @@ class World(TFB.World):
             return ok(self.label_events)
         if cmd[0] == sys.executable and cmd[1].endswith("find-scheduler.py"):
             return ok(self.owner)
+        if cmd[0] == "lark-cli" and cmd[1:3] == ["im", "+messages-send"] and self.send_failures:
+            self.send_failures -= 1
+            return ok({"ok": False, "error": {"message": "TLS handshake timeout"}})
+        if cmd[:3] == ["herdr", "agent", "list"]:
+            return ok({"result": {"agents": self.agents}})
         if cmd[:3] == ["herdr", "agent", "get"]:
             return ok({"result": {"agent": {"agent_status": self.agent_status}}})
         if cmd[0] == "omp":
@@ -190,6 +197,69 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(self.state["secretary"]["held"], {})
         self.now += 3600
         self.assertIsNone(self.sec.patrol())  # 发过就清空，不重复汇报
+
+    def test_note_mentioning_user_forwards_without_waiting_for_patrol(self) -> None:
+        self.w.agent_note(7, "@pengjh test 的采集结果：共 231 条")
+        self.sec.poll()
+        self.assertEqual(len(self.forwarded()), 1)
+        self.assertIn("231 条", self.forwarded()[0]["text"])
+        self.assertEqual(self.state["secretary"]["held"], {})
+
+    def test_failed_send_is_kept_and_retried_next_round(self) -> None:
+        self.waiting()
+        self.w.agent_note(7, "第一条：要你选 A 或 B")
+        self.w.agent_note(7, "第二条：补充说明")
+        self.w.send_failures = 1
+        with self.assertRaises(Exception):
+            self.sec.poll()
+        self.assertEqual(self.forwarded(), [])
+        self.assertEqual(len(self.state["secretary"]["held"][URL7]), 2)
+        self.sec.poll()
+        self.assertEqual([("第一条" in s["text"], "第二条" in s["text"]) for s in self.forwarded()], [(True, False), (False, True)])
+        self.assertEqual(self.state["secretary"]["held"], {})
+
+    def test_mention_of_other_name_prefix_is_not_a_mention(self) -> None:
+        self.w.agent_note(7, "@pengjhx 进展：开发中")
+        self.sec.poll()
+        self.assertEqual(self.forwarded(), [])
+
+    def test_work_items_and_issues_links_are_one_issue(self) -> None:
+        work_items = URL7.replace("/-/issues/", "/-/work_items/")
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {work_items: {
+            "project": "frontend/web-v1", "iid": 7, "repo": str(self.home / "repo")}}}))
+        self.state["threads"] = {"om_t": {"project": "frontend/web-v1", "iid": 7}}
+        self.w.agent_note(7, "进展：开发中")
+        self.sec.poll()
+        self.assertEqual(list(self.state["secretary"]["issues"]), [URL7])
+        self.assertEqual(len(self.state["secretary"]["held"][URL7]), 1)
+        self.now += 3600
+        self.assertIn("1 条新进展", self.sec.patrol())
+        self.assertEqual(len(self.sec.overview()), 1)
+
+    def test_old_state_with_both_link_forms_is_merged(self) -> None:
+        work_items = URL7.replace("/-/issues/", "/-/work_items/")
+        entry = {"id": 71, "body": "进展"}
+        sec_state = self.state["secretary"]
+        sec_state["issues"][work_items] = dict(sec_state["issues"][URL7])
+        sec_state["held"] = {work_items: [entry], URL7: [entry]}
+        sec_state["msgs"] = {"om_x": work_items}
+        SEC.Secretary(self.b, home=self.home)
+        self.assertEqual(list(sec_state["issues"]), [URL7])
+        self.assertEqual(sec_state["held"], {URL7: [entry]})
+        self.assertEqual(sec_state["msgs"], {"om_x": URL7})
+
+    def test_overview_lists_busy_members_of_the_scheduler(self) -> None:
+        self.w.agents = [{"pane_id": "w1:p1", "name": "delivery-scheduler-w1-p1", "agent_status": "working"},
+                         {"pane_id": "w1:p2", "agent_status": "working"}, {"pane_id": "w1:p3", "agent_status": "idle"},
+                         {"pane_id": "w1:p4", "agent_status": "working"}]
+        (self.home / "state/members.json").write_text(json.dumps({
+            "w1:p2": {"scheduler": "delivery-scheduler-w1-p1", "profile": "arch"},
+            "w1:p3": {"scheduler": "delivery-scheduler-w1-p1", "profile": "test"},
+            "w1:p4": {"scheduler": "delivery-scheduler-w9-p9", "profile": "dev-fe"}}))
+        line = "\n".join(self.sec.overview())
+        self.assertIn("调度者正在干活；架构师正在干活", line)
+        self.assertNotIn("测试", line)
+        self.assertNotIn("前端开发", line)
 
     def test_held_notes_flush_when_label_turns_waiting(self) -> None:
         self.w.agent_note(7, "需要你在 A、B 里选一个")

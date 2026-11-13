@@ -259,32 +259,34 @@ class Secretary:
     def handle(self, msg: Mapping[str, Any], text: str) -> None:
         """私聊主窗口里桥没认出的话：对转达的「回复」转给需求，「进度」回总览，其余当提问。"""
         mid = msg["message_id"]
+        thread = bool(msg.get("thread_id"))  # 私聊主窗口里就地回，不开话题
         target = self.target(msg)
         if target is not None:
             self.relay(target, msg, text)
             return
         if text.strip().lower() in STATUS_WORDS:
             lines = self.overview()
-            self.bridge.reply(mid, "**总览**\n" + ("\n".join(lines) or "现在没有在跑的需求。"), f"sec-status-{mid}")
+            self.bridge.reply(mid, "**总览**\n" + ("\n".join(lines) or "现在没有在跑的需求。"), f"sec-status-{mid}", in_thread=thread)
             return
-        self.bridge.reply(mid, self.answer(text), f"sec-answer-{mid}")
+        self.bridge.reply(mid, self.answer(text), f"sec-answer-{mid}", in_thread=thread)
 
     def relay(self, url: str, msg: Mapping[str, Any], text: str) -> None:
         mid = msg["message_id"]
+        thread = bool(msg.get("thread_id"))
         issue = self.state["issues"].get(url)
         project = issue["project"] if issue else self.bridge.project
         iid = issue["iid"] if issue else int(url.rsplit("/", 1)[-1])
         images = self.bridge.images_markdown({**msg, "reply_to": "", "root_id": ""}, project)
         text = self.bridge.strip_images(text)
         if not text and not images:
-            self.bridge.reply(mid, "这条没有内容，没转。", f"sec-empty-{mid}")
+            self.bridge.reply(mid, "这条没有内容，没转。", f"sec-empty-{mid}", in_thread=thread)
             return
         # 指令要整条只有指令，收件箱才认得，所以不加尾注
         body = text if text.startswith("/") and not images else \
             "\n\n".join(x for x in (text, images) if x) + "\n\n_（来自飞书秘书）_"
         self.bridge.note_as_user(project, iid, f"@{self.bridge.agent} {body}")
         title = f" {issue.get('title', '')}" if issue else ""
-        self.bridge.reply(mid, f"已转给 [#{iid}]({url}){title}。", f"sec-relayed-{mid}")
+        self.bridge.reply(mid, f"已转给 [#{iid}]({url}){title}。", f"sec-relayed-{mid}", in_thread=thread)
 
     def answer(self, question: str) -> str:
         lines = self.overview()

@@ -72,6 +72,7 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(len(self.w.sent), 1)  # 只有一段说明，旧评论不回放
         self.assertIn("秘书", self.w.sent[0]["text"])
         self.assertEqual(self.w.replies[-1]["text"], FB.HELP_TEXT)
+        self.assertFalse(self.w.replies[-1]["in_thread"])  # 私聊里就地回，不开话题
         self.assertEqual(self.state["secretary"]["issues"][URL7]["last_note"], 70)
         self.b.handle(msg("om_hi2", "帮助"))
         self.assertEqual(len(self.w.sent), 1)  # 同一窗口不重复发说明
@@ -105,6 +106,7 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual((method, path, as_user), ("POST", "projects/frontend/web-v1/issues/7/notes", True))
         self.assertTrue(fields["body"].startswith("@pjhagent 1"))
         self.assertIn("已转给", self.w.replies[-1]["text"])
+        self.assertFalse(self.w.replies[-1]["in_thread"])
 
     def test_thread_under_forwarded_message_also_relays(self) -> None:
         self.w.agent_note(7, "要你看一下")
@@ -113,6 +115,7 @@ class SecretaryTest(unittest.TestCase):
         self.b.handle(msg("om_u4", "看过了", root=forwarded, thread="omt_x"))
         self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
         self.assertIn("看过了", self.w.writes[-1][2]["body"])
+        self.assertTrue(self.w.replies[-1]["in_thread"])  # 本来就在话题里，回执也留在话题里
 
     def test_command_reply_keeps_command_bare(self) -> None:
         self.w.agent_note(7, "可以开工吗")
@@ -152,11 +155,13 @@ class SecretaryTest(unittest.TestCase):
         self.b.handle(msg("om_q1", "进度"))
         self.assertIn("**总览**", self.w.replies[-1]["text"])
         self.assertIn("#7", self.w.replies[-1]["text"])
+        self.assertFalse(self.w.replies[-1]["in_thread"])
 
     def test_question_uses_model_and_falls_back_to_overview(self) -> None:
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": "#7 在开发"}]}})
         self.b.handle(msg("om_q2", "现在哪个最急？"))
         self.assertEqual(self.w.replies[-1]["text"], "#7 在开发")
+        self.assertFalse(self.w.replies[-1]["in_thread"])
         self.w.omp_out = ""
         self.b.handle(msg("om_q3", "还有吗？"))
         self.assertIn("这会儿没法回答", self.w.replies[-1]["text"])

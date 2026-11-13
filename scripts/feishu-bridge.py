@@ -415,7 +415,7 @@ class Bridge:
             self.secretary.handle(msg, text)
             return
         if private:
-            self.reply(mid, HELP_TEXT, f"help-{mid}")
+            self.reply(mid, HELP_TEXT, f"help-{mid}", in_thread=False)
             return
         last = self.state["help_sent"].get(chat, 0)
         if self.now() - last >= HELP_COOLDOWN_S:

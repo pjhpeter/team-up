@@ -45,7 +45,8 @@ STATUS_TEXT = {"working": "正在干活", "idle": "空闲", "done": "空闲", "b
 DEFAULT_MODEL = {"model": "jc-gpt/gpt-6-luna", "thinking": "medium", "timeout_s": 120}
 SYSTEM_PROMPT = (
     "你是用户的交付秘书，替他盯着多个由 Agent 团队推进的需求。只根据给你的「任务总览」和「最近转达」回答，"
-    "不知道就说不知道，不编造进度。用中文大白话，先给结论，控制在 10 行内；需要用户动手的事写清楚去哪个 issue 做什么。"
+    "不知道就说不知道，不编造进度。问怎么用（发起任务、关联 issue、群里怎么叫你等）就按「机器人用法」回答，"
+    "不要让用户自己去 GitLab 建单。用中文大白话，先给结论，控制在 10 行内；需要用户动手的事写清楚去哪个 issue 做什么。"
 )
 
 INTRO = (
@@ -297,7 +298,8 @@ class Secretary:
     def answer(self, question: str) -> str:
         lines = self.overview()
         material = ("## 任务总览\n" + ("\n".join(lines) or "（没有在跑的需求）") + "\n\n## 最近转达\n"
-                    + ("\n".join(self.state["recent"]) or "（无）") + f"\n\n## 用户的问题\n{question}")
+                    + ("\n".join(self.state["recent"]) or "（无）") + f"\n\n## 机器人用法\n{getattr(self.bridge, 'help_text', '')}"
+                    + f"\n\n## 用户的问题\n{question}")
         cmd = ["omp", "-p", "--model", self.cfg["model"], "--thinking", self.cfg["thinking"], "--no-session",
                "--mode", "json", "--tools", "read", "--no-context-files", "--no-skills", "--no-rules",
                "--no-extensions", "--no-lsp", "--system-prompt", SYSTEM_PROMPT, material]

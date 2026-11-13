@@ -160,11 +160,18 @@ class SecretaryTest(unittest.TestCase):
     def test_question_uses_model_and_falls_back_to_overview(self) -> None:
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": "#7 在开发"}]}})
         self.b.handle(msg("om_q2", "现在哪个最急？"))
-        self.assertEqual(self.w.replies[-1]["text"], "#7 在开发")
+        self.assertEqual(self.w.replies[-1]["text"], f"[#7]({URL7}) 在开发")
         self.assertFalse(self.w.replies[-1]["in_thread"])
         self.w.omp_out = ""
         self.b.handle(msg("om_q3", "还有吗？"))
         self.assertIn("这会儿没法回答", self.w.replies[-1]["text"])
+
+    def test_model_answer_links_known_issue_numbers(self) -> None:
+        answer = "**#7 旧单**：开发中；[#7](x) 已有链接不重复；#70 不认识；见 note#7a"
+        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": answer}]}})
+        self.b.handle(msg("om_q4", "现在有哪些需求？"))
+        self.assertEqual(self.w.replies[-1]["text"],
+                         f"**[#7]({URL7}) 旧单**：开发中；[#7](x) 已有链接不重复；#70 不认识；见 note#7a")
 
     def test_closed_origin_drops_out_of_watch(self) -> None:
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))

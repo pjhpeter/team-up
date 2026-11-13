@@ -621,10 +621,13 @@ scheduler 回收实际输出并核验：每条验收有运行证据、测试 HEA
 - **测试服务收尾核验**：写完成评论与关闭 issue 前，核对第 8 阶段该 issue 新启动的服务与后台进程已关闭、所用端口全部空闲；发现残留先安排清理并回读，不得在残留未清时汇报完成或关闭 issue。**不得以“已有服务在运行”为由复用**；发现测试复用了他人的或先前 issue 的服务，本轮结果不放行，须按要求新启动独立服务重跑。
   - 调度者不只看 test 报告：关闭 issue 前、以及交付收尾把 INDEX 改为收尾状态前，必须亲自对自己名下每个 worktree 执行一次 `python3 ~/.hwf/scripts/stop-test-services.py <worktree>...`（这是收尾核验，不算代做测试），退出码 0 后把输出摘要写入 STATE。成员 pane 关闭前也执行一次，防止成员退出后服务成为孤儿进程。
 - **worktree 收尾核验**：交付收尾前按「worktree 生命周期」删除自己名下已满足条件的 worktree 并回读 `git worktree list`；保留的 worktree 必须在收尾汇报中逐个写明路径与原因。未处理 worktree 不得把 INDEX 状态改为收尾状态。
-- **成员收尾与收尾回执**：通过「关闭前核对」、确认全部交付完成或用户明确取消后，由调度者主动执行，不等用户提醒。阶段测试结束、阻塞等待或单独收到 issue 关闭事件都不等于交付结束。按顺序做完下面四步，全部回读通过后才能将 INDEX 改为 `done`/`delivered`/`closed`/`cancelled`：
-  1. 对名下每个 worktree 执行 `python3 ~/.hwf/scripts/stop-test-services.py <worktree>`，退出码 0，再回读本交付用过的全部端口空闲；
-  2. 按「pane 收尾」关闭本交付创建的全部成员 pane（交付结束后不再为“以后复用”保留成员），执行 `herdr agent list` 回读这些成员已不在列表中；
-  3. 按上一条「worktree 收尾核验」删除满足条件的 worktree，回读 `git worktree list`；
+- **成员收尾与收尾回执**：通过「关闭前核对」、确认全部交付完成或用户明确取消后，由调度者主动执行，不等用户提醒。阶段测试结束、阻塞等待或单独收到 issue 关闭事件都不等于交付结束。
+  - **一律用脚本收尾（2026-11-13 用户指示：#478 调度者手写 done，没关成员、没删 worktree、没发回执，10 个成员一直挂着）**：运行 `python3 ~/.hwf/scripts/wrapup.py --repo <主仓库> --task <任务标识> --issue <发起 issue URL，没有则根 issue> --release release-<根编号> --status "<done/delivered/closed/cancelled>（说明）" --port <本交付用过的端口>...`，可先加 `--dry-run` 看它将关哪些成员、删哪些 worktree。脚本按下面四步做完并回读，最后才写 INDEX；退出码 0 才算收尾完成，把输出摘要写入 STATE。退出码 1 表示有残留（INDEX 未改、回执已如实写明），按「需要用户确认」通知用户，处理后重跑。**INDEX 的收尾状态只能由该脚本写，调度者不得手改**；脚本自身出错时报告阻塞，不手写命令兜底。
+  - worktree 要保留（未提交改动、HEAD 不在 release/main、有人在用）**不是保留成员的理由**：先关成员，再处理 worktree，顺序不能反。
+  脚本执行的四步（也是回执要证明的内容）：
+  1. 对名下每个 worktree 执行 `stop-test-services.py`，退出码 0，回读本交付用过的全部端口空闲；成员关闭后再执行一次；
+  2. 按「pane 收尾」关闭本交付创建的全部成员 pane（交付结束后不再为“以后复用”保留成员），`herdr agent list` 回读这些成员已不在列表中；
+  3. 按上一条「worktree 收尾核验」删除满足条件的 worktree（HEAD 已在 `release-<根编号>` 或 main，按提交内容比对的 cherry-pick 也算），回读 `git worktree list`；随后释放测试账号；
   4. **在发起 issue（没有则根 issue）发一条「收尾回执」评论**，作为 pane 关掉之后唯一可查的证据，同时写入 STATE。格式：
      ```markdown
      **收尾回执**
@@ -839,7 +842,7 @@ scheduler 回收实际输出并核验：每条验收有运行证据、测试 HEA
 
 ### pane 收尾
 
-- **时机**：交付结束时按 §9「成员收尾与收尾回执」一次性关闭，不留到用户提醒；交付进行中，空闲成员按「复用」规则留给本交付的下一个 issue。
+- **时机**：交付结束时按 §9「成员收尾与收尾回执」用 `wrapup.py` 一次性关闭，不留到用户提醒；交付进行中，空闲成员按「复用」规则留给本交付的下一个 issue。
 - 只关闭 STATE 中 `created_by` 为自己、由本任务 `pane split` 创建且已交接完毕的 pane。
 - 复用的 pane、用户 pane、他人创建的 pane、调度者自身所在 pane 一律不关。
 - 关闭前确认它不是所在 workspace 的最后一个 tab（关闭最后一个 tab 会连带关闭 workspace），是则保留。

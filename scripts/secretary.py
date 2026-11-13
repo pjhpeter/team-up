@@ -1,9 +1,9 @@
 """秘书：和机器人的私聊窗口就是秘书，统一转达各交付的消息、每小时巡检、回答提问、转发用户的快速回复。
 
 问题：每个交付各有一张 issue 和一个飞书话题，同时跑的交付一多，用户要在好几个话题之间来回看。
-办法：私聊窗口本来就是提需求的入口，让它同时当秘书：要用户处理或整项做完的需求，Agent 评论马上发到私聊主窗口，
-其余进展攒进每小时巡检（调度者不守免打扰时也不刷屏）；巡检有变化或异常才汇报；用户对某条转达点「回复」，就把话转成那张 issue 的评论。各交付自己的
-话题照常保留（默认免打扰），想看某个需求的完整经过时去话题里看。
+办法：私聊窗口本来就是提需求的入口，让它同时当秘书：调度者的每条评论都马上发到私聊主窗口（发多少由协议的免打扰/详尽
+在源头控制，秘书不再二次筛）；每小时巡检只发总览，有变化或异常才汇报；用户对某条转达点「回复」，就把话转成那张 issue 的评论。
+各交付自己的话题照常保留（默认免打扰），想看某个需求的完整经过时去话题里看。
 
 只由 feishu-bridge.py 调用（同一进程、同一份飞书连接与状态文件），不单独运行：
   开启：白名单用户第一次在私聊里说话，桥就记下这个私聊窗口，之后的转达和巡检都发到这里，不需要命令。
@@ -15,7 +15,7 @@
     「帮我问 481 的调度…」         → 模型判断是要传话，以用户名义写成那张 issue 的评论，调度者回复照常转回来
     其他话                        → 当作提问，用模型按总览、各需求最近评论和最近转达回答；模型不可用时回总览
 看哪些 issue：收件箱登记的发起 issue（state/gitlab-inbox.json 的 origins）加上飞书桥里还没关闭的话题。
-只转 Agent 账号发的评论；收件箱的「已收到」回执不转，免得用户每回一句就多一条。
+只转 Agent 账号发的评论；收件箱固定格式的「已收到，已转交…」回执不转（秘书转话时已回过「已转给」）。
 巡检只读：GitLab GET、find-scheduler --owner-of、herdr agent get、本机 INDEX/STATE 修改时间。
 """
 from __future__ import annotations
@@ -39,19 +39,22 @@ IDLE_ALERT_S = 3 * 3600  # 在途交付超过这么久没有任何动静，巡�
 MSG_MAP_CAP = 500
 RECENT_CAP = 20
 SUMMARY_CAP = 600  # 转达只放开头一段，全文给链接
-RECEIPT = re.compile(r"^(@\S+\s+)?已收到")  # 收件箱回执，不转达
+# 只认 gitlab-inbox.py deliver() 的两种整条回执；调度者以「已收到」开头的实质答复（#483 note_25889）照常转
+RECEIPT = re.compile(r"^(@\S+\s+)?已收到(，已转交目标 issue \S+ 的消息，等待调度者回复。"
+                     r"|目标 issue \S+ 的消息。目前没有在线负责人，已转交调度入口，等待接手后回复。)$")
 FOLDED = re.compile(r"<details>.*?</details>", re.S)
 BARE_ISSUE = re.compile(r"(?<![\[\w/&])#(\d+)(?!\d)")  # 已在链接里的「[#12]」、网址里的不算
 WAITING_LABEL = "状态:等你处理"
 SHIP_LABEL = "状态:待上线"
-URGENT_LABELS = (WAITING_LABEL, SHIP_LABEL)  # 免打扰下也马上转：要用户处理、整项做完等合并
 SHIP_ASK_GRACE_S = 15 * 60  # 调度者常先发「请授权合并」再改标签，往前放宽这么久都算
 LABEL_EVENT_PAGES = 5
-HELD_LINE_CAP = 80
 ASK_LINE = re.compile(r"^\s*转给\s*#(\d+)\s*[:：]\s*(.+)", re.S)  # 模型要替用户传话时的格式
 NOTES_PER_ISSUE = 3
 NOTE_CAP = 400
 STATUS_TEXT = {"working": "正在干活", "idle": "空闲", "done": "空闲", "blocked": "卡在确认界面", "unknown": "状态不明"}
+ROLE_TEXT = {"arch": "架构师", "arch-lite": "方案作者", "precheck": "取证", "code-review": "代码评审", "test-writer": "写用例",
+             "test": "测试", "test-herdr": "测试", "dev": "开发", "dev-fe": "前端开发", "dev-be": "后端开发",
+             "dev-mini": "开发", "dev-fe-mini": "前端开发", "dev-be-mini": "后端开发"}
 DEFAULT_MODEL = {"model": "jc-gpt/gpt-6-luna", "thinking": "medium", "timeout_s": 120}
 SYSTEM_PROMPT = (
     "你是用户的交付秘书，替他盯着多个由 Agent 团队推进的需求。只根据给你的「任务总览」「各需求最近的评论」「最近转达」回答，"
@@ -64,8 +67,8 @@ SYSTEM_PROMPT = (
 
 INTRO = (
     "以后我也是你的秘书，所有在跑的需求都在这个窗口跟进：\n"
-    "1. 要你处理、或整项做完等合并的消息，我马上转到这里\n"
-    "2. 其他进展每小时汇总一次（某个需求发过 /详尽 就每条都马上转）；有变化或卡住了才汇报\n"
+    "1. 各需求调度者发的每条消息，我都马上转到这里\n"
+    "2. 每小时看一遍总览，有变化或卡住了才汇报\n"
     "3. 对某条转达点「回复」，我把你的话转给那个需求；也可以发「#编号 内容」\n"
     "4. 想问某个需求的调度者，直接说「帮我问 481 的调度…」，我替你问，回复会转到这里\n"
     "5. 发「进度」看总览，发「帮助」看用法，其他话直接问我"
@@ -92,6 +95,11 @@ def _ts(value: Any) -> float:
         return 0.0
 
 
+def canon(url: str) -> str:
+    """GitLab 同一张 issue 有 issues、work_items 两种链接（收件箱记后者、桥记前者），统一成 issues 才不会当成两个需求。"""
+    return url.replace("/-/work_items/", "/-/issues/")
+
+
 def find_scheduler() -> Any:
     global _FS
     if _FS is None:
@@ -105,11 +113,26 @@ class Secretary:
         self.state: dict[str, Any] = bridge.state.setdefault("secretary", {})
         self.state.setdefault("issues", {})   # issue URL → {project, iid, repo, title, last_note, last_agent_at}
         self.state.setdefault("msgs", {})     # 私聊里的转达消息 id → issue URL（快速回复用）
-        self.state.setdefault("held", {})     # issue URL → 免打扰下攒着、等巡检一起发的 Agent 发言
+        self.state.setdefault("held", {})     # issue URL → 飞书没发出去、下一轮重发的 Agent 发言
         self.state.setdefault("recent", [])   # 最近转达的摘要，回答提问时当材料
+        self.merge_link_forms()
         cfg = dict(DEFAULT_MODEL)
         cfg.update(bridge.cfg.get("secretary") or {})
         self.cfg = cfg
+
+    def merge_link_forms(self) -> None:
+        """旧状态里同一需求可能按两种链接各记了一份：合成一份，攒着的发言按评论 id 去重。"""
+        issues, held, msgs = self.state["issues"], self.state["held"], self.state["msgs"]
+        for url in [u for u in issues if canon(u) != u]:
+            old, new = issues.pop(url), issues.get(canon(url))
+            if new is None or old.get("last_note", 0) > new.get("last_note", 0):
+                issues[canon(url)] = old
+        for url in [u for u in held if canon(u) != u]:
+            merged = held.get(canon(url), []) + held.pop(url)
+            seen: set[Any] = set()
+            held[canon(url)] = [e for e in sorted(merged, key=lambda e: e["id"]) if not (e["id"] in seen or seen.add(e["id"]))]
+        for mid, url in list(msgs.items()):
+            msgs[mid] = canon(url)
 
     # ---------- 私聊窗口 ----------
     @property
@@ -130,7 +153,7 @@ class Secretary:
         msgs = self.state["msgs"]
         for key in (msg.get("reply_to"), msg.get("root_id")):
             if key and key in msgs:
-                return msgs[key]
+                return canon(msgs[key])
         return None
 
     def is_relay(self, msg: Mapping[str, Any]) -> bool:
@@ -157,19 +180,18 @@ class Secretary:
         except (OSError, ValueError):
             origins = {}
         for url, o in origins.items():
-            found[url] = {"project": o["project"], "iid": int(o["iid"]), "repo": o.get("repo") or repos.get(o["project"], ""),
-                          "notify": o.get("notify", "")}
+            found[canon(url)] = {"project": o["project"], "iid": int(o["iid"]), "repo": o.get("repo") or repos.get(o["project"], ""),
+                                 "notify": o.get("notify", ""), "initiator": o.get("initiator", "")}
         for t in self.bridge.state.get("threads", {}).values():
             if t.get("closed"):
                 continue
-            url = self.bridge.issue_url(t["project"], t["iid"])
+            url = canon(self.bridge.issue_url(t["project"], t["iid"]))
             found.setdefault(url, {"project": t["project"], "iid": int(t["iid"]), "repo": repos.get(t["project"], "")})
         return found
 
     # ---------- 转达 ----------
     def poll(self, forward: bool = True) -> None:
-        """免打扰：要用户处理或整项完成的需求，Agent 发言马上转；其余先攒着，标签一变成要用户处理就立刻补发，
-        否则并进每小时巡检。调度者常先发评论、几秒后才改标签，所以攒着的每轮都重看一次标签。详尽模式一律马上转。"""
+        """Agent 的每条发言都马上转到私聊（2026-11-13 用户要求：攒到巡检里只剩一行摘要，等于漏了）。"""
         if not self.chat:
             return
         issues, held = self.state["issues"], self.state["held"]
@@ -178,9 +200,7 @@ class Secretary:
             # 关闭后才掉出名单：调度者常发完最后几条评论就立刻关 issue（#481），先把没转的补发完再放手。
             # 读评论失败就抛出去、记录不删，下一轮再补。
             known = issues[url]
-            pending = held.get(url, []) + self.fresh_entries(url, known, self.notes_of(known), forward)
-            for entry in pending:
-                self.forward(url, known, entry)
+            self.flush(url, known, held.get(url, []) + self.fresh_entries(url, known, self.notes_of(known), forward))
             del issues[url]
             held.pop(url, None)
         for url, w in watched.items():
@@ -194,14 +214,19 @@ class Secretary:
                 continue  # 第一次看到只记水位，不回放旧评论
             known.update(w)
             pending = held.get(url, []) + self.fresh_entries(url, known, notes, forward)
-            if not pending:
-                continue
-            if w.get("notify") == "verbose" or self.urgent(pid, w["iid"]):
-                held.pop(url, None)
-                for entry in pending:
-                    self.forward(url, known, entry)
-            else:
-                held[url] = pending
+            if pending:
+                self.flush(url, known, pending)
+
+    def flush(self, url: str, issue: Mapping[str, Any], pending: list[dict[str, Any]]) -> None:
+        """逐条发出；飞书发送失败时，没发出去的留在 held 里下一轮重发（水位已推进，丢了就再也找不回来）。"""
+        held = self.state["held"]
+        for i, entry in enumerate(pending):
+            try:
+                self.forward(url, issue, entry)
+            except Exception:
+                held[url] = pending[i:]
+                raise
+        held.pop(url, None)
 
     def notes_of(self, w: Mapping[str, Any]) -> list[dict[str, Any]]:
         pid = quote(w["project"], safe="")
@@ -216,11 +241,6 @@ class Secretary:
                 fresh.append(n)
             known["last_note"] = n["id"]
         return [self.held_entry(url, known, n) for n in fresh]
-
-    def urgent(self, pid: str, iid: int) -> bool:
-        info = self.bridge.api(f"projects/{pid}/issues/{iid}")
-        labels = info.get("labels") or []
-        return info.get("state") != "opened" or any(l in labels for l in URGENT_LABELS)
 
     def held_entry(self, url: str, issue: Mapping[str, Any], n: Mapping[str, Any]) -> dict[str, Any]:
         body = FOLDED.sub("", (n.get("body") or "").strip()).strip()
@@ -246,35 +266,21 @@ class Secretary:
             for old in list(msgs)[:-MSG_MAP_CAP]:
                 del msgs[old]
 
-    def held_lines(self) -> list[str]:
-        lines = []
-        for url, entries in sorted(self.state["held"].items(), key=lambda kv: self.state["issues"].get(kv[0], {}).get("iid", 0)):
-            issue = self.state["issues"].get(url) or {}
-            last = entries[-1]
-            first = next((l.strip(" *#") for l in last["body"].splitlines() if l.strip()), "")[:HELD_LINE_CAP]
-            lines.append(f"- [#{issue.get('iid', '')}]({url}#note_{last['id']}) {issue.get('title', '')}："
-                         f"{len(entries)} 条新进展，最新一条：{first}")
-        return lines
-
     # ---------- 巡检 ----------
     def patrol(self, force: bool = False) -> Optional[str]:
-        """到点（或 force）就看一遍；内容和上次发的不同才发。攒着的进展并在这里发，发完清空。返回发出的文本。"""
+        """到点（或 force）就看一遍；内容和上次发的不同才发。返回发出的文本。"""
         if not self.chat:
             return None
         if not force and self.bridge.now() - float(self.state.get("last_patrol") or 0) < PATROL_S:
             return None
         self.state["last_patrol"] = self.bridge.now()
         lines = self.overview()
-        progress = self.held_lines()
         digest = "\n".join(lines)
-        if digest == self.state.get("last_digest") and not progress:
+        if digest == self.state.get("last_digest"):
             return None
         self.state["last_digest"] = digest
         text = f"**每小时巡检（{time.strftime('%H:%M', time.localtime(self.bridge.now()))}）**\n" + ("\n".join(lines) or "现在没有在跑的需求。")
-        if progress:
-            text += "\n\n**这一小时的进展**（点编号看全文）\n" + "\n".join(progress)
         self.say(text, f"sec-patrol-{int(self.bridge.now())}")
-        self.state["held"] = {}
         return text
     def overview(self) -> list[str]:
         lines = []
@@ -304,6 +310,9 @@ class Secretary:
             if pane:
                 status = self.agent_status(pane)
                 parts.append(f"调度者{STATUS_TEXT.get(status, status)}")
+                busy = self.busy_members(pane)
+                if busy:
+                    parts.append(f"{'、'.join(busy)}正在干活")
                 if status == "blocked":
                     alerts.append("调度者卡在确认界面，要到电脑上处理")
             elif not str(owner.get("status") or "").lower().startswith(find_scheduler().TERMINAL_STATUS):
@@ -343,9 +352,7 @@ class Secretary:
                 break
         if not added:
             return False
-        people = {u for u in self.bridge.users.values() if u} | {(info.get("author") or {}).get("username") or ""}
-        people -= {"", self.bridge.agent}
-        mention = re.compile("|".join(rf"@{re.escape(p)}(?![\w.-])" for p in sorted(people))) if people else None
+        mention = self.mention_re((info.get("author") or {}).get("username") or "")
         notes = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
         for n in notes:
             if n.get("system") or (n.get("author") or {}).get("username") != self.bridge.agent:
@@ -355,6 +362,11 @@ class Secretary:
             if mention and mention.search(n.get("body") or ""):
                 return False
         return True
+
+    def mention_re(self, *extra: str) -> Optional["re.Pattern[str]"]:
+        people = {u for u in self.bridge.users.values() if u} | set(extra)
+        people -= {"", self.bridge.agent}
+        return re.compile("|".join(rf"@{re.escape(p)}(?![\w.-])" for p in sorted(people))) if people else None
 
     def owner(self, repo: str, url: str) -> dict[str, Any]:
         if not repo:
@@ -368,6 +380,20 @@ class Secretary:
             return str(json.loads(out)["result"]["agent"].get("agent_status") or "unknown")
         except Exception:
             return "unknown"
+
+    def busy_members(self, scheduler_pane: str) -> list[str]:
+        """调度者派出去、正在干活的成员（按 state/members.json 的领取登记）；查不到就不写，不影响总览。"""
+        try:
+            agents = {a.get("pane_id"): a for a in json.loads(self.bridge.sh(["herdr", "agent", "list"]))["result"]["agents"]}
+            members = json.loads((self.home / "state" / "members.json").read_text())
+        except Exception:
+            return []
+        name = (agents.get(scheduler_pane) or {}).get("name")
+        if not name:
+            return []
+        roles = {ROLE_TEXT.get(m.get("profile", ""), m.get("profile", "")) for p, m in members.items()
+                 if m.get("scheduler") == name and (agents.get(p) or {}).get("agent_status") == "working"}
+        return sorted(r for r in roles if r)
 
     @staticmethod
     def state_mtime(repo: str, task: str) -> float:

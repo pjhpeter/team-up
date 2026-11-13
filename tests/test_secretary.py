@@ -1,4 +1,4 @@
-"""聚焦验证秘书（私聊窗口）：只转 Agent 发言、对转达点回复回到对应 issue、巡检有变化才发、提问失败回总览。"""
+"""聚焦验证秘书（私聊窗口）：Agent 每条发言马上转、对转达点回复回到对应 issue、巡检有变化才发、提问失败回总览。"""
 
 from __future__ import annotations
 
@@ -29,6 +29,8 @@ class World(TFB.World):
         self.issues[7].update(labels=["状态:开发中"])
         self.owner = {"task": "frontend-web-v1-7", "live_pane": "w1:p1", "status": "in-progress"}
         self.agent_status = "working"
+        self.agents: list[dict] = []
+        self.send_failures = 0  # 接下来几次往私聊发消息返回失败
         self.omp_out = ""
         self.omp_cmds: list[list[str]] = []
         self.label_events: list[dict] = []
@@ -38,6 +40,11 @@ class World(TFB.World):
             return ok(self.label_events)
         if cmd[0] == sys.executable and cmd[1].endswith("find-scheduler.py"):
             return ok(self.owner)
+        if cmd[0] == "lark-cli" and cmd[1:3] == ["im", "+messages-send"] and self.send_failures:
+            self.send_failures -= 1
+            return ok({"ok": False, "error": {"message": "TLS handshake timeout"}})
+        if cmd[:3] == ["herdr", "agent", "list"]:
+            return ok({"result": {"agents": self.agents}})
         if cmd[:3] == ["herdr", "agent", "get"]:
             return ok({"result": {"agent": {"agent_status": self.agent_status}}})
         if cmd[0] == "omp":
@@ -102,7 +109,8 @@ class SecretaryTest(unittest.TestCase):
     def test_forwards_agent_notes_but_not_receipts_user_or_system(self) -> None:
         self.waiting()
         self.w.agent_note(7, "步骤 1 完成：列表改版\n\n<details>全文</details>")
-        self.w.agent_note(7, "已收到，已转交目标 issue 的消息，等待调度者回复。")
+        self.w.agent_note(7, f"已收到，已转交目标 issue {URL7} 的消息，等待调度者回复。")
+        self.w.agent_note(7, f"@pengjh 已收到目标 issue {URL7} 的消息。目前没有在线负责人，已转交调度入口，等待接手后回复。")
         self.w.gitlab_comment(7, "我自己说的话")
         self.w.gitlab_comment(7, "改了标签", system=True)
         self.sec.poll()
@@ -170,36 +178,94 @@ class SecretaryTest(unittest.TestCase):
         self.w.agent_note(7, "要你在 A、B 里选一个")
         self.assertIn("⚠️ 等你处理", "\n".join(self.sec.overview()))
         self.w.gitlab_comment(7, "选 A")
-        self.w.agent_note(7, "已收到，已转交目标 issue 的消息，等待调度者回复。")  # 回执不算
+        self.w.agent_note(7, f"已收到，已转交目标 issue {URL7} 的消息，等待调度者回复。")  # 回执不算
         line = "\n".join(self.sec.overview())
         self.assertIn("你已回复，等调度者接着处理", line)
         self.assertNotIn("⚠️", line)
 
-    def test_quiet_holds_progress_and_patrol_sums_it_up(self) -> None:
-        self.w.agent_note(7, "**国内冒烟首轮未通过**：站点可用，验收点未执行")
+    def test_every_agent_note_forwards_immediately_and_patrol_is_overview_only(self) -> None:
+        self.w.agent_note(7, "**国内冒烟首轮未通过**：站点可用，验收点未执行")  # 开发中、没 @ 用户也马上转
         self.w.agent_note(7, "**国内冒烟第2轮**：仍未进入验收")
         self.sec.poll()
-        self.assertEqual(self.forwarded(), [])  # 开发中的进展不马上推
-        self.sec.poll()
-        self.assertEqual(self.forwarded(), [])
+        texts = [s["text"] for s in self.forwarded()]
+        self.assertEqual(len(texts), 2)
+        self.assertIn("首轮未通过", texts[0])
+        self.assertIn("第2轮", texts[1])
+        self.assertEqual(self.state["secretary"]["held"], {})
         self.now += 3600
         text = self.sec.patrol()
-        self.assertIn("这一小时的进展", text)
-        self.assertIn("2 条新进展", text)
-        self.assertIn("国内冒烟第2轮", text)
-        self.assertEqual(self.state["secretary"]["held"], {})
-        self.now += 3600
-        self.assertIsNone(self.sec.patrol())  # 发过就清空，不重复汇报
+        self.assertIn("每小时巡检", text)
+        self.assertNotIn("这一小时的进展", text)
 
-    def test_held_notes_flush_when_label_turns_waiting(self) -> None:
-        self.w.agent_note(7, "需要你在 A、B 里选一个")
+    def test_substantive_reply_starting_with_received_is_forwarded(self) -> None:
+        self.w.agent_note(7, "已收到 note_25884 的重试要求，正在重新领取后台开发成员。")
+        self.w.agent_note(7, f"@pengjh 开始跑交付流程。已收到，已转交目标 issue {URL7} 的消息，等待调度者回复。")
         self.sec.poll()
-        self.assertEqual(self.forwarded(), [])
-        self.waiting()  # 调度者几秒后才改标签
+        texts = [s["text"] for s in self.forwarded()]
+        self.assertEqual(len(texts), 2)
+        self.assertIn("重新领取后台开发成员", texts[0])
+        self.assertIn("开始跑交付流程", texts[1])
+
+    def test_note_mentioning_user_forwards_without_waiting_for_patrol(self) -> None:
+        self.w.agent_note(7, "@pengjh test 的采集结果：共 231 条")
         self.sec.poll()
         self.assertEqual(len(self.forwarded()), 1)
-        self.assertIn("A、B 里选一个", self.forwarded()[0]["text"])
+        self.assertIn("231 条", self.forwarded()[0]["text"])
         self.assertEqual(self.state["secretary"]["held"], {})
+
+    def test_failed_send_is_kept_and_retried_next_round(self) -> None:
+        self.waiting()
+        self.w.agent_note(7, "第一条：要你选 A 或 B")
+        self.w.agent_note(7, "第二条：补充说明")
+        self.w.send_failures = 1
+        with self.assertRaises(Exception):
+            self.sec.poll()
+        self.assertEqual(self.forwarded(), [])
+        self.assertEqual(len(self.state["secretary"]["held"][URL7]), 2)
+        self.sec.poll()
+        self.assertEqual([("第一条" in s["text"], "第二条" in s["text"]) for s in self.forwarded()], [(True, False), (False, True)])
+        self.assertEqual(self.state["secretary"]["held"], {})
+
+    def test_ship_request_to_other_name_prefix_is_not_a_request(self) -> None:
+        self.w.agent_note(7, "@pengjhx 请授权合并 MR", at="2026-11-12T10:00:00.000+08:00")
+        self.w.ship(7, "2026-11-12T10:00:05.000+08:00")
+        self.assertIn("没 @你", "\n".join(self.sec.overview()))
+
+    def test_work_items_and_issues_links_are_one_issue(self) -> None:
+        work_items = URL7.replace("/-/issues/", "/-/work_items/")
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {work_items: {
+            "project": "frontend/web-v1", "iid": 7, "repo": str(self.home / "repo")}}}))
+        self.state["threads"] = {"om_t": {"project": "frontend/web-v1", "iid": 7}}
+        self.w.agent_note(7, "进展：开发中")
+        self.sec.poll()
+        self.assertEqual(list(self.state["secretary"]["issues"]), [URL7])
+        self.assertEqual(len(self.forwarded()), 1)
+        self.assertEqual(len(self.sec.overview()), 1)
+
+    def test_old_state_with_both_link_forms_is_merged(self) -> None:
+        work_items = URL7.replace("/-/issues/", "/-/work_items/")
+        entry = {"id": 71, "body": "进展"}
+        sec_state = self.state["secretary"]
+        sec_state["issues"][work_items] = dict(sec_state["issues"][URL7])
+        sec_state["held"] = {work_items: [entry], URL7: [entry]}
+        sec_state["msgs"] = {"om_x": work_items}
+        SEC.Secretary(self.b, home=self.home)
+        self.assertEqual(list(sec_state["issues"]), [URL7])
+        self.assertEqual(sec_state["held"], {URL7: [entry]})
+        self.assertEqual(sec_state["msgs"], {"om_x": URL7})
+
+    def test_overview_lists_busy_members_of_the_scheduler(self) -> None:
+        self.w.agents = [{"pane_id": "w1:p1", "name": "delivery-scheduler-w1-p1", "agent_status": "working"},
+                         {"pane_id": "w1:p2", "agent_status": "working"}, {"pane_id": "w1:p3", "agent_status": "idle"},
+                         {"pane_id": "w1:p4", "agent_status": "working"}]
+        (self.home / "state/members.json").write_text(json.dumps({
+            "w1:p2": {"scheduler": "delivery-scheduler-w1-p1", "profile": "arch"},
+            "w1:p3": {"scheduler": "delivery-scheduler-w1-p1", "profile": "test"},
+            "w1:p4": {"scheduler": "delivery-scheduler-w9-p9", "profile": "dev-fe"}}))
+        line = "\n".join(self.sec.overview())
+        self.assertIn("调度者正在干活；架构师正在干活", line)
+        self.assertNotIn("测试", line)
+        self.assertNotIn("前端开发", line)
 
     def test_ready_to_ship_or_closed_forwards_immediately(self) -> None:
         self.w.issues[7]["labels"] = ["状态:待上线"]
@@ -293,9 +359,9 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(self.state["secretary"]["issues"], {})
 
     def test_notes_posted_right_before_close_are_forwarded_before_dropping(self) -> None:
-        self.w.agent_note(7, "测试通过，攒着等巡检")
+        self.w.agent_note(7, "测试通过")
         self.sec.poll()
-        self.assertEqual(self.forwarded(), [])
+        self.assertEqual(len(self.forwarded()), 1)
         self.w.agent_note(7, "生产验证通过")
         self.w.agent_note(7, "交付收尾")
         self.w.issues[7]["state"] = "closed"
@@ -303,7 +369,7 @@ class SecretaryTest(unittest.TestCase):
         self.sec.poll()
         texts = [s["text"] for s in self.forwarded()]
         self.assertEqual(len(texts), 3)
-        self.assertIn("攒着等巡检", texts[0])
+        self.assertIn("测试通过", texts[0])
         self.assertIn("交付收尾", texts[2])
         self.assertEqual(self.state["secretary"]["issues"], {})
         self.assertEqual(self.state["secretary"]["held"], {})

@@ -41,10 +41,13 @@ class World:
         self.reply_failures = 0  # 接下来几次飞书回帖返回失败
         self.threads: dict[str, list] = {}  # thread_id → 话题消息（历史格式）
         self.unreadable_threads: set[str] = set()
+        self.sent: list[dict] = []  # 机器人主动发的顶层消息（秘书）
 
     def __call__(self, cmd, input=None, env=None, cwd=None, **_):
         if cmd[0] == "lark-cli":
             return self.lark(cmd, input, cwd)
+        if cmd[0] == "omp":  # 秘书回答提问用的模型，默认不可用
+            return subprocess.CompletedProcess(cmd, 1, "", "")
         method, path = cmd[cmd.index("-X") + 1], unquote(cmd[cmd.index("-X") + 2])
         fields = dict(cmd[i + 1].split("=", 1) for i, c in enumerate(cmd) if c == "-f")
         as_user = bool(env and env.get("GITLAB_TOKEN") == "tok")
@@ -102,6 +105,10 @@ class World:
             self.replies.append({"to": to, "text": stdin, "in_thread": "--reply-in-thread" in cmd,
                                  "key": cmd[cmd.index("--idempotency-key") + 1] if "--idempotency-key" in cmd else None})
             return ok({"ok": True, "data": {"message_id": f"om_r{len(self.replies)}"}})
+        if cmd[1:3] == ["im", "+messages-send"]:
+            self.sent.append({"chat": cmd[cmd.index("--chat-id") + 1], "text": stdin,
+                              "key": cmd[cmd.index("--idempotency-key") + 1]})
+            return ok({"ok": True, "data": {"message_id": f"om_s{len(self.sent)}"}})
         if cmd[1:3] == ["im", "+chat-messages-list"]:
             chat = cmd[cmd.index("--chat-id") + 1]
             if chat in self.unreadable_chats:
@@ -206,12 +213,14 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("![img_only.jpg](/uploads/x/img_only.jpg)", creates[0][2]["description"])
 
     def test_attachment_does_not_turn_prose_or_empty_requirement_into_command(self) -> None:
-        for index, text in enumerate(("[Image: img_prose]\n这里写着需求：不是发起命令", "需求：")):
+        # 私聊里不是命令的话交给秘书回答（模型不可用时回总览），空的「需求：」回用法
+        cases = (("[Image: img_prose]\n这里写着需求：不是发起命令", "这会儿没法回答"), ("需求：", FB.HELP_TEXT))
+        for index, (text, expected) in enumerate(cases):
             with self.subTest(text=text):
                 self.b.handle(msg(f"om_not_command_{index}", text, chat=f"oc_not_command_{index}"))
                 self.assertEqual(self.w.writes, [])
                 self.assertEqual(self.w.downloads, [])
-                self.assertEqual(self.w.replies[-1]["text"], FB.HELP_TEXT)
+                self.assertIn(expected, self.w.replies[-1]["text"])
 
     def test_thread_reply_becomes_user_comment_and_command_stays_bare(self) -> None:
         self.b.handle(msg("om_1", "/需求 修个按钮"))
@@ -413,9 +422,10 @@ class BridgeTest(unittest.TestCase):
         self.assertGreater(len(texts), 1)  # 不是固定一句
         self.assertEqual(self.w.writes, [])
 
-    def test_small_talk_gets_help_once_per_cooldown(self) -> None:
-        self.b.handle(msg("om_1", "你叫什么名字？"))
-        self.b.handle(msg("om_2", "在吗"))
+    def test_group_small_talk_gets_help_once_per_cooldown(self) -> None:
+        bot = [{"id": BOT}]
+        self.b.handle(msg("om_1", "你叫什么名字？", chat="oc_g", chat_type="group", mentions=bot))
+        self.b.handle(msg("om_2", "在吗", chat="oc_g", chat_type="group", mentions=bot))
         self.assertEqual(len(self.w.replies), 1)
         self.assertIn("用法", self.w.replies[0]["text"])
         self.assertEqual(self.w.writes, [])

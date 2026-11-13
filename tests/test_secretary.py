@@ -182,6 +182,26 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("## 机器人用法", material)
         self.assertIn("需求：<要做的事>", material)
 
+    def test_question_material_includes_recent_issue_comments(self) -> None:
+        self.w.agent_note(7, "方案要你在 A、B 里选一个，选好前先停着")
+        self.b.handle(msg("om_q6", "7 为什么还在等我？"))
+        material = self.w.omp_cmds[-1][-1]
+        self.assertIn("## 各需求最近的评论", material)
+        self.assertIn("#7 Agent", material)
+        self.assertIn("A、B 里选一个", material)
+
+    def test_ask_scheduler_line_becomes_user_comment_on_that_issue(self) -> None:
+        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
+            {"type": "text", "text": "转给 #7：用户想知道为什么状态还是等你处理，需要他做什么？"}]}})
+        self.b.handle(msg("om_q7", "你帮我问7的调度，为什么状态还是等我处理？"))
+        method, path, fields, as_user = self.w.writes[-1]
+        self.assertEqual((method, path, as_user), ("POST", "projects/frontend/web-v1/issues/7/notes", True))
+        self.assertTrue(fields["body"].startswith("@pjhagent 用户想知道为什么状态还是等你处理"))
+        self.assertIn("用户原话：你帮我问7的调度", fields["body"])
+        self.assertIn("已转给", self.w.replies[-1]["text"])
+        self.assertIn("调度者回复后我会转到这里", self.w.replies[-1]["text"])
+        self.assertFalse(self.w.replies[-1]["in_thread"])
+
     def test_closed_origin_drops_out_of_watch(self) -> None:
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))
         self.sec.poll()

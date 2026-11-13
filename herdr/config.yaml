@@ -1,7 +1,8 @@
 # 机器级角色定义（hwf 全局插件配置层，最低优先级）。
 # 2026-11-11 用户指示：arch 默认恢复 Opus 5.5，用户明确指定时才用其他模型；仍承担方案评审。
+# 2026-11-13 用户指示：arch 仍用 omp，模型改为 Factory 的 Opus 5.5（factory-droid/claude-opus-5-5 + thinking medium）。
 # arch 与 arch-lite 的 thinking 均为 medium；三个开发角色 thinking 为 medium，模型保持 gpt-6.1-sol。
-# 2026-11-12 用户指示：极简模式的开发角色（dev-mini / dev-fe-mini / dev-be-mini）用 droid + Opus 5.5 + thinking low。
+# 2026-11-12 用户指示：debug 模式的开发角色（dev-mini / dev-fe-mini / dev-be-mini）用 droid + Opus 5.5 + thinking low。
 # 2026-11-11 用户指示：固定使用 GPT 的成员统一用 codex；模型与思考强度不变。
 # 模型不可用时先报告；每次临时替换须用户确认，替换与恢复都记入 STATE。
 # 2026-10-20 用户指示：scheduler 不固定模型与思考档，按用户发起工作流时的当前会话
@@ -27,12 +28,12 @@ profiles:
   scheduler:
     kind: omp
     args: ["--config", "/Users/pengjiahui/.hwf/scheduler-omp.yml", "--approval-mode", "yolo"]
-  # 架构师：默认 omp + devin/claude-opus-5-5 + thinking medium；用户指定其他模型时按授权覆盖。
+  # 架构师：默认 omp + factory-droid/claude-opus-5-5 + thinking medium；用户指定其他模型时按授权覆盖。
   # 承担复杂度判定、独立方案评审、关键取舍、风险终审与最终验收；不编写技术方案。
   # 常规代码评审和回改由 code-review 承担。
   arch:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "devin/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
+    args: ["--config", "/Users/pengjiahui/.hwf/member-omp.yml", "--model", "factory-droid/claude-opus-5-5", "--thinking", "medium", "--approval-mode", "yolo"]
   # 技术方案编写（arch-lite）：所有技术方案的初稿、逐文件改动、回滚与验证表、评审回改。
   # 方案作者使用 codex + gpt-6-astra，思考强度 medium。
   # 不签发、不拍板、不评审自己的方案；编写会话不得兼任同一交付物的 precheck/arch/dev。
@@ -55,11 +56,11 @@ profiles:
   dev-be:
     kind: codex
     args: ["-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=medium", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
-  # 2026-11-12 用户指示：极简模式（见 PROTOCOL「极简模式」）的开发角色改用 droid + Opus 5.5 + 思考 low。
+  # 2026-11-12 用户指示：debug 模式（见 PROTOCOL「debug 模式」）的开发角色改用 droid + Opus 5.5 + 思考 low。
   # 交互式 droid 没有 --model 参数，模型与思考档写在 droid-dev-mini.json（sessionDefaultSettings）；
   # --auto high 是 droid 交互模式里最高的自主等级（允许所有命令）。
   # 新 worktree 不弹「信任此文件夹」依赖 ~/.factory/settings.json 已信任 ~/.herdr/worktrees。
-  # 非极简模式仍用上面的 dev / dev-fe / dev-be。
+  # 非 debug 模式仍用上面的 dev / dev-fe / dev-be。
   dev-mini:
     kind: droid
     args: ["--settings", "/Users/pengjiahui/.hwf/herdr/droid-dev-mini.json", "--auto", "high"]

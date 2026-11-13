@@ -14,7 +14,7 @@
 
 三类事件（只认 allowed_users 的操作；其他人的待办原样留着，不碰）：
   1. 指派：白名单用户把带开关标签的 issue 指派给本账号 → hwf run team-up 开一个对话模式的调度者（它不自己分析，
-     按用户点名派角色只读分析，没点名派 arch），用户发 `/go` 或明确说开工才进入交付流程（2026-10-30 用户指示）；`/go 极简`（或 `/go 极简模式`、`/go minimal`）是用户明确要求极简模式（只开发 + 提交 MR 到 release-<根编号>）。
+     按用户点名派角色只读分析，没点名派 arch），用户发 `/go` 或明确说开工才进入交付流程（2026-10-30 用户指示）；`/go debug`（或 `/go debug模式`、`/go 改bug`；旧叫法 `/go 极简`、`/go minimal` 仍可用）是用户明确要求 debug 模式（只开发 + 提交 MR 到 release-<根编号>）。
      issue 描述里可写 `/model <模型>`、`/thinking <强度>` 两行指定调度者参数。
      入口复用空闲调度者或新建一个，允许多个调度者并行，不必等在途交付结束。
      本账号自己指派（调度者拆出的子 issue）作者不在白名单，天然被忽略，不会重复发起。
@@ -74,8 +74,9 @@ QUIET, VERBOSE = "quiet", "verbose"
 NOTIFY_COMMANDS = {"/免打扰": QUIET, "/quiet": QUIET, "/详尽": VERBOSE, "/verbose": VERBOSE}
 NOTIFY_LABELS = {QUIET: ("免打扰", "之后只在每个步骤完成、整项交付完成和需要你处理时发消息"),
                  VERBOSE: ("详尽", "之后每个小阶段都会发消息")}
-# `/go` 后紧跟其中一个词 = 用户明确要求极简模式（只开发 + 提交 MR 到 release-<根编号>，见 PROTOCOL「极简模式」）。
-MINIMAL_WORDS = frozenset({"极简", "极简模式", "minimal"})
+# `/go` 后紧跟其中一个词 = 用户明确要求 debug 模式（只开发 + 提交 MR 到 release-<根编号>，见 PROTOCOL「debug 模式」）。
+# 「极简」「minimal」是改名前的旧叫法，保留兼容。前两个词连起来也认，覆盖「/go debug 模式」「/go 改 bug」。
+DEBUG_WORDS = frozenset({"debug", "debug模式", "改bug", "极简", "极简模式", "minimal"})
 # 发起 issue 的两种模式：对话 = 只读 + 评论答疑；交付 = 跑完整交付流程。指派后默认对话，/go 切到交付。
 CHAT, DELIVER = "chat", "deliver"
 CHAT_TAG = "【对话模式】"  # team-up 需求文本前缀，调度者据此只派人分析、不进入交付流程
@@ -322,18 +323,19 @@ class Inbox:
         return len(words) == 1 and words[0].lower() in commands
 
     def handle_go(self, url: str, repo: str, note: Mapping[str, Any], where: Mapping[str, Any]) -> bool:
-        """`/go [极简] [补充说明]`：从对话切到交付流程。非发起 issue 上直接把它登记为发起 issue 并开跑。"""
+        """`/go [debug|改bug] [补充说明]`：从对话切到交付流程。非发起 issue 上直接把它登记为发起 issue 并开跑。"""
         user = note["author"]["username"]
         rest = self.words(note["body"])[1:]
-        minimal = bool(rest) and rest[0].lower() in MINIMAL_WORDS
-        extra = " ".join(rest[1:] if minimal else rest)
+        used = 2 if len(rest) >= 2 and "".join(rest[:2]).lower() in DEBUG_WORDS else int(bool(rest) and rest[0].lower() in DEBUG_WORDS)
+        debug = used > 0
+        extra = " ".join(rest[used:])
         origin = self.state["origins"].get(url)
         if origin is not None and self.mode_of(url) == DELIVER:
             forwarded = bool(rest) and self.deliver(repo, url, self.message(url, note, True), DELIVER) is not None
             self.comment(where, f"@{user} 这个 issue 已经在交付流程中了。" + ("补充说明已转给调度者。" if forwarded else ""))
             return True
-        flow = ("用户明确要求极简模式：按 ~/.hwf/PROTOCOL.md「极简模式」领取 dev-mini 开发并提交 MR 到 release-<根编号>，不做复杂度判定"
-                if minimal else "按 ~/.hwf/PROTOCOL.md 从 §0 复杂度判定开始")
+        flow = ("用户明确要求 debug 模式：按 ~/.hwf/PROTOCOL.md「debug 模式」领取 dev-mini 开发并提交 MR 到 release-<根编号>，不做复杂度判定"
+                if debug else "按 ~/.hwf/PROTOCOL.md 从 §0 复杂度判定开始")
         go = (f"[GitLab 收件箱] 用户在 {url}#note_{note['id']} 发出 /go：从对话模式切换到交付流程，"
               f"{flow}交付这个 issue（发起人 @{user}）。"
               + (f"\n用户补充：{extra}" if extra else ""))
@@ -363,7 +365,7 @@ class Inbox:
             return False
         origin["mode"] = DELIVER
         save_state(self.state)
-        self.comment(where, f"@{user} 开始跑交付流程{'（极简模式：只开发并提交 MR 到 release-<根编号>，不评审不测试）' if minimal else ''}。{receipt}")
+        self.comment(where, f"@{user} 开始跑交付流程{'（debug 模式：只开发并提交 MR 到 release-<根编号>，不评审不测试）' if debug else ''}。{receipt}")
         return True
 
     def resume_stage(self, url: str, where: Mapping[str, Any]) -> str:

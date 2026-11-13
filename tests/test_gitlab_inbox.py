@@ -299,6 +299,42 @@ class InboxTests(unittest.TestCase):
         make(world, self.origin_state()).poll()
         self.assertEqual(world.resets, ["w1:p1"])
 
+    def test_quiet_command_records_mode_forwards_once_and_confirms(self) -> None:
+        state = self.origin_state()
+        world = FakeWorld([], notes=[note(6) | {"body": "/免打扰 @pjhagent"}])
+        make(world, state).poll()
+        self.assertEqual(state["origins"][URL]["notify"], "quiet")
+        self.assertEqual(len(world.prompts), 1)
+        self.assertIn("免打扰", world.prompts[0])
+        self.assertIn("不要再发确认评论", world.prompts[0])
+        self.assertEqual(len(world.comments), 1)
+        self.assertIn("已切到免打扰模式", world.comments[0])
+
+    def test_verbose_english_alias_switches_back(self) -> None:
+        state = self.origin_state()
+        state["origins"][URL]["notify"] = "quiet"
+        world = FakeWorld([], notes=[note(6) | {"body": "/VERBOSE"}])
+        make(world, state).poll()
+        self.assertEqual(state["origins"][URL]["notify"], "verbose")
+        self.assertIn("已切到详尽模式", world.comments[0])
+
+    def test_notify_command_without_delivery_only_replies(self) -> None:
+        world = FakeWorld([], notes=[note(6) | {"body": "/quiet"}], owners={})
+        make(world, self.origin_state()).poll()
+        self.assertEqual((world.prompts, world.launched), ([], []))
+        self.assertIn("没有对应的交付", world.comments[0])
+
+    def test_notify_retries_when_scheduler_rejects_prompt(self) -> None:
+        state = self.origin_state()
+        world = FakeWorld([], notes=[note(6) | {"body": "/详尽"}], prompt_rc=1)
+        make(world, state).poll()
+        self.assertEqual((world.comments, state["origins"][URL]["last_note_id"]), ([], 5))
+        self.assertNotIn("notify", state["origins"][URL])
+
+    def test_notify_word_inside_sentence_is_a_normal_message(self) -> None:
+        world = FakeWorld([], notes=[note(6) | {"body": "/免打扰 先别发了"}])
+        make(world, self.origin_state()).poll()
+        self.assertIn("/免打扰 先别发了", world.prompts[0])
     def test_reset_command_with_other_words_is_a_normal_message(self) -> None:
         world = FakeWorld([], notes=[note(6) | {"body": "/new 然后继续"}])
         make(world, self.origin_state()).poll()

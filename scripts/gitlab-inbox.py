@@ -22,6 +22,8 @@
   2. 发起 issue 的新评论（不要求 @）→ 转交调度者，这是用户回复调度者提问的通道。
      评论正文只有 `/new` 或 `/clear` 时是清空指令：收件箱让该调度者开新会话，再让它按 INDEX/STATE 接续本任务。
      任何 issue 里只有 `/status` 的评论由收件箱直接回复进度，不打扰调度者。
+     只有 `/免打扰`（`/quiet`）或 `/详尽`（`/verbose`）的评论切换本交付的通知模式：转给调度者记入 STATE，
+     收件箱回一条确认，调度者不再另发确认评论。
   每条转交的评论都会立即得到回执（转给谁、它在不在干活、在做什么）；调度者卡在确认界面时在发起 issue @发起人一次。
   卡住时能读出界面上的单选题，就把题目和编号选项贴出来；发起人回复一个数字（如 `1`、`选 2`），收件箱核对界面
   没变后替他按键选中，并回帖结果（2026-11-03 用户指示：不在电脑旁也能在飞书里作答）。
@@ -65,6 +67,11 @@ LAUNCH_COOLDOWN_S = 600
 RESET_COMMANDS = frozenset({"/new", "/clear"})
 STATUS_COMMANDS = frozenset({"/status"})
 GO_COMMANDS = frozenset({"/go"})
+# 通知模式（见 PROTOCOL「通知模式」）：免打扰 = 只在大步骤完成和需要用户处理时发评论；详尽 = 每个小阶段都发。
+QUIET, VERBOSE = "quiet", "verbose"
+NOTIFY_COMMANDS = {"/免打扰": QUIET, "/quiet": QUIET, "/详尽": VERBOSE, "/verbose": VERBOSE}
+NOTIFY_LABELS = {QUIET: ("免打扰", "之后只在每个步骤完成、整项交付完成和需要你处理时发消息"),
+                 VERBOSE: ("详尽", "之后每个小阶段都会发消息")}
 # `/go` 后紧跟其中一个词 = 用户明确要求极简模式（只开发 + 提交 MR 到 release-<根编号>，见 PROTOCOL「极简模式」）。
 MINIMAL_WORDS = frozenset({"极简", "极简模式", "minimal"})
 # 发起 issue 的两种模式：对话 = 只读 + 评论答疑；交付 = 跑完整交付流程。指派后默认对话，/go 切到交付。
@@ -277,6 +284,29 @@ class Inbox:
                              "它会按任务记录接着做。")
         return True
 
+    def handle_notify(self, url: str, repo: str, note: Mapping[str, Any], where: Mapping[str, Any]) -> bool:
+        """`/免打扰`、`/详尽`：切换本交付的通知模式；返回 False 表示下一轮重试。"""
+        user = note["author"]["username"]
+        command = self.words(note["body"])[0].lower()
+        mode = NOTIFY_COMMANDS[command]
+        label, effect = NOTIFY_LABELS[mode]
+        task, _ = self.owner(repo, url)
+        if task is None:
+            self.comment(where, f"@{user} 这个 issue 现在没有对应的交付，开工后再发 {command}。")
+            return True
+        text = (f"[GitLab 收件箱] 用户在 {url}#note_{note['id']} 发出 {command}：把本交付的通知模式切换为「{label}」，"
+                "写进 STATE 顶部「通知模式」（附该 note 链接），之后按 ~/.hwf/PROTOCOL.md「通知模式」执行。"
+                "收件箱已在 issue 回复确认，你不要再发确认评论。")
+        receipt = self.deliver(repo, url, text, self.mode_of(url))
+        if receipt is None:
+            return False
+        origin = self.state["origins"].get(url)
+        if origin is not None:
+            origin["notify"] = mode
+            save_state(self.state)
+        self.comment(where, f"@{user} 已切到{label}模式，{effect}。{receipt}")
+        return True
+
     def words(self, body: str) -> list[str]:
         """正文去掉 @本账号 后的词（用户常顺手 @ 一下）。"""
         return [w for w in body.split() if w.lower() != f"@{self.me}".lower()]
@@ -354,6 +384,8 @@ class Inbox:
             return self.handle_go(url, repo, note, where)
         if origin is not None and self.is_command(note["body"], RESET_COMMANDS):
             return self.handle_reset(url, origin, note)
+        if self.is_command(note["body"], frozenset(NOTIFY_COMMANDS)):
+            return self.handle_notify(url, repo, note, where)
         receipt = self.deliver(repo, url, self.message(url, note, origin is not None), self.mode_of(url))
         if receipt is None:
             return False

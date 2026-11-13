@@ -28,6 +28,7 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime
 from typing import Any, Mapping, Optional
 from urllib.parse import quote
 
@@ -42,7 +43,10 @@ RECEIPT = re.compile(r"^(@\S+\s+)?已收到")  # 收件箱回执，不转达
 FOLDED = re.compile(r"<details>.*?</details>", re.S)
 BARE_ISSUE = re.compile(r"(?<![\[\w/&])#(\d+)(?!\d)")  # 已在链接里的「[#12]」、网址里的不算
 WAITING_LABEL = "状态:等你处理"
-URGENT_LABELS = (WAITING_LABEL, "状态:待上线")  # 免打扰下也马上转：要用户处理、整项做完等合并
+SHIP_LABEL = "状态:待上线"
+URGENT_LABELS = (WAITING_LABEL, SHIP_LABEL)  # 免打扰下也马上转：要用户处理、整项做完等合并
+SHIP_ASK_GRACE_S = 15 * 60  # 调度者常先发「请授权合并」再改标签，往前放宽这么久都算
+LABEL_EVENT_PAGES = 5
 HELD_LINE_CAP = 80
 ASK_LINE = re.compile(r"^\s*转给\s*#(\d+)\s*[:：]\s*(.+)", re.S)  # 模型要替用户传话时的格式
 NOTES_PER_ISSUE = 3
@@ -78,6 +82,14 @@ def _load(name: str, file: str) -> Any:
 
 
 _FS: Any = None
+
+
+def _ts(value: Any) -> float:
+    """GitLab 时间（2026-11-12T10:00:00.000+08:00 / …Z）转成秒；认不出就当 0。"""
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def find_scheduler() -> Any:
@@ -284,6 +296,8 @@ class Secretary:
                 parts.append("你已回复，等调度者接着处理")
             else:
                 alerts.append("等你处理")
+        if SHIP_LABEL in labels and info.get("state") == "opened" and self.ship_not_requested(issue, info):
+            alerts.append("已待上线，但调度者没 @你 请求授权合并")
         owner = self.owner(issue.get("repo") or "", url)
         if owner.get("task"):
             pane = owner.get("live_pane")
@@ -309,6 +323,38 @@ class Secretary:
                 continue
             return (n.get("author") or {}).get("username") != self.bridge.agent
         return False
+
+    def ship_not_requested(self, issue: Mapping[str, Any], info: Mapping[str, Any]) -> bool:
+        """打上「待上线」后，调度者没有发过 @用户 的评论（请授权合并）：用户收不到通知，MR 就一直晾着。
+        用户已经在后面说过话的不算（球在调度者那边）；查不到标签记录时不报，免得误报。"""
+        if self.user_spoke_last(issue):
+            return False
+        pid = quote(issue["project"], safe="")
+        added = 0.0
+        for page in range(1, LABEL_EVENT_PAGES + 1):
+            try:
+                events = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}/resource_label_events?per_page=100&page={page}")
+            except Exception:
+                return False
+            for e in events or []:
+                if e.get("action") == "add" and (e.get("label") or {}).get("name") == SHIP_LABEL:
+                    added = max(added, _ts(e.get("created_at")))
+            if len(events or []) < 100:
+                break
+        if not added:
+            return False
+        people = {u for u in self.bridge.users.values() if u} | {(info.get("author") or {}).get("username") or ""}
+        people -= {"", self.bridge.agent}
+        mention = re.compile("|".join(rf"@{re.escape(p)}(?![\w.-])" for p in sorted(people))) if people else None
+        notes = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
+        for n in notes:
+            if n.get("system") or (n.get("author") or {}).get("username") != self.bridge.agent:
+                continue
+            if _ts(n.get("created_at")) < added - SHIP_ASK_GRACE_S:
+                break
+            if mention and mention.search(n.get("body") or ""):
+                return False
+        return True
 
     def owner(self, repo: str, url: str) -> dict[str, Any]:
         if not repo:

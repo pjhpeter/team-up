@@ -69,7 +69,9 @@ HERDR_SYNTAX_EXIT = 2  # herdr CLI 用 2 表示参数/语法错误，通常是 C
 
 LIST_TIMEOUT_S = 10
 CELL_SPLIT = re.compile(r"(?<!\\)\|")  # INDEX 输入原文里的 | 写作 \|。
-TICKED = re.compile(r"`([^`]+)`")
+# 调度者有时漏写反引号（2026-11-15 #483：整行没加，收件箱找不到负责人），所以任务标识与登记名都不依赖反引号。
+TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # 表头「任务标识」和分隔行 `---` 都不匹配。
+SCHEDULER_NAME = re.compile(rf"{re.escape(NAME_PREFIX)}[A-Za-z0-9_-]+")
 ISSUE_URL = re.compile(r"https?://[^/]+/(?P<project>.+?)/-/(?:issues|work_items)/(?P<iid>\d+)")
 
 
@@ -91,14 +93,29 @@ def read_index(repo: str) -> list[IndexRow]:
         return []
     rows: list[IndexRow] = []
     for line in path.read_text().splitlines():
-        if not line.startswith("| `"):
+        cells = index_cells(line)
+        if cells is None or len(cells) < 5:
             continue
-        cells = [cell.strip() for cell in CELL_SPLIT.split(line)]
-        if len(cells) < 5:
-            continue
-        names = [n for n in TICKED.findall(cells[3]) if n.startswith(NAME_PREFIX)]
-        rows.append(IndexRow(cells[1].strip("`"), names[0] if names else "", cells[4]))
+        names = scheduler_names(cells[3])
+        rows.append(IndexRow(task_of(cells), names[0] if names else "", cells[4].strip()))
     return rows
+
+
+def index_cells(line: str) -> list[str] | None:
+    """INDEX 任务行按列切开（保留原始空白，供原样回写）；表头、分隔行和非表格行返回 None。"""
+    if not line.startswith("|"):
+        return None
+    cells = CELL_SPLIT.split(line)
+    return cells if len(cells) > 1 and TASK_ID.fullmatch(task_of(cells)) else None
+
+
+def task_of(cells: Sequence[str]) -> str:
+    return cells[1].strip().strip("`")
+
+
+def scheduler_names(cell: str) -> list[str]:
+    """调度者列里的登记名，按出现顺序。"""
+    return SCHEDULER_NAME.findall(cell)
 
 
 def open_origin_tasks(repo: str) -> frozenset[str]:

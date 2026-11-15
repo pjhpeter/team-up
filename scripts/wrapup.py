@@ -461,8 +461,12 @@ def write_index_status(repo: str, task: str, scheduler: str, status: str) -> Non
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i]
         parts = _FS.index_cells(line)
-        if parts is None or len(parts) < 6 or _FS.task_of(parts) != task:
+        # 读的一侧（read_index）认 5 段，这里也得认：2026-11-15 #483 手写的行末尾少了「 |」，
+        # 能找到负责人却改不了状态，收尾停在最后一步。
+        if parts is None or len(parts) < 5 or _FS.task_of(parts) != task:
             continue
+        if len(parts) == 5:
+            parts.append("\n" if line.endswith("\n") else "")
         if scheduler not in _FS.scheduler_names(parts[3]):
             raise WrapupError(f"INDEX 里 {task} 的调度者不是 {scheduler}，不改")
         parts[4] = cell

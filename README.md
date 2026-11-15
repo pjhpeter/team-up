@@ -24,8 +24,9 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `herdr/config.yaml` | 各角色用什么工具、什么模型（install.sh 把 Herdr 插件配置链接到这里） |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
+| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
+| `omp-extensions/` | omp 扩展：调度者手改 INDEX 或直接用 glab 发 issue 评论时拦下，要求改用 `task-record.py`（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
 | `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔；`proactive` 段是主动接活用的模型 |
 | `proactive-rules.md` | 主动接活的规则：什么情况 → 做什么，每条规则单独一档 |

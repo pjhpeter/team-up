@@ -6,6 +6,7 @@
     task-record.py state-set --repo <主仓库> --task <任务标识> --field <字段> --value <内容>
     task-record.py note      --repo <主仓库> --task <任务标识> --issue <issue URL> --kind <类别> --body-file <文件> [--will …]
     task-record.py preflight --will <动作>...
+    task-record.py card-check --file <arch 判定落盘文件>
 
 为什么有它：
 - 2026-11-15 #483：调度者手写 INDEX 行没加反引号，收件箱找不到负责人，用户的回复晚到约 7 分钟。
@@ -24,6 +25,9 @@ todo（要用户处理或授权）必须用 --will 写明用户同意后本账�
 发出后回读，并把链接写进 STATE 顶部「最近用户通知」和 <任务目录>/notes.jsonl。
 
 退出码：0 成功；1 失败；2 参数错误；3 按规则没发（免打扰拦下、重复、自查不通过）。
+
+card-check：核对 arch 的 §0 判定里有没有写全「需求理解卡」（现状带 file:line、历史与坑不为空、验收条件每条写了证据）。
+2026-11-15 用户同意：编码前对项目了解不够、验收太粗；只写进协议的要求聊几句就忘，所以由脚本拦。缺项时退出码 3。
 """
 
 from __future__ import annotations
@@ -235,6 +239,54 @@ def preflight(wills: Sequence[str]) -> list[tuple[str, str]]:
     return [check(will) for will in wills if will != "none"]
 
 
+# ---------- 需求理解卡 ----------
+
+CARD_FIELDS = ("复杂度判定", "先出方案", "防风险", "理由", "依据", "现状", "历史与坑", "验收条件",
+               "关键决定", "接口约定", "待澄清问题")
+FIELD_LINE = re.compile(rf"^[#>*\s]*({'|'.join(CARD_FIELDS)})\**\s*(?:[:：]\s*\**\s*(.*))?$")
+FILE_LINE = re.compile(r"[\w./-]+\.\w+:\d+")
+ITEM = re.compile(r"^(?:[-*]|\d+[.、)])\s+")
+EVIDENCE = re.compile(r"证据\**\s*[:：]\s*\**\s*\S")
+
+
+def card_sections(text: str) -> dict[str, str]:
+    """按字段名切开 arch 的判定；字段名可以是「现状：…」一行，也可以是小标题或加粗。"""
+    sections: dict[str, list[str]] = {}
+    current: Optional[str] = None
+    for line in text.splitlines():
+        match = FIELD_LINE.match(line)
+        if match:
+            current = match.group(1)
+            sections[current] = [match.group(2) or ""]
+        elif line.lstrip().startswith("#"):
+            current = None
+        elif current:
+            sections[current].append(line)
+    return {name: "\n".join(lines).strip() for name, lines in sections.items()}
+
+
+def card_check(text: str) -> list[str]:
+    """返回缺项清单；空列表表示需求理解卡写全了。"""
+    sections = card_sections(text)
+    problems = []
+    if not FILE_LINE.search(sections.get("现状", "")):
+        problems.append("「现状」缺失或没有 file:line 依据")
+    if not sections.get("历史与坑"):
+        problems.append("「历史与坑」缺失或是空的（没有相关记录也要写明查了什么）")
+    items: list[str] = []
+    for line in sections.get("验收条件", "").splitlines():
+        if ITEM.match(line):
+            items.append(line)
+        elif items and line.strip():
+            items[-1] += "\n" + line
+    if not items:
+        problems.append("「验收条件」缺失或不是编号列表")
+    for number, item in enumerate(items, 1):
+        if not EVIDENCE.search(item):
+            problems.append(f"验收条件第 {number} 条没写「证据：<怎么证明>」：{item.splitlines()[0][:60]}")
+    return problems
+
+
 # ---------- 评论 ----------
 
 def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequence[str]) -> tuple[int, str]:
@@ -293,6 +345,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     post.add_argument("--will", action="append", default=[])
     pre = sub.add_parser("preflight")
     pre.add_argument("--will", action="append", required=True)
+    card = sub.add_parser("card-check")
+    card.add_argument("--file", required=True, help="arch §0 判定的落盘文件")
     opts = parser.parse_args(argv)
     try:
         if opts.command == "index-add":
@@ -308,6 +362,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               Path(opts.body_file).read_text(encoding="utf-8"), opts.will)
             print(text)
             return code
+        elif opts.command == "card-check":
+            problems = card_check(Path(opts.file).read_text(encoding="utf-8"))
+            for problem in problems:
+                print(f"缺：{problem}")
+            if problems:
+                return EXIT_HELD
+            print("需求理解卡齐全，验收条件：")
+            print(card_sections(Path(opts.file).read_text(encoding="utf-8"))["验收条件"])
         else:
             results = preflight(opts.will)
             for verdict, text in results:

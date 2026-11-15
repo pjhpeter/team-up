@@ -153,5 +153,53 @@ class NoteTests(Case):
         self.assertIn("读不到", self.glab.posted[-1])
 
 
+CARD = """## 给用户的摘要
+直达路径。
+
+## 完整内容
+复杂度判定：直达路径
+
+### 现状
+- 入口在 src/views/Foo.vue:12，复用 useBar（src/composables/useBar.ts:40）
+
+**历史与坑：**
+- 已查 git log、关联 issue、记忆库，无相关记录
+
+**验收条件**
+1. 宽 1200px 时工具栏不换行 ｜ 证据：该宽度下的页面截图
+2. 保存失败时出现重试按钮
+   ｜ **证据：** 断网后点击保存的截图
+
+关键决定：无
+"""
+
+
+class CardCheckTests(unittest.TestCase):
+    def test_complete_card_passes(self) -> None:
+        self.assertEqual(TR.card_check(CARD), [])
+
+    def test_acceptance_without_evidence_is_reported_by_number(self) -> None:
+        problems = TR.card_check(CARD.replace(" ｜ 证据：该宽度下的页面截图", ""))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("第 1 条", problems[0])
+
+    def test_old_style_verdict_without_card_is_held(self) -> None:
+        old = "复杂度判定：直达路径\n理由：小改动\n依据：src/a.ts:3\n关键决定：无\n"
+        self.assertEqual(len(TR.card_check(old)), 3)
+
+    def test_status_quo_needs_file_line(self) -> None:
+        problems = TR.card_check(CARD.replace("src/views/Foo.vue:12", "Foo 页面").replace("（src/composables/useBar.ts:40）", ""))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("现状", problems[0])
+
+    def test_command_exit_code(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "verdict.md"
+            path.write_text(CARD, encoding="utf-8")
+            self.assertEqual(TR.main(["card-check", "--file", str(path)]), TR.EXIT_OK)
+            path.write_text("复杂度判定：直达路径\n", encoding="utf-8")
+            self.assertEqual(TR.main(["card-check", "--file", str(path)]), TR.EXIT_HELD)
+
+
 if __name__ == "__main__":
     unittest.main()

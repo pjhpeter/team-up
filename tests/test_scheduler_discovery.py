@@ -296,6 +296,13 @@ class OwnerTests(CleanRepo):
         write_index([("frontend-web-v1-7", "delivery-scheduler-w9-p2", "in-progress")])
         self.assertEqual(self.owner(7), {"task": "frontend-web-v1-7", "pane": "w9:p2"})
 
+    def test_row_without_backticks_still_routes_to_its_scheduler(self) -> None:
+        # 2026-11-15 #483：调度者整行没加反引号，收件箱认不出负责人，评论改走入口被冷却拖住。
+        write_index([])
+        with (Path(ROOT) / ".hwf/tmp/INDEX.md").open("a") as index:
+            index.write("| frontend-web-v1-7 | 需求 | delivery-scheduler-w9-p2 / w9:p2 | blocked-user |\n")
+        self.assertEqual(self.owner(7), {"task": "frontend-web-v1-7", "pane": "w9:p2"})
+
     def test_child_issue_maps_through_state(self) -> None:
         write_index([("frontend-web-v1-7", "delivery-scheduler-w9-p2", "in-progress")],
                     states={"frontend-web-v1-7": "子 issue #70；上线清单 https://git.example/frontend/web-v1/-/work_items/71"})

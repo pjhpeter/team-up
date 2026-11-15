@@ -459,12 +459,10 @@ def write_index_status(repo: str, task: str, scheduler: str, status: str) -> Non
     cell = " " + status.replace("\n", " ").replace("|", "\\|") + " "
     for i in range(len(lines) - 1, -1, -1):
         line = lines[i]
-        if not line.startswith("| `"):
+        parts = _FS.index_cells(line)
+        if parts is None or len(parts) < 6 or _FS.task_of(parts) != task:
             continue
-        parts = _FS.CELL_SPLIT.split(line)
-        if len(parts) < 6 or parts[1].strip().strip("`") != task:
-            continue
-        if scheduler not in _FS.TICKED.findall(parts[3]):
+        if scheduler not in _FS.scheduler_names(parts[3]):
             raise WrapupError(f"INDEX 里 {task} 的调度者不是 {scheduler}，不改")
         parts[4] = cell
         lines[i] = "|".join(parts)

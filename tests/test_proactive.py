@@ -295,6 +295,23 @@ class ScoutTest(unittest.TestCase):
         self.assertEqual(len(self.w.prompts), 1)  # 引用回复没被拆成另一段
         self.assertIn("（引用：昨天说的 PDF 那个问题）我这也是", self.w.prompts[0])
 
+    def test_feishu_message_handed_to_agent_is_tagged_in_batch_and_context(self) -> None:
+        self.w.judge = hits()
+        self.feishu("m1", "头像没更新", self.t - 120)
+        self.feishu("m2", "管理员看不到全部团队", self.t - 60)
+        P.append_feishu_queue({"handled": "m1", "chat": "oc_g", "iid": 480}, self.files)
+        self.t += 300
+        self.scout.tick()
+        self.assertIn("头像没更新〔已交给 Agent 处理：#480〕", self.w.prompts[0])
+        self.assertNotIn("全部团队〔", self.w.prompts[0])
+        P.append_feishu_queue({"handled": "m2", "chat": "oc_g", "iid": 479}, self.files)  # 判过之后才交出去
+        self.feishu("m3", "还有别的吗", self.t)
+        self.t += 301
+        self.scout.tick()
+        self.assertIn("[上文]", self.w.prompts[1])
+        self.assertIn("管理员看不到全部团队〔已交给 Agent 处理：#479〕", self.w.prompts[1])
+        self.assertEqual(len(self.records()), 2)  # 记号本身不单独成事件
+
     def test_feishu_images_go_to_model_capped_and_missing_skipped(self) -> None:
         self.w.judge = hits("R2")
         pics = []

@@ -508,6 +508,20 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(rows[1]["quote"], "")  # 话题里不额外取
         self.assertEqual(self.w.replies, [])
 
+    def test_observe_skips_linked_thread_and_marks_replied_message_handled(self) -> None:
+        self.b.observe_chats = {"oc_g": "研发小分队"}
+        bot = [{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]
+        self.b.handle(msg("om_bug", "头像没更新", sender="ou_other", chat="oc_g", chat_type="group"))
+        self.b.handle(msg("om_req", "@交付助手-试点 需求：处理这个问题", chat="oc_g", chat_type="group", mentions=bot,
+                          root="om_bug", reply_to="om_bug"))
+        tid = next(iter(self.state["thread_ids"]))
+        self.b.handle(msg("om_go", "同意", chat="oc_g", chat_type="group", root="om_bug", thread=tid))
+        self.b.handle(msg("om_other", "话题外另一件事", sender="ou_other", chat="oc_g", chat_type="group"))
+        rows = self.observed()
+        self.assertEqual([r.get("mid") for r in rows if "mid" in r], ["om_bug", "om_other"])  # 话题里跟 Agent 的对话不进观察
+        iid = self.state["threads"]["om_req"]["iid"]
+        self.assertEqual([r for r in rows if "handled" in r], [{"handled": "om_bug", "chat": "oc_g", "iid": iid}])
+
     def test_catch_up_observes_group_history_but_skips_other_groups(self) -> None:
         self.b.observe_chats = {"oc_g": "研发小分队"}
         self.state["chats"] = {"oc_g": 1, "oc_x": 1}

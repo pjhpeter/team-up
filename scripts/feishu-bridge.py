@@ -371,8 +371,10 @@ class Bridge:
             return  # 机器人（含自己）发的不处理，避免来回刷屏
         mentioned = any(map(self.is_bot_mention, msg.get("mentions") or []))
         user = self.users.get(msg.get("sender_id", ""))
-        if msg.get("chat_type") == "group" and chat in self.observe_chats and not (mentioned and user):
-            # 观察群：白名单的人 @ 机器人是明确指令，照常处理；其余消息（含同事 @ 机器人）交给主动接活去判断
+        if msg.get("chat_type") == "group" and chat in self.observe_chats and not (mentioned and user) \
+                and not self.in_linked_thread(msg):
+            # 观察群：白名单的人 @ 机器人是明确指令，照常处理；其余消息（含同事 @ 机器人）交给主动接活去判断。
+            # 已关联 issue 的话题里是在跟 Agent 说话，那件事已经有人管了，不进观察
             self.observe(msg)
         if msg.get("chat_type") == "group" and not mentioned:
             # 应用开了「获取群组中所有消息」权限后，群里每句话都会推过来；没 @ 机器人的不是对它说的，
@@ -455,6 +457,22 @@ class Bridge:
             elif key:
                 text = text.replace(key, f"@{name}")
         return text.strip()
+
+    def in_linked_thread(self, msg: dict[str, Any]) -> bool:
+        """这条消息在已关联 issue 的话题里：是跟 Agent 的对话，不是群里没人管的事。"""
+        root = msg.get("root_id") or ""
+        return msg.get("thread_id") in self.state["thread_ids"] or (
+            root != msg["message_id"] and root in self.state["threads"])
+
+    def mark_handled(self, msg: Optional[dict[str, Any]], chat: str, iid: int) -> None:
+        """在观察群里回复某句话建单或关联 issue：告诉主动接活那句话已经交给 Agent，别再记成「本来会接」。"""
+        if not msg or chat not in self.observe_chats:
+            return
+        for target in {msg.get("root_id") or "", msg.get("reply_to") or ""} - {"", msg["message_id"]}:
+            try:
+                proactive_module().append_feishu_queue({"handled": target, "chat": chat, "iid": iid})
+            except OSError as e:
+                log(f"mark handled {target} failed: {e}")
 
     def observe(self, msg: dict[str, Any]) -> None:
         """观察群里的一条消息进主动接活队列：只写本机文件，不回复、不碰 GitLab；写失败只记日志。"""
@@ -583,6 +601,7 @@ class Bridge:
                         "Agent 会先只读分析，结论会回到这个话题；在这里回复「/go」或说「开工」才正式交付。",
                    f"created-{mid}")
         self.link_thread(mid, mid)
+        self.mark_handled(msg, chat, iid)
         log(f"created {self.project}#{iid} from {mid} by {user}")
 
     def bind(self, mid: str, chat: str, iid: int, rest: str, user: str,
@@ -607,6 +626,7 @@ class Bridge:
         self.reply(mid, f"已关联 [#{iid}]({self.issue_url(self.project, iid)})：{issue['title']}\n"
                         "之后在这个话题里回复会同步成评论，issue 里的新评论也会发到这里。", f"bound-{mid}")
         self.link_thread(mid, mid)
+        self.mark_handled(msg, chat, iid)
         log(f"bound {mid} → {self.project}#{iid} by {user}")
 
     def follow_up(self, root: str, msg: dict[str, Any], text: str) -> None:

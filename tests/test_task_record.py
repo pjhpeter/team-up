@@ -94,6 +94,15 @@ class IndexTests(Case):
         row = TR._FS.read_index(self.repo)[-1]
         self.assertEqual((row.task, row.scheduler, row.open), (TASK, "", True))
 
+    def test_status_change_repairs_row_missing_trailing_pipe(self) -> None:
+        # 2026-11-15 #483：手写的行末尾少了「 |」，index-set 和 wrapup 都报找不到行。
+        path = Path(self.repo) / TR._FS.INDEX_RELATIVE
+        path.parent.mkdir(parents=True)
+        path.write_text(f"| `{TASK}` | 需求 | `{SCHED}` / `w1:pS` | blocked：等用户。\n", encoding="utf-8")
+        TR.index_set(self.repo, TASK, "in-progress", None)
+        self.assertEqual(path.read_text(encoding="utf-8"),
+                         f"| `{TASK}` | 需求 | `{SCHED}` / `w1:pS` | in-progress |\n")
+
 
 class StateTests(Case):
     def test_top_block_keeps_existing_body_and_other_fields(self) -> None:

@@ -7,7 +7,7 @@
 分工（2026-11-02 用户指示，方案 A：每人一个飞书应用，桥跑在自己电脑上）：
   飞书 → GitLab：本脚本（收消息、建 issue、把话题回复写成 issue 评论）
   GitLab → Agent：原有的 gitlab-inbox.py（不改）
-  GitLab → 飞书：本脚本轮询已关联 issue 的新评论，回帖到对应飞书话题
+  GitLab → 飞书：轮询新评论；私聊统一由秘书通知，群聊保留原话题回复
 桥只做搬运，以后推广到公司时可整体挪到一台常开的机器上。
 
 飞书里怎么用（只认 users 白名单里的人）：
@@ -29,6 +29,8 @@
   可选：gitlab_host（默认取 gitlab-inbox.config.json 的 host）、agent_account（默认 glab 当前账号）、
         label（默认 herdr-auto）、poll_seconds（默认 15）。
 状态：~/.hwf/state/feishu-bridge.json。
+恢复：启动、消息连接恢复后自动补读；运行时每分钟查漏。只查上次读完之后的消息，按消息 ID 去重。
+电脑休眠期间不能实时收信，醒来后补收；补收会照常执行积压指令。
 """
 
 from __future__ import annotations
@@ -62,6 +64,8 @@ MEDIA_DIR = HWF_HOME / "state" / "feishu-media"  # 飞书图片/文件下载的�
 CMD_TIMEOUT_S = 60
 TRANSFER_TIMEOUT_S = 300  # 下载/上传附件可能是几十 MB 的文件，单独放宽
 SEEN_CAP = 2000
+HISTORY_POLL_S = 60
+HISTORY_OVERLAP_MS = 120_000  # 历史接口时间只精确到分钟，重读边界以免漏掉同一分钟的消息
 HELP_COOLDOWN_S = 600
 NOTE_RETRIES = 3  # 一条评论连续发送失败几次后改发 GitLab 链接
 FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
@@ -185,12 +189,17 @@ class Bridge:
         state.setdefault("threads", {})      # 话题根消息 id → {project, iid, chat_id, last_note, closed}
         state.setdefault("seen", [])         # 已处理的飞书消息 id
         state.setdefault("posted_notes", []) # 桥自己发到 GitLab 的评论 id（不再搬回飞书）
-        state.setdefault("chats", {})        # chat_id → 上次看到消息的时间戳（毫秒），补漏用
+        state.setdefault("chats", {})        # chat_id → 上次看到消息的时间戳（毫秒）
+        # 实时收到新消息不代表之前的历史已读完，两种进度必须分开。
+        state.setdefault("history_cursors", {f"chat:{chat}": ms for chat, ms in state["chats"].items()})
+        state.setdefault("history_seen", {})  # chat_id → 尚在补读窗口内的消息 ID/时间，不能被 SEEN_CAP 淘汰
         state.setdefault("help_sent", {})    # chat_id → 上次发用法说明的时间戳（秒）
         state.setdefault("group_chats", [])  # 收到过群消息的 chat_id（补漏时群里只处理 @ 机器人的）
         state.setdefault("thread_ids", {})   # 飞书话题 thread_id → threads 的键（话题里任何一条消息都带 thread_id）
         state.setdefault("pending_images", {})  # chat_id → [{mid, key, kind, name, ts}] 单独发、还没用上的图片/文件
         self._secretary: Any = None
+        self.history_requested = threading.Event()
+        self.next_history_poll = 0.0
 
     @property
     def secretary(self) -> Any:
@@ -313,8 +322,11 @@ class Bridge:
     # ---------- 飞书 → GitLab ----------
     def handle(self, msg: dict[str, Any]) -> None:
         """处理一条飞书消息（实时事件或补漏拉到的历史，字段已统一）。"""
-        mid = msg["message_id"]
-        if mid in self.state["seen"]:
+        mid, chat = msg["message_id"], msg.get("chat_id", "")
+        pending_seen = self.state["history_seen"].setdefault(chat, {})
+        already_seen = mid in self.state["seen"] or mid in pending_seen
+        pending_seen[mid] = int(msg.get("create_ms") or self.now() * 1000)
+        if already_seen:
             return
         self.state["seen"] = cap_list(self.state["seen"] + [mid])
         pending = list(self.state["pending_images"].get(msg.get("chat_id", ""), []))
@@ -346,6 +358,8 @@ class Bridge:
         mid = msg["message_id"]
         chat = msg.get("chat_id", "")
         if chat:
+            self.state["history_cursors"].setdefault(
+                f"chat:{chat}", self.state["chats"].get(chat, int(msg.get("create_ms") or self.now() * 1000)))
             self.state["chats"][chat] = max(int(msg.get("create_ms") or 0), self.state["chats"].get(chat, 0))
             if msg.get("chat_type") == "group" and chat not in self.state["group_chats"]:
                 self.state["group_chats"].append(chat)
@@ -622,6 +636,9 @@ class Bridge:
                 if len(batch) < 50 or any(n["id"] <= t.get("last_note", 0) for n in batch):
                     break
                 page += 1
+            private = t["chat_id"] == self.secretary.chat and t["chat_id"] not in self.state["group_chats"]
+            if private:
+                self.secretary.forward_private_notes(t, notes)
             for n in sorted(notes, key=lambda x: x["id"]):
                 if n["id"] <= t.get("last_note", 0):
                     continue
@@ -633,7 +650,8 @@ class Bridge:
             issue = self.api(f"projects/{pid}/issues/{t['iid']}")
             if issue["state"] == "closed":
                 t["closed"] = True
-                self.reply(root, f"#{t['iid']} 已关闭，这个话题不再同步。", f"gl-closed-{t['iid']}-{root[-12:]}")
+                if not private:
+                    self.reply(root, f"#{t['iid']} 已关闭，这个话题不再同步。", f"gl-closed-{t['iid']}-{root[-12:]}")
 
     def forward_note(self, root: str, t: dict[str, Any], n: dict[str, Any]) -> bool:
         """把一条 GitLab 评论发到飞书话题；成功（或已放弃）返回 True。幂等键保证重试不会重复发。"""
@@ -666,37 +684,83 @@ class Bridge:
         return f"**{who}**（[#{t['iid']}]({url})）：\n{body}"
 
     # ---------- 补漏 ----------
+    def poll_history(self) -> None:
+        """只由主循环调用；连接线程只发通知，不与实时消息并发写状态或发评论。"""
+        if not self.history_requested.is_set() and self.now() < self.next_history_poll:
+            return
+        self.history_requested.clear()  # 补读期间再重连，通知留给下一轮，不能在结束时清掉
+        try:
+            self.catch_up()
+        finally:
+            self.next_history_poll = self.now() + HISTORY_POLL_S
+
     def catch_up(self) -> None:
-        """重启后按聊天记录补上停机期间的消息；第一次运行只记水位，不回放旧消息。"""
-        # 群聊整段记录要额外权限，读不到就跳过该会话（话题里的回复仍按下面的话题补）；一个失败不影响其他
+        """增量补读已知聊天和未关闭话题；一个来源失败不推进它的进度，也不挡住其他来源。"""
+        until_ms = int(self.now()) * 1000
+        cursors = self.state["history_cursors"]
         for chat, last_ms in list(self.state["chats"].items()):
-            start = datetime.fromtimestamp(max(last_ms / 1000 - 120, 0)).astimezone().isoformat(timespec="seconds")
+            key = f"chat:{chat}"
+            since_ms = max(cursors.setdefault(key, last_ms) - HISTORY_OVERLAP_MS, 0) // 60_000 * 60_000
+            start = datetime.fromtimestamp(since_ms / 1000).astimezone().isoformat(timespec="seconds")
+            end = datetime.fromtimestamp(until_ms / 1000).astimezone().isoformat(timespec="seconds")
             try:
-                data = self.lark(["im", "+chat-messages-list", "--chat-id", chat, "--order", "asc",
-                                  "--no-reactions", "--start", start, "--page-all", "--page-limit", "5"])
-            except BridgeError as e:
+                self.read_history(["im", "+chat-messages-list", "--chat-id", chat, "--order", "asc",
+                                   "--start", start, "--end", end], chat)
+            except (BridgeError, KeyError, ValueError) as e:
                 log(f"catch-up skip chat {chat}: {e}")
                 continue
-            for item in (data.get("data") or {}).get("messages", []):
-                msg = normalize_history(item)
-                if chat in self.state["group_chats"]:
-                    msg["chat_type"] = "group"  # 历史记录不带会话类型，补上后由 dispatch 统一分流
-                    if chat not in self.observe_chats and not any(map(self.is_bot_mention, msg["mentions"])):
-                        continue  # 非观察群里没 @ 机器人的话不是对它说的
-                self.handle(msg)
+            cursors[key] = until_ms
+
+        # 话题接口不支持时间过滤：从最新一页向前读，遇到已覆盖的时间边界就停。
         roots = [(root, t["chat_id"]) for root, t in self.state["threads"].items() if not t.get("closed")]
-        for root, chat_id in roots:
+        for root, chat in roots:
+            key = f"thread:{root}"
+            since_ms = max(cursors.get(key, 0) - HISTORY_OVERLAP_MS, 0) // 60_000 * 60_000
             try:
-                data = self.lark(["im", "+threads-messages-list", "--thread", root, "--order", "asc",
-                                  "--no-reactions", "--page-all", "--page-limit", "5"])
-            except BridgeError as e:
+                self.read_history(["im", "+threads-messages-list", "--thread", root, "--order", "desc"],
+                                  chat, root, since_ms)
+            except (BridgeError, KeyError, ValueError) as e:
                 log(f"catch-up skip thread {root}: {e}")
                 continue
-            for item in (data.get("data") or {}).get("messages", []):
+            cursors[key] = until_ms
+
+        for chat, seen in self.state["history_seen"].items():
+            covered = [cursors.get(f"chat:{chat}", 0)]
+            covered.extend(cursors.get(f"thread:{root}", 0) for root, cid in roots if cid == chat)
+            cutoff = (min(covered) - HISTORY_OVERLAP_MS) // 60_000 * 60_000
+            self.state["history_seen"][chat] = {mid: ms for mid, ms in seen.items() if ms >= cutoff}
+
+    def read_history(self, args: list[str], chat: str, root: str = "", since_ms: int = 0) -> None:
+        """逐页读取，不把分页上限当作读完；话题倒序拉取、正序处理，保持指令先后顺序。"""
+        token = ""
+        used_tokens: set[str] = set()
+        replies: list[dict[str, Any]] = []
+        while True:
+            page_args = args + ["--no-reactions", "--page-size", "50"]
+            if token:
+                page_args += ["--page-token", token]
+            data = self.lark(page_args).get("data") or {}
+            reached_boundary = False
+            for item in data.get("messages", []):
                 msg = normalize_history(item, default_root=root)
-                if chat_id in self.state["group_chats"]:
+                msg["chat_id"] = chat
+                if root and 0 < msg["create_ms"] < since_ms:
+                    reached_boundary = True
+                    continue
+                if chat in self.state["group_chats"]:
                     msg["chat_type"] = "group"
-                self.handle(msg)
+                if root:
+                    replies.append(msg)
+                else:
+                    self.handle(msg)
+            if reached_boundary or not data.get("has_more"):
+                break
+            token = data.get("page_token") or ""
+            if not token or token in used_tokens:
+                raise BridgeError("history pagination did not advance")
+            used_tokens.add(token)
+        for msg in reversed(replies):
+            self.handle(msg)
 
 
 _PROACTIVE: Any = None
@@ -812,7 +876,17 @@ def stop_children(*_: Any) -> None:
     sys.exit(0)
 
 
-def consume_events(out: "queue.Queue[dict]") -> None:
+def read_event_status(lines: Any, history_requested: threading.Event) -> None:
+    """连接恢复只安排补读；实际补读仍在主线程执行，与消息处理共用去重状态。"""
+    for line in lines:
+        status = line.strip()
+        log(f"lark: {status}")
+        if (status == "[source] feishu-websocket: connected"
+                or status == "[event] ready event_key=im.message.receive_v1"):
+            history_requested.set()
+
+
+def consume_events(out: "queue.Queue[dict]", history_requested: threading.Event) -> None:
     """常驻 lark-cli event consume；stdin 保持不关（关了它会退出），挂了就退避重启。"""
     backoff = 5
     while True:
@@ -820,7 +894,7 @@ def consume_events(out: "queue.Queue[dict]") -> None:
         p = subprocess.Popen(["lark-cli", "event", "consume", "im.message.receive_v1", "--as", "bot"],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         CHILDREN.append(p)
-        threading.Thread(target=lambda: [log(f"lark: {l.rstrip()}") for l in p.stderr], daemon=True).start()
+        threading.Thread(target=read_event_status, args=(p.stderr, history_requested), daemon=True).start()
         for line in p.stdout:  # type: ignore[union-attr]
             line = line.strip()
             if line:
@@ -883,11 +957,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     topic_queue.consume()
     signal.signal(signal.SIGINT, stop_children)
     events: "queue.Queue[dict]" = queue.Queue()
-    threading.Thread(target=consume_events, args=(events,), daemon=True).start()
+    threading.Thread(target=consume_events, args=(events, bridge.history_requested), daemon=True).start()
     # 搬附件用的中转目录正常情况下用完即删；上次被强杀可能留下半截文件，启动时清空
     shutil.rmtree(MEDIA_DIR, ignore_errors=True)
     try:
-        bridge.catch_up()
+        bridge.poll_history()
     except BridgeError as e:
         log(f"catch-up failed: {e}")
     save_json(STATE_PATH, state)
@@ -903,6 +977,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         except (BridgeError, KeyError, ValueError) as err:
             log(f"handle failed: {err}")
             save_json(STATE_PATH, state)
+        try:
+            bridge.poll_history()
+        except (BridgeError, KeyError, ValueError) as err:
+            log(f"catch-up failed: {err}")
         if time.time() >= next_poll:
             next_poll = time.time() + poll
             try:

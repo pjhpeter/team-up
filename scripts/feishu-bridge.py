@@ -198,6 +198,7 @@ class Bridge:
         state.setdefault("thread_ids", {})   # 飞书话题 thread_id → threads 的键（话题里任何一条消息都带 thread_id）
         state.setdefault("pending_images", {})  # chat_id → [{mid, key, kind, name, ts}] 单独发、还没用上的图片/文件
         self._secretary: Any = None
+        self.delivered: Optional[dict[str, Any]] = None  # 处理当前这条消息时已代用户写进评论的 issue（project、iid）
         self.history_requested = threading.Event()
         self.next_history_poll = 0.0
 
@@ -330,6 +331,7 @@ class Bridge:
             return
         self.state["seen"] = cap_list(self.state["seen"] + [mid])
         pending = list(self.state["pending_images"].get(msg.get("chat_id", ""), []))
+        self.delivered = None
         try:
             self.dispatch(msg)
         except Exception as e:  # 消息已记为处理过，不会自动重试，无论什么错都要让发消息的人知道
@@ -337,9 +339,9 @@ class Bridge:
             self.report_failure(msg, pending)
 
     def report_failure(self, msg: dict[str, Any], pending: list[dict[str, Any]]) -> None:
-        """告诉发消息的人结果。话题已记录说明事情办成了，只是回帖失败，这时重发会多建一张单。"""
+        """告诉发消息的人结果。话题已记录或评论已写进 issue 说明事情办成了，只是回帖失败，这时重发会重复。"""
         mid, chat = msg["message_id"], msg.get("chat_id", "")
-        t = self.state["threads"].get(mid)
+        t = self.state["threads"].get(mid) or self.delivered
         if not t:  # 没办成：把单独发的附件放回去，重发时还能带上
             if pending:
                 self.state["pending_images"][chat] = pending
@@ -348,7 +350,9 @@ class Bridge:
         if msg.get("sender_type") != "user" or msg.get("sender_id") not in self.users:
             return
         text = f"[#{t['iid']}]({self.issue_url(t['project'], t['iid'])}) 已经弄好了，不用重发。" if t else FAILED_TEXT
-        in_thread = bool(t or msg.get("root_id") or msg.get("thread_id"))
+        # 主聊天区的引用回复也带 root_id（被引用那条），但不是话题；只有真在话题里才用话题回，否则会凭空开出一个话题
+        in_thread = bool(mid in self.state["threads"] or msg.get("thread_id")
+                         or msg.get("root_id") in self.state["threads"])
         try:
             self.reply(mid, text, f"failed-{mid}", in_thread=in_thread)
         except (BridgeError, ValueError) as e:
@@ -498,6 +502,7 @@ class Bridge:
         note = self.api(f"projects/{quote(project, safe='')}/issues/{iid}/notes", "POST",
                         {"body": body}, as_user=True)
         self.state["posted_notes"] = cap_list(self.state["posted_notes"] + [note["id"]])
+        self.delivered = {"project": project, "iid": iid}
         return note["id"]
 
     def issue_url(self, project: str, iid: int) -> str:

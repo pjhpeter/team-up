@@ -211,6 +211,19 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("已转给", self.w.replies[-1]["text"])
         self.assertFalse(self.w.replies[-1]["in_thread"])
 
+    def test_relayed_but_receipt_failed_says_no_need_to_resend_without_opening_topic(self) -> None:
+        self.waiting()
+        self.w.agent_note(7, "要你看一下")
+        self.sec.poll()
+        forwarded = list(self.state["secretary"]["msgs"])[0]
+        notes = sum(1 for w in self.w.writes if w[1].endswith("/issues/7/notes"))
+        self.w.reply_failures = 1  # 评论已写进 issue，只是「已转给」这条回执没发出去
+        self.b.handle(msg("om_u1", "好的", root=forwarded, reply_to=forwarded))  # 引用回复带 root_id，但不在话题里
+        self.assertEqual(sum(1 for w in self.w.writes if w[1].endswith("/issues/7/notes")), notes + 1)
+        self.assertIn("#7", self.w.replies[-1]["text"])
+        self.assertIn("不用重发", self.w.replies[-1]["text"])
+        self.assertFalse(self.w.replies[-1]["in_thread"])
+
     def test_thread_under_forwarded_message_also_relays(self) -> None:
         self.waiting()
         self.w.agent_note(7, "要你看一下")

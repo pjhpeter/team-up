@@ -101,7 +101,8 @@ WAITING_LABEL = "状态:等你处理"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")  # omp --thinking 可选值
 # 每次投递都把通知规则放回上下文，避免调度者只在首次启动时读过、续跑后忘记。
 NOTIFY_REMINDER = (
-    "\n[通知检查] 写 issue 评论前，先读 ~/.hwf/PROTOCOL.md「通知模式」的发送前核对与同一件事只说一次，"
+    "\n[通知检查] issue 评论只用 ~/.hwf/scripts/task-record.py note 发（请用户同意或授权时带 --will，脚本先自查做不做得了）；"
+    "发之前先读 ~/.hwf/PROTOCOL.md「通知模式」的发送前核对与同一件事只说一次，"
     "再对照本任务 STATE 的通知模式和最近用户通知。未记录模式时按免打扰；"
     "本条若是用户切换通知模式的指令，先应用切换。只有收到/开始/派工的确认写 STATE，"
     "回执由收件箱或秘书承担；实质答复、新风险和新增用户待办按协议及时通知。"

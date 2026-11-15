@@ -433,15 +433,16 @@ def receipt_text(services: Services, members: Members, removed: Sequence[str], w
     ])
 
 
-def post_receipt(issue: Issue, body: str) -> str:
+def post_note(issue: Issue, body: str) -> str:
+    """发一条评论并回读，返回评论链接。"""
     base = f"projects/{quote(issue.project, safe='')}/issues/{issue.iid}/notes"
     note = glab_api(issue.host, "POST", base, f"body={body}")
     note_id = note.get("id")
     if not note_id:
-        raise WrapupError(f"发回执后没拿到评论编号：{note}")
+        raise WrapupError(f"发评论后没拿到评论编号：{note}")
     back = glab_api(issue.host, "GET", f"{base}/{note_id}")
     if str(back.get("body") or "").strip() != body.strip():
-        raise WrapupError(f"回执回读内容不一致：{issue.url}#note_{note_id}")
+        raise WrapupError(f"评论回读内容不一致：{issue.url}#note_{note_id}")
     return f"{issue.url}#note_{note_id}"
 
 
@@ -556,7 +557,7 @@ def wrapup(opts: argparse.Namespace) -> int:
         print(f"{tag}7. 将把 INDEX 中 {opts.task} 的状态改为：{opts.status}")
         return 0
     try:
-        link = post_receipt(issue, body)
+        link = post_note(issue, body)
         print(f"回执评论：{link}")
         append_state(repo, opts.task, body, link)
     except (WrapupError, ValueError) as error:

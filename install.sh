@@ -36,7 +36,19 @@ else
   echo "[已链接] Herdr 角色配置 → $src"
 fi
 
-# 3. 依赖检查
+# 3. omp 扩展：调度者改 INDEX、发 issue 评论时拦下手写，改走 task-record.py
+ext="$HOME/.omp/agent/extensions"
+if [ -d "$HOME/.omp/agent" ]; then
+  mkdir -p "$ext"
+  for f in "$HWF"/omp-extensions/*.ts; do
+    ln -sfn "$f" "$ext/$(basename "$f")"
+  done
+  echo "[已链接] omp 扩展 → $HWF/omp-extensions（新开的 omp 会话生效）"
+else
+  echo "[注意]   没找到 ~/.omp/agent，omp 扩展未安装（调度者用 omp 时需要）"
+fi
+
+# 4. 依赖检查
 python3 -c 'import yaml' 2>/dev/null && echo "[已有]   python3 + PyYAML（只有测试用到）" || echo "[注意]   测试需要 PyYAML：python3 -m pip install pyyaml"
 for c in herdr glab omp claude codex droid; do
   command -v "$c" >/dev/null 2>&1 && echo "[已有]   $c" || echo "[注意]   没装 $c（角色配置里用到）"

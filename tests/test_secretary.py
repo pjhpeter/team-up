@@ -106,6 +106,82 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(self.state["secretary"]["chat_id"], "oc_1")
         self.assertEqual(self.w.replies[-1]["text"], FB.HELP_TEXT)
 
+    def test_private_thread_and_secretary_send_each_note_once(self) -> None:
+        self.b.handle(msg("om_bind", "#7"))
+        self.b.handle(msg("om_bind_again", "#7"))
+        before, replies = len(self.w.sent), len(self.w.replies)
+        self.w.agent_note(7, "Windows 测试包已准备好，请测试")
+        self.b.poll_gitlab()
+        self.sec.poll()
+        self.b.poll_gitlab()
+        self.assertEqual(len(self.w.sent) - before, 1)
+        self.assertEqual(len(self.w.replies), replies)
+        self.assertIn("Windows 测试包已准备好", self.w.sent[-1]["text"])
+        forwarded = next(reversed(self.sec.state["msgs"]))
+        self.b.handle(msg("om_answer", "测试通过", reply_to=forwarded))
+        self.assertIn("@pjhagent 测试通过", self.w.issues[7]["notes"][-1]["body"])
+
+    def test_group_keeps_its_reply_while_private_uses_one_notification(self) -> None:
+        self.b.handle(msg("om_group", "#7", chat="oc_group", chat_type="group", mentions=[{"id": TFB.BOT}]))
+        before, replies = len(self.w.sent), len(self.w.replies)
+        self.w.agent_note(7, "需要确认一个新风险")
+        self.b.poll_gitlab()
+        self.sec.poll()
+        self.assertEqual(len(self.w.sent) - before, 1)
+        self.assertEqual(len(self.w.replies) - replies, 1)
+        self.assertEqual(self.w.replies[-1]["to"], "om_group")
+        self.assertIn("需要确认一个新风险", self.w.sent[-1]["text"])
+
+    def test_private_retry_survives_restart_without_a_second_thread_copy(self) -> None:
+        self.b.handle(msg("om_bind", "#7"))
+        before, replies = len(self.w.sent), len(self.w.replies)
+        self.w.agent_note(7, "第一条实质答复")
+        self.w.agent_note(7, "第二条实质答复")
+        self.w.send_failures = 1
+        with self.assertRaises(FB.BridgeError):
+            self.b.poll_gitlab()
+        self.assertEqual(len(self.w.sent), before)
+        restored = json.loads(json.dumps(self.state))
+        bridge = FB.Bridge(self.b.cfg, restored, run=self.w, user_token="tok", now=lambda: self.now)
+        bridge._secretary = SEC.Secretary(bridge, home=self.home)
+        bridge.secretary.poll()
+        bridge.poll_gitlab()
+        bridge.secretary.poll()
+        self.assertEqual([m["text"].split("\n", 1)[1] for m in self.w.sent[before:]],
+                         ["第一条实质答复", "第二条实质答复"])
+        self.assertEqual(len(self.w.replies), replies)
+
+    def test_private_receipt_is_skipped_but_received_prefix_answer_is_delivered(self) -> None:
+        self.b.handle(msg("om_bind", "#7"))
+        before, replies = len(self.w.sent), len(self.w.replies)
+        self.w.agent_note(7, f"已收到，已转交目标 issue {URL7} 的消息，等待调度者回复。")
+        self.w.agent_note(7, "已收到，新的检查结果是磁盘空间不足，请清理后继续。")
+        self.b.poll_gitlab()
+        self.sec.poll()
+        self.assertEqual(len(self.w.sent) - before, 1)
+        self.assertIn("磁盘空间不足", self.w.sent[-1]["text"])
+        self.assertEqual(len(self.w.replies), replies)
+
+    def test_private_route_keeps_other_peoples_substantive_comments(self) -> None:
+        self.b.handle(msg("om_bind", "#7"))
+        before = len(self.w.sent)
+        self.w.gitlab_comment(7, "同事补充：这个问题也出现在 Windows", name="同事")
+        self.b.poll_gitlab()
+        self.sec.poll()
+        self.assertEqual(len(self.w.sent) - before, 1)
+        self.assertIn("同事补充", self.w.sent[-1]["text"])
+
+    def test_private_close_does_not_add_a_second_completion_notice(self) -> None:
+        self.b.handle(msg("om_bind", "#7"))
+        before, replies = len(self.w.sent), len(self.w.replies)
+        self.w.agent_note(7, "交付完成，已经验收")
+        self.w.issues[7]["state"] = "closed"
+        self.b.poll_gitlab()
+        self.sec.poll()
+        self.assertEqual(len(self.w.sent) - before, 1)
+        self.assertIn("交付完成", self.w.sent[-1]["text"])
+        self.assertEqual(len(self.w.replies), replies)
+
     def test_forwards_agent_notes_but_not_receipts_user_or_system(self) -> None:
         self.waiting()
         self.w.agent_note(7, "步骤 1 完成：列表改版\n\n<details>全文</details>")

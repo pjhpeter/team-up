@@ -3,7 +3,7 @@
 问题：每个交付各有一张 issue 和一个飞书话题，同时跑的交付一多，用户要在好几个话题之间来回看。
 办法：私聊窗口本来就是提需求的入口，让它同时当秘书：调度者的每条评论都马上发到私聊主窗口（发多少由协议的免打扰/详尽
 在源头控制，秘书不再二次筛）；每小时巡检只发总览，有变化或异常才汇报；用户对某条转达点「回复」，就把话转成那张 issue 的评论。
-各交付自己的话题照常保留（默认免打扰），想看某个需求的完整经过时去话题里看。
+私聊绑定的 issue 只在秘书主窗口通知，原话题仍可回复；群聊绑定保留群内回复，秘书同时私聊转达。
 
 只由 feishu-bridge.py 调用（同一进程、同一份飞书连接与状态文件），不单独运行：
   开启：白名单用户第一次在私聊里说话，桥就记下这个私聊窗口，之后的转达和巡检都发到这里，不需要命令。
@@ -15,7 +15,7 @@
     「帮我问 481 的调度…」         → 模型判断是要传话，以用户名义写成那张 issue 的评论，调度者回复照常转回来
     其他话                        → 当作提问，用模型按总览、各需求最近评论和最近转达回答；模型不可用时回总览
 看哪些 issue：收件箱登记的发起 issue（state/gitlab-inbox.json 的 origins）加上飞书桥里还没关闭的话题。
-只转 Agent 账号发的评论；收件箱固定格式的「已收到，已转交…」回执不转（秘书转话时已回过「已转给」）。
+默认转 Agent 评论；私聊绑定的 issue 也保留原话题可见的其他人评论。固定转交回执不转，实质答复不按相似度过滤。
 巡检只读：GitLab GET、find-scheduler --owner-of、herdr agent get、本机 INDEX/STATE 修改时间。
 """
 from __future__ import annotations
@@ -217,6 +217,22 @@ class Secretary:
             if pending:
                 self.flush(url, known, pending)
 
+    def forward_private_notes(self, thread: dict[str, Any], notes: list[dict[str, Any]]) -> None:
+        """私聊话题与秘书共用同一进度、待发队列和消息 ID，不再各发一份。"""
+        url = canon(self.bridge.issue_url(thread["project"], thread["iid"]))
+        known = self.state["issues"].get(url)
+        if known is None:
+            pid = quote(thread["project"], safe="")
+            info = self.bridge.api(f"projects/{pid}/issues/{thread['iid']}")
+            known = {"project": thread["project"], "iid": thread["iid"], "title": info.get("title", ""),
+                     "last_note": thread.get("last_note", 0), "last_agent_at": self.bridge.now()}
+            self.state["issues"][url] = known
+        # 原话题会转达其他人从 GitLab 发来的评论；合并出口不能丢掉这些内容。
+        known["private_thread"] = True
+        pending = self.state["held"].get(url, []) + self.fresh_entries(url, known, notes, True)
+        self.flush(url, known, pending)
+        thread["last_note"] = max([thread.get("last_note", 0)] + [n["id"] for n in notes])
+
     def flush(self, url: str, issue: Mapping[str, Any], pending: list[dict[str, Any]]) -> None:
         """逐条发出；飞书发送失败时，没发出去的留在 held 里下一轮重发（水位已推进，丢了就再也找不回来）。"""
         held = self.state["held"]
@@ -236,7 +252,7 @@ class Secretary:
         """水位之后要转的 Agent 发言，同时推进水位。"""
         fresh = []
         for n in sorted((n for n in notes if n["id"] > known["last_note"]), key=lambda n: n["id"]):
-            if forward and self.should_forward(n):
+            if forward and self.should_forward(n, include_users=known.get("private_thread", False)):
                 known["last_agent_at"] = self.bridge.now()
                 fresh.append(n)
             known["last_note"] = n["id"]
@@ -247,10 +263,10 @@ class Secretary:
         self.state["recent"] = (self.state["recent"] + [f"#{issue['iid']} {issue.get('title', '')}：{body[:200]}"])[-RECENT_CAP:]
         return {"id": n["id"], "body": body}
 
-    def should_forward(self, n: Mapping[str, Any]) -> bool:
+    def should_forward(self, n: Mapping[str, Any], include_users: bool = False) -> bool:
         author = (n.get("author") or {}).get("username")
         body = (n.get("body") or "").strip()
-        return (not n.get("system") and author == self.bridge.agent
+        return (not n.get("system") and (author == self.bridge.agent or include_users)
                 and n["id"] not in self.bridge.state.get("posted_notes", []) and not RECEIPT.match(body))
 
     def forward(self, url: str, issue: Mapping[str, Any], entry: Mapping[str, Any]) -> None:

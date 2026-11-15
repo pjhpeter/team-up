@@ -153,6 +153,7 @@ class BridgeTest(unittest.TestCase):
         proactive.STATE_DIR = Path(self.tmp.name)
         self.b = FB.Bridge(cfg, self.state, run=self.w, user_token="tok", now=lambda: 1_000_000.0,
                            upload=self.fake_upload, media_dir=Path(tempfile.mkdtemp(prefix="fb-media-")))
+        self.b._secretary = FB.secretary_module().Secretary(self.b, home=Path(self.tmp.name))
 
     def fake_upload(self, project: str, path: Path) -> str:
         self.assertTrue(path.exists())
@@ -251,16 +252,19 @@ class BridgeTest(unittest.TestCase):
         self.b.handle(msg("om_2", "补充一句", root="om_1"))  # 桥自己发的评论
         self.w.gitlab_comment(8, "已收到，已转给调度者")
         self.w.gitlab_comment(8, "added label", system=True)
-        before = len(self.w.replies)
+        before = len(self.w.sent)
+        replies_before = len(self.w.replies)
         self.b.poll_gitlab()
-        self.b.poll_gitlab()  # 第二轮不重复
-        new = self.w.replies[before:]
+        self.b.secretary.poll()
+        self.b.poll_gitlab()  # 两个轮询入口共用进度，不再各发一次
+        new = self.w.sent[before:]
         self.assertEqual(len(new), 1)
         self.assertIn("已收到，已转给调度者", new[0]["text"])
-        self.assertEqual(new[0]["to"], "om_1")
+        self.assertEqual(new[0]["chat"], "oc_1")
+        self.assertEqual(len(self.w.replies), replies_before)
 
     def test_failed_forward_is_retried_next_round_in_order(self) -> None:
-        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.b.handle(msg("om_1", "需求：做个东西", chat="oc_group", chat_type="group", mentions=[{"id": BOT}]))
         self.w.gitlab_comment(8, "第一条")
         self.w.gitlab_comment(8, "第二条")
         before = len(self.w.replies)
@@ -277,7 +281,7 @@ class BridgeTest(unittest.TestCase):
     def test_stuck_or_missing_command_is_a_bridge_error_and_next_round_recovers(self) -> None:
         self.b.handle(msg("om_1", "需求：做个东西"))
         self.w.gitlab_comment(8, "卡住时写的评论")
-        before = len(self.w.replies)
+        before = len(self.w.sent)
         real_run = self.b.run
         for failure in (subprocess.TimeoutExpired(["glab"], FB.CMD_TIMEOUT_S), FileNotFoundError("glab")):
             def broken(*_a, _e=failure, **_k):
@@ -287,7 +291,7 @@ class BridgeTest(unittest.TestCase):
                 self.b.poll_gitlab()
         self.b.run = real_run
         self.b.poll_gitlab()
-        self.assertIn("卡住时写的评论", self.w.replies[before]["text"])
+        self.assertIn("卡住时写的评论", self.w.sent[before]["text"])
 
     def break_gitlab_writes(self):
         """GitLab 写请求一律卡住；返回恢复函数。"""
@@ -371,7 +375,7 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("om_b", self.state["threads"])
 
     def test_note_that_keeps_failing_becomes_link_and_does_not_block(self) -> None:
-        self.b.handle(msg("om_1", "需求：做个东西"))
+        self.b.handle(msg("om_1", "需求：做个东西", chat="oc_group", chat_type="group", mentions=[{"id": BOT}]))
         self.w.gitlab_comment(8, "飞书不收的内容")
         self.w.gitlab_comment(8, "后面的评论")
         before = len(self.w.replies)
@@ -384,7 +388,7 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("后面的评论", texts[1])
 
     def test_long_comment_is_truncated_with_link(self) -> None:
-        self.b.handle(msg("om_1", "需求：长内容"))
+        self.b.handle(msg("om_1", "需求：长内容", chat="oc_group", chat_type="group", mentions=[{"id": BOT}]))
         self.w.gitlab_comment(8, "字" * 5000)
         self.b.poll_gitlab()
         text = self.w.replies[-1]["text"]
@@ -392,12 +396,12 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("全文见", text)
 
     def test_closed_issue_notifies_once_and_rejects_replies(self) -> None:
-        self.b.handle(msg("om_1", "需求：会被关掉"))
+        self.b.handle(msg("om_1", "需求：会被关掉", chat="oc_group", chat_type="group", mentions=[{"id": BOT}]))
         self.w.issues[8]["state"] = "closed"
         self.b.poll_gitlab()
         self.b.poll_gitlab()
         self.assertEqual(sum("已关闭" in r["text"] for r in self.w.replies), 1)
-        self.b.handle(msg("om_2", "还有个问题", root="om_1"))
+        self.b.handle(msg("om_2", "还有个问题", root="om_1", chat="oc_group", chat_type="group", mentions=[{"id": BOT}]))
         self.assertIn("已关闭", self.w.replies[-1]["text"])
         self.assertFalse([w for w in self.w.writes if w[1].endswith("/notes")])
 
@@ -558,7 +562,8 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.w.writes[-1][2]["body"], "补充：只在测试环境\n\n_（来自飞书）_")
         self.w.gitlab_comment(8, "看了，是权限问题")
         self.b.poll_gitlab()
-        self.assertEqual(self.w.replies[-1]["to"], "om_req")  # Agent 回复和 issue 链接在同一个话题
+        self.assertEqual(self.w.sent[-1]["chat"], "oc_1")
+        self.assertIn("看了，是权限问题", self.w.sent[-1]["text"])
 
     def test_lone_image_is_attached_to_next_requirement_within_ten_minutes(self) -> None:
         clock = [1_000_000.0]

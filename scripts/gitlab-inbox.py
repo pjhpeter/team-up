@@ -99,6 +99,13 @@ CHOICE_SETTLE_S = 3  # 按键后等界面刷新再读屏核对
 STAGE_PREFIX = "状态:"
 WAITING_LABEL = "状态:等你处理"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")  # omp --thinking 可选值
+# 每次投递都把通知规则放回上下文，避免调度者只在首次启动时读过、续跑后忘记。
+NOTIFY_REMINDER = (
+    "\n[通知检查] 写 issue 评论前，先读 ~/.hwf/PROTOCOL.md「通知模式」的发送前核对与同一件事只说一次，"
+    "再对照本任务 STATE 的通知模式和最近用户通知。未记录模式时按免打扰；"
+    "本条若是用户切换通知模式的指令，先应用切换。只有收到/开始/派工的确认写 STATE，"
+    "回执由收件箱或秘书承担；实质答复、新风险和新增用户待办按协议及时通知。"
+)
 
 
 class InboxError(RuntimeError):
@@ -190,7 +197,7 @@ class Inbox:
             return False
         origin = self.state["origins"].get(url or "") or {}
         result = self._exec(
-            ["hwf", "run", "team-up", "--detach", "--json", "--input", f"task={task}",
+            ["hwf", "run", "team-up", "--detach", "--json", "--input", f"task={task}{NOTIFY_REMINDER}",
              "--input", f"model={origin.get('model', '')}", "--input", f"thinking={origin.get('thinking', '')}"],
             cwd=repo, timeout=LAUNCH_TIMEOUT_S,
         )
@@ -225,7 +232,7 @@ class Inbox:
         return model, thinking, ""
 
     def prompt(self, pane: str, text: str) -> bool:
-        result = self._exec(["herdr", "agent", "prompt", pane, text])
+        result = self._exec(["herdr", "agent", "prompt", pane, text + NOTIFY_REMINDER])
         if result.returncode != 0:
             log(f"prompt to {pane} rejected: {result.stderr.strip()}")
         return result.returncode == 0

@@ -273,6 +273,46 @@ class WrapupTest(Case):
         self.assertEqual(code, 0, out)
         self.assertEqual(herdr.closed, ["w1:pA"])
 
+    def test_registered_unnamed_agent_and_exited_shell_are_closed(self) -> None:
+        self.registry({"w1:pA": SCHED, "w1:pB": SCHED})
+        unnamed = agent(None, "w1:pA") | {"label": "dev-gpt-#47 构建", "agent": "codex"}
+        shell = agent(None, "w1:pB") | {"label": "dev-gpt-#47 测试", "agent_status": "unknown"}
+        herdr = FakeHerdr([agent(SCHED, "w1:pS"), unnamed], [shell])
+        code, out = self.run_wrapup(herdr)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(herdr.closed), ["w1:pA", "w1:pB"])
+        self.assertEqual(WR._MS.read_registry(), {})
+
+    def test_registered_pane_with_unverifiable_identity_blocks_completion(self) -> None:
+        for replacement in (agent(None, "w1:pA"), agent("another-agent", "w1:pA")):
+            with self.subTest(replacement=replacement):
+                self.registry({"w1:pA": SCHED})
+                herdr = FakeHerdr([agent(SCHED, "w1:pS"), replacement])
+                code, out = self.run_wrapup(herdr)
+                self.assertEqual(code, 1, out)
+                self.assertEqual(herdr.closed, [])
+                self.assertIn("w1:pA", out)
+                self.assertEqual(self.index_status(), "in-progress（开发中）")
+
+    def test_registered_unnamed_working_agent_is_not_closed(self) -> None:
+        self.registry({"w1:pA": SCHED})
+        member = agent(None, "w1:pA") | {"label": "dev-gpt-#47 构建", "agent": "codex", "agent_status": "working"}
+        herdr = FakeHerdr([agent(SCHED, "w1:pS"), member])
+        code, out = self.run_wrapup(herdr)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(herdr.closed, [])
+        self.assertEqual(self.index_status(), "in-progress（开发中）")
+
+    def test_unnamed_sibling_is_kept_without_blocking_this_issue(self) -> None:
+        index = Path(self.repo, ".hwf/tmp/INDEX.md")
+        index.write_text(index.read_text().replace("done（旧）", "in-progress（兄弟任务）"), encoding="utf-8")
+        self.registry({"w1:pA": SCHED})
+        member = agent(None, "w1:pA") | {"label": "dev-gpt-#40 构建", "agent": "codex"}
+        herdr = FakeHerdr([agent(SCHED, "w1:pS"), member])
+        code, out = self.run_wrapup(herdr)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(herdr.closed, [])
+
     def test_last_pane_in_workspace_is_kept(self) -> None:
         self.registry({"w2:pA": SCHED})
         herdr = FakeHerdr([agent(SCHED, "w1:pS"), agent("i47-dev", "w2:pA")])

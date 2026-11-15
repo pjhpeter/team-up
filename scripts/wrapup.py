@@ -199,20 +199,44 @@ def team_tabs(scheduler: str, agents: Sequence[dict[str, Any]], registry: dict[s
 
 
 def pick_members(scheduler: str, iid: str, only_issue: bool, agents: Sequence[dict[str, Any]],
-                 registry: dict[str, Any], skip_panes: set[str]) -> list[dict[str, Any]]:
-    """只认还在运行、登记名符合成员格式的 agent：pane id 可能在 herdr 重启后被别的 pane 复用，空 shell 不碰。"""
+                 registry: dict[str, Any], skip_panes: set[str],
+                 panes: Optional[Sequence[dict[str, Any]]] = None,
+                 problems: Optional[list[str]] = None) -> list[dict[str, Any]]:
+    """同时检查登记窗格和运行中的 Agent；身份不明的登记项必须阻止完成，不能静默漏掉。"""
     tabs = team_tabs(scheduler, agents, registry)
-    picked = []
+    live = {str(p["pane_id"]): dict(p) for p in (panes if panes is not None else agents)}
     for agent in agents:
-        pane, name = str(agent.get("pane_id") or ""), str(agent.get("name") or "")
-        if not pane or pane in skip_panes or not MEMBER_NAME.fullmatch(name):
+        pane = str(agent.get("pane_id") or "")
+        live[pane] = live.get(pane, {}) | agent
+    picked = []
+    for pane, member in live.items():
+        name = str(member.get("name") or "")
+        if not pane or pane in skip_panes:
             continue
-        this_issue = name.startswith(f"i{iid}-")
-        owner = (registry.get(pane) or {}).get("scheduler")
-        if owner == scheduler or (owner is None and this_issue and agent.get("tab_id") in tabs):
-            if only_issue and not this_issue:
-                continue
-            picked.append(agent)
+        entry = registry.get(pane) or {}
+        owner = entry.get("scheduler")
+        named = bool(MEMBER_NAME.fullmatch(name))
+        label = str(member.get("label") or "")
+        label_issue = re.search(r"#(\d+)(?!\d)", label)
+        this_issue = name.startswith(f"i{iid}-") if named else bool(label_issue and label_issue[1] == iid)
+        if owner != scheduler and not (owner is None and named and this_issue and member.get("tab_id") in tabs):
+            continue
+        if only_issue and not this_issue and (named or label_issue):
+            continue
+        reason = ""
+        if not named:
+            if name or not label_issue or not label.startswith(str(entry.get("profile") or "") + "-") or member.get("tab_id") != entry.get("tab_id"):
+                reason = "登记窗格的当前身份无法确认"
+            elif member.get("agent") and member.get("agent_status") not in ("idle", "done"):
+                reason = "无名 Agent 尚未结束或状态不明"
+            elif only_issue and not this_issue:
+                reason = "无法确定登记窗格属于本次 issue"
+        if reason:
+            if problems is None:
+                raise WrapupError(f"{pane}：{reason}")
+            problems.append(f"{pane}：{reason}，保留并核实后重跑")
+            continue
+        picked.append(member | {"name": name or label})
     return picked
 
 
@@ -507,8 +531,19 @@ def wrapup(opts: argparse.Namespace) -> int:
     siblings = [r for r in _FS.read_index(repo) if r.scheduler == scheduler and r.task != opts.task and r.open]
     skip = {p for p in (os.environ.get("HERDR_PANE_ID"),) if p}
     skip |= {str(a.get("pane_id")) for a in agents if a.get("name") == scheduler}
-    picked = pick_members(scheduler, issue.iid, bool(siblings), agents, _MS.read_registry(), skip)
+    registry = _MS.read_registry()
+    selection_problems: list[str] = []
+    picked = pick_members(scheduler, issue.iid, bool(siblings), agents, registry, skip,
+                          herdr("pane", "list")["result"]["panes"], selection_problems)
     members = close_members(picked, opts.dry_run)
+    members.problems.extend(selection_problems)
+    if not opts.dry_run:
+        remaining = pick_members(scheduler, issue.iid, bool(siblings),
+                                 herdr("agent", "list")["result"]["agents"], _MS.read_registry(), skip,
+                                 herdr("pane", "list")["result"]["panes"], members.problems)
+        for member in remaining:
+            if not any(member["pane_id"] in kept for kept in members.kept):
+                members.problems.append(f"{member['pane_id']}：团队登记复核发现残留成员")
     print(f"{tag}2. 成员：{'将关闭' if opts.dry_run else '已关闭'} {'、'.join(members.closed) or '无'}"
           + (f"；保留 {'、'.join(members.kept)}" if members.kept else "")
           + (f"（调度者还有未收尾任务 {', '.join(r.task for r in siblings)}，只关 i{issue.iid}-*）" if siblings else ""))

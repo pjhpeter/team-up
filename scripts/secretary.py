@@ -440,14 +440,15 @@ class Secretary:
         issue = self.state["issues"].get(url)
         project = issue["project"] if issue else self.bridge.project
         iid = issue["iid"] if issue else int(url.rsplit("/", 1)[-1])
-        images = self.bridge.images_markdown({**msg, "reply_to": "", "root_id": ""}, project)
+        # 纯指令保持原样；普通引用回复与群消息共用上下文和附件收集。
+        source = {**msg, "reply_to": "", "root_id": "", "context_warning": ""} if text.startswith("/") else dict(msg)
+        context = self.bridge.message_context(source, project)
         text = self.bridge.strip_images(text)
-        if not text and not images:
+        if not text and not context:
             self.bridge.reply(mid, "这条没有内容，没转。", f"sec-empty-{mid}", in_thread=thread)
             return
-        # 指令要整条只有指令，收件箱才认得，所以不加尾注
-        body = text if text.startswith("/") and not images else \
-            "\n\n".join(x for x in (text, images) if x) + "\n\n_（来自飞书秘书）_"
+        body = text if text.startswith("/") and not context else \
+            "\n\n".join(x for x in (text, context) if x) + "\n\n_（来自飞书秘书）_"
         self.bridge.note_as_user(project, iid, f"@{self.bridge.agent} {body}")
         title = f" {issue.get('title', '')}" if issue else ""
         self.bridge.reply(mid, f"已转给 [#{iid}]({url}){title}。{ack}", f"sec-relayed-{mid}", in_thread=thread)

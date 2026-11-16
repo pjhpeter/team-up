@@ -1,5 +1,5 @@
 # Herdr 交付流程的项目信息（提交入库，团队共用）。
-# 协议 ~/.hwf/PROTOCOL.md 里「项目专属」的值都从这里读；可以手改，改完不用重启。
+# 协议 ~/.hwf/PROTOCOL.md「适用范围与配置」中的项目值从这里读；可以手改，改完不用重启。
 # 由 ~/.hwf/scripts/init-project.py 生成。
 gitlab:
   host: {{HOST}}

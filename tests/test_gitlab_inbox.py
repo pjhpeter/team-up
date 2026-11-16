@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import tempfile
 from typing import Any
@@ -570,22 +571,108 @@ class InboxTests(unittest.TestCase):
         make(world, state).poll()
         self.assertIn("交付模式", world.prompts[-1])
 
-    def test_go_debug_skips_complexity_and_keeps_rest_as_extra(self) -> None:
-        cases = (("@pjhagent /go debug 先只改文案", "先只改文案"), ("/go 改bug 按钮点不动", "按钮点不动"),
-                 ("/go 改 bug", ""), ("/go Debug 模式", ""), ("/go debug模式", ""),
-                 ("/go 极简 先只改文案", "先只改文案"), ("/go minimal", ""))
-        for body, extra in cases:
-            state = self.origin_state()
-            state["origins"][URL]["mode"] = INBOX.CHAT
-            world = FakeWorld([], notes=[note(6) | {"body": body}])
-            make(world, state).poll()
-            self.assertIn("debug 模式", world.prompts[0], body)
-            self.assertNotIn("§0 复杂度判定开始", world.prompts[0])
-            if extra:
+    def assert_debug_delivery_contract(self, text: str) -> None:
+        self.assertIn("protocol/implementation.md", text)
+        for role in ("dev", "dev-fe", "dev-be"):
+            self.assertRegex(text, rf"(?<![\w-]){role}(?![\w-])")
+        self.assertRegex(text, r"单元测试|单测")
+        self.assertRegex(text, r"develop.*自动化.*release-<根编号>")
+        self.assertNotIn("§0 复杂度判定开始", text)
+        for obsolete in ("dev-mini", "dev-fe-mini", "dev-be-mini", "不测试", "只开发"):
+            self.assertNotIn(obsolete, text)
+
+    def test_debug_commands_route_existing_and_new_issues_to_delivery(self) -> None:
+        aliases = ("debug", "DEBUG", "debug模式", "Debug 模式", "改bug", "改 BUG",
+                   "修bug", "修 Bug", "极简", "极简模式", "极简 模式", "minimal", "MINIMAL")
+        for alias in aliases:
+            for prefix in ("", "/go ", "/GO "):
+                for existing in (True, False):
+                    body = f"@PJHAGENT {prefix}{alias}"
+                    with self.subTest(body=body, existing=existing):
+                        state = self.origin_state() if existing else {}
+                        if existing:
+                            state["origins"][URL]["mode"] = INBOX.CHAT
+                        world = FakeWorld([] if existing else [todo("mentioned", url=f"{URL}#note_6")],
+                                          notes=[note(6, body=body)], owners=None if existing else {})
+                        inbox = make(world, state)
+                        inbox.poll()
+                        self.assertIn(URL, inbox.state["origins"])
+                        self.assertEqual(inbox.state["origins"][URL]["mode"], INBOX.DELIVER)
+                        self.assertEqual(inbox.state["origins"][URL]["initiator"], "pengjh")
+                        dispatched = world.prompts if existing else world.launched
+                        self.assertEqual(len(dispatched), 1)
+                        self.assertFalse(dispatched[0].startswith(INBOX.CHAT_TAG))
+                        self.assert_debug_delivery_contract(dispatched[0])
+                        self.assertNotIn("用户补充", dispatched[0])
+                        for obsolete in ("mini", "不测试", "只开发"):
+                            self.assertNotIn(obsolete, " ".join(world.comments))
+
+    def test_go_debug_keeps_extra_instructions(self) -> None:
+        for command in ("debug", "修 Bug", "极简 模式", "MINIMAL"):
+            with self.subTest(command=command):
+                state = self.origin_state()
+                state["origins"][URL]["mode"] = INBOX.CHAT
+                extra = "按钮点不动，保留 debug 日志"
+                world = FakeWorld([], notes=[note(6, body=f"/go {command} {extra}")])
+                make(world, state).poll()
+                self.assertEqual(state["origins"][URL]["mode"], INBOX.DELIVER)
+                self.assert_debug_delivery_contract(world.prompts[0])
                 self.assertIn(f"用户补充：{extra}", world.prompts[0])
-            else:
-                self.assertNotIn("用户补充", world.prompts[0], body)
-            self.assertIn("debug 模式", world.comments[0])
+
+    def test_debug_mentions_and_negations_remain_conversation(self) -> None:
+        for body in ("不要 debug", "不要极简模式", "不是修bug", "这次不使用 minimal",
+                     "debug 日志在哪里", "极简模式是什么", "请解释 /go debug", "按极简模式推进"):
+            for existing in (True, False):
+                with self.subTest(body=body, existing=existing):
+                    state = self.origin_state() if existing else {}
+                    if existing:
+                        state["origins"][URL]["mode"] = INBOX.CHAT
+                    world = FakeWorld([] if existing else [todo("mentioned", url=f"{URL}#note_6")],
+                                      notes=[note(6, body=body)])
+                    inbox = make(world, state)
+                    inbox.poll()
+                    if existing:
+                        self.assertEqual(inbox.state["origins"][URL]["mode"], INBOX.CHAT)
+                    else:
+                        self.assertNotIn(URL, inbox.state["origins"])
+                    self.assertEqual(len(world.prompts), 1)
+                    self.assertIn(body, world.prompts[0])
+                    self.assertEqual(world.launched, [])
+
+    def test_debug_bridge_footer_routes_standalone_mode(self) -> None:
+        for footer in ("_（来自飞书）_", "_（来自飞书秘书）_"):
+            for existing in (True, False):
+                with self.subTest(footer=footer, existing=existing):
+                    state = self.origin_state() if existing else {}
+                    if existing:
+                        state["origins"][URL]["mode"] = INBOX.CHAT
+                    body = f"极简模式\n\n{footer}"
+                    world = FakeWorld([] if existing else [todo("mentioned", url=f"{URL}#note_6")],
+                                      notes=[note(6, body=body)], owners=None if existing else {})
+                    inbox = make(world, state)
+                    inbox.poll()
+                    self.assertIn(URL, inbox.state["origins"])
+                    self.assertEqual(inbox.state["origins"][URL]["mode"], INBOX.DELIVER)
+                    dispatched = world.prompts if existing else world.launched
+                    self.assertEqual(len(dispatched), 1)
+                    self.assert_debug_delivery_contract(dispatched[0])
+                    self.assertNotIn("用户补充", dispatched[0])
+
+    def test_debug_bridge_footer_preserves_noncommand_body(self) -> None:
+        for footer in ("_（来自飞书）_", "_（来自飞书秘书）_"):
+            for text in ("不要极简模式", "> 极简模式", "极简模式\n\n> 引用上一条消息",
+                         "> 上一条消息\n\n极简模式", f"极简模式\n\n{footer}\n正文仍有内容",
+                         "极简模式 _（来自其他系统）_"):
+                with self.subTest(footer=footer, text=text):
+                    state = self.origin_state()
+                    state["origins"][URL]["mode"] = INBOX.CHAT
+                    body = f"{text}\n\n{footer}"
+                    world = FakeWorld([], notes=[note(6, body=body)])
+                    make(world, state).poll()
+                    self.assertEqual(state["origins"][URL]["mode"], INBOX.CHAT)
+                    self.assertEqual(len(world.prompts), 1)
+                    self.assertIn(body, world.prompts[0])
+                    self.assertEqual(world.launched, [])
 
     def test_go_with_other_extra_is_not_debug(self) -> None:
         state = self.origin_state()
@@ -868,9 +955,92 @@ class ProtocolChangeTests(unittest.TestCase):
         world = self.world("bbbb2222")
         self.run_round(world, state)
         self.assertEqual(world.prompt_panes, ["w1:p1"])  # 没有未收尾交付的调度者不打扰
-        self.assertIn("git -C ~/.hwf diff aaaa1111 bbbb2222 -- PROTOCOL.md", world.prompts[0])
+        command = next(part for part in world.prompts[0].split("`") if part.startswith("git "))
+        self.assertEqual(shlex.split(command)[3:], ["diff", "aaaa1111", "bbbb2222", "--", "PROTOCOL.md", "protocol/"])
         self.run_round(world, state)
         self.assertEqual(len(world.prompts), 1)
+
+    def test_topic_only_commit_notifies_and_unrelated_commit_does_not(self) -> None:
+        # 真正的 Git 历史验证路径范围，避免假执行器无论查哪个文件都返回同一个版本。
+        with tempfile.TemporaryDirectory(prefix="hwf-protocol-") as directory:
+            root = Path(directory)
+
+            def git(*args: str) -> str:
+                return subprocess.run(["git", "-C", directory, *args], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            git("init", "--quiet")
+            git("config", "user.name", "Protocol Test")
+            git("config", "user.email", "protocol-test@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            git("config", "core.hooksPath", "/dev/null")
+            (root / "PROTOCOL.md").write_text("Protocol entry\n")
+            (root / "protocol").mkdir()
+            topic = root / "protocol/communication.md"
+            topic.write_text("Original notification rules\n")
+            git("add", ".")
+            git("commit", "--quiet", "-m", "Initial protocol")
+            old = git("rev-parse", "HEAD")
+            state: dict[str, Any] = {"protocol_rev": old}
+            world = self.world("")
+            original_call = world.call
+
+            def call(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+                if argv[0] == "git":
+                    return subprocess.run(argv, capture_output=True, text=True)
+                return original_call(argv, **kw)
+
+            world.call = call
+            topic.write_text("Updated notification rules\n")
+            git("add", "protocol/")
+            git("commit", "--quiet", "-m", "Update topic only")
+            revised = git("rev-parse", "HEAD")
+            with patch.object(INBOX, "HWF_HOME", root):
+                self.run_round(world, state)
+                self.assertEqual(state["protocol_rev"], revised)
+                self.assertEqual(world.prompt_panes, ["w1:p1"])
+                command = next(part for part in world.prompts[0].split("`") if part.startswith("git "))
+                diff = git(*shlex.split(command)[3:])
+                self.assertIn("+Updated notification rules", diff)
+                self.run_round(world, state)
+                (root / "unrelated.txt").write_text("Not a protocol change\n")
+                git("add", "unrelated.txt")
+                git("commit", "--quiet", "-m", "Unrelated change")
+                self.run_round(world, state)
+            self.assertEqual(state["protocol_rev"], revised)
+            self.assertEqual(len(world.prompts), 1)
+
+    def test_failed_notice_keeps_old_revision_for_retry(self) -> None:
+        state: dict[str, Any] = {"protocol_rev": "aaaa1111"}
+        world = self.world("bbbb2222")
+        world.prompt_rc = 1
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "aaaa1111")
+        world.prompt_rc = 0
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "bbbb2222")
+        self.assertEqual(world.prompt_panes, ["w1:p1", "w1:p1"])
+        self.run_round(world, state)
+        self.assertEqual(len(world.prompts), 2)
+
+    def test_scheduler_query_failure_keeps_old_revision_for_retry(self) -> None:
+        state: dict[str, Any] = {"protocol_rev": "aaaa1111"}
+        world = self.world("bbbb2222")
+        original_call = world.call
+
+        def call(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+            if argv[:3] == ["herdr", "agent", "list"]:
+                return subprocess.CompletedProcess(argv, 1, "", "Agent list unavailable")
+            return original_call(argv, **kw)
+
+        world.call = call
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "aaaa1111")
+        self.assertEqual(world.prompts, [])
+        world.call = original_call
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "bbbb2222")
+        self.assertEqual(world.prompt_panes, ["w1:p1"])
 
     def test_find_scheduler_module_really_loads(self) -> None:
         with patch.object(INBOX, "_FIND_SCHEDULER", None):

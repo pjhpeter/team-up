@@ -26,7 +26,7 @@ todo（要用户处理或授权）必须用 --will 写明用户同意后本账�
 
 退出码：0 成功；1 失败；2 参数错误；3 按规则没发（免打扰拦下、重复、自查不通过）。
 
-card-check：核对 arch 的 §0 判定里有没有写全「需求理解卡」（现状带 file:line、历史与坑不为空、验收条件每条写了证据）。
+card-check：按 ~/.hwf/protocol/planning.md §0 核对 arch 判定里的「需求理解卡」（现状带 file:line、历史与坑不为空、验收条件每条写了证据）。
 2026-11-15 用户同意：编码前对项目了解不够、验收太粗；只写进协议的要求聊几句就忘，所以由脚本拦。缺项时退出码 3。
 """
 
@@ -66,7 +66,7 @@ TOP_OPEN = "<!-- hwf:top 本段只由 task-record.py 改 -->"
 TOP_CLOSE = "<!-- /hwf:top -->"
 TOP_FIELDS = ("通知模式", "当前阶段", "下一动作", "待用户事项", "最近用户通知")
 LEGACY_MODE = re.compile(r"通知模式[:：]\s*(免打扰|详尽)")
-# 免打扰下只有这几类发；stage 是阶段进度，只在详尽模式发（PROTOCOL「通知模式」）。
+# 免打扰下只有这几类发；stage 是阶段进度，只在详尽模式发（protocol/communication.md「通知模式」）。
 # record 是登记或存档（登记池评论、待定清单评论），不是发给用户看进度的。
 KINDS = {"todo": "用户待办", "risk": "新风险", "answer": "实质答复", "step-done": "步骤完成",
          "delivery-done": "整项交付完成", "stage": "阶段进度", "record": "登记或存档"}

@@ -20,7 +20,7 @@ open 字段保留 omp 的 browser.open(...) 参数格式，其他工具按对应
 node_modules/.cache/hwf/ 下运行，依赖仍从 worktree 的 node_modules 解析。
 项目登录脚本约定：成功时最后一行输出含 `"ok": true` 的 JSON，失败时 `"ok": false` 并带 `stage`/`message`。
 
-退出码：0 成功；1 失败（stdout 一行 JSON 说明卡在哪一步）。失败才算环境阻塞，测试成员按协议 §8 处理。
+退出码：0 成功；1 失败（stdout 一行 JSON 说明卡在哪一步）。失败才算环境阻塞，测试成员按 ~/.hwf/protocol/review-testing.md §8 处理。
 """
 
 from __future__ import annotations

@@ -19,7 +19,8 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 | 位置 | 作用 |
 | --- | --- |
-| `PROTOCOL.md` | 流程规则本体，所有角色都按它干活 |
+| `PROTOCOL.md` | 短入口：共同边界、阶段路由、按需阅读与规则维护方式 |
+| `protocol/` | 七个主题：调度、沟通、规划、实现、评审测试、交付、工作树；进入对应阶段时再读 |
 | `workflows/team-up.yaml` | Herdr 启动团队的入口 |
 | `herdr/config.yaml` | 各角色用什么工具、什么模型（install.sh 把 Herdr 插件配置链接到这里） |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩） |
@@ -52,7 +53,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 图片或文件可以和指令一起发送，放在文字前后都可以；第一段文字仍需以「需求：」、`/需求`、`#编号` 或 issue 链接开头，附件会一起带进 issue。改了飞书桥脚本后，需要在原来的窗格按 Ctrl+C，再运行 `python3 ~/.hwf/scripts/feishu-bridge.py` 才会生效；之前已回复用法说明的消息不会自动重试，请在原话题里重新发送需求文字。
 
-从一个需求拆出独立 issue 时，各自使用独立飞书话题：原话题只留新话题链接，结果、截图和确认各归各。调度者按 `PROTOCOL.md`「独立需求与飞书话题」登记并核对建立结果；原话题不会因提到别的编号而切换绑定。`/status` 读取对应 GitLab issue 的当前状态；普通「已收到」回执只代表已转交，不代表执行或交付完成。
+从一个需求拆出独立 issue 时，各自使用独立飞书话题：原话题只留新话题链接，结果、截图和确认各归各。调度者按 `protocol/communication.md`「独立需求与飞书话题」登记并核对建立结果；原话题不会因提到别的编号而切换绑定。`/status` 读取对应 GitLab issue 的当前状态；普通「已收到」回执只代表已转交，不代表执行或交付完成。
 
 ### 私聊即秘书：多个需求统一跟进
 
@@ -88,7 +89,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 ## 怎么改
 
 1. 在 `~/.hwf` 里建分支：`git switch -c <改什么>`。
-2. 改完跑测试：`python3 -m unittest discover -s tests -p 'test_*.py'`。
+2. 按 `PROTOCOL.md`「规则维护方式」修改对应条款，不追加事故流水账；workflow 用 loader 校验，脚本只跑直接相关的测试文件或用例。
 3. 推送并开 MR，合并后其他电脑 `git -C ~/.hwf pull` 即生效（改了 `herdr/config.yaml` 且不是本人电脑的，再跑一次 `install.sh`）。
 
-改动立即对本机生效：正在跑的调度者下一次读协议时就会用新规则。
+协议入口和主题在本机更新后，调度者下次读取时生效；收件箱监听 `PROTOCOL.md` 与 `protocol/` 的提交变化并提醒在途调度者。常驻 Python 脚本改动需在原窗格重启相应进程后生效，不因文件已更新就假定正在运行的进程已重载。

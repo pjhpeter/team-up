@@ -51,10 +51,10 @@ steps:
         入口已后台提交本条需求、不等待你的回复；进度写入任务记录与 STATE.md。hwf run id 用 hwf runs list --json --checkout-root {{context.cwd}} 取 workflow 为 team-up 的最新一条，查不到写 n/a。
         按 ~/.hwf/protocol/scheduling.md「任务标识与索引」核对 INDEX 与 STATE；若仍有在途交付，用 task-record.py index-add --queued 记录本需求，不打断现有任务。任务记录、成员复用、派活与等待均执行该主题；你只做调度，不代做成员工作。
         发通知、拆独立 issue 或收到跨 issue 回复前，读 ~/.hwf/protocol/communication.md「通知模式」「独立需求与飞书话题」「GitLab 收件箱」。需求以「【对话模式】」开头时，只派用户点名角色只读分析（未点名派 arch），原样转贴成员结论；你不分析、不读代码、不判复杂度，直到用户 /go 或明确开工才走交付步骤。
-        debug 仅由用户明确要求触发（debug 模式、改bug、/go debug、/go 改bug，兼容极简模式、/go 极简）；按 ~/.hwf/protocol/implementation.md「debug 模式」执行，角色与模型取 ~/.hwf/herdr/config.yaml，不能自行选择 debug。
+        debug/修bug/改bug/极简模式及对应 /go 指令仅由用户明确要求触发；按 ~/.hwf/protocol/implementation.md「debug 模式」执行，用普通 dev/dev-fe/dev-be，单测与实现前核验后实现，合 develop 等部署，再由 test 在项目 smoke 地址及必要的测试客户端真实验收，通过后只创建 release MR 交用户。不得启动本地 Web/开发版 Electron 验收，也不引入整项代码评审、arch 终审或 release/main 合并；角色模型取 ~/.hwf/herdr/config.yaml，不能自行选择 debug。
         非 debug 先派 arch 按 ~/.hwf/protocol/planning.md §0 判定，§0.1 用户确认后才走对应路径；方案确认、spec、拆分和 issue 标签均按该主题相应章节执行。
-        派测试准备或开发前读 ~/.hwf/protocol/implementation.md §4–6；所有开发含 debug 先过 §6「实现前检查点」，独立 code-review 核准后才派生产代码修改。进入代码评审或自动化验收前读 ~/.hwf/protocol/review-testing.md §7–8；创建或清理工作树前读 ~/.hwf/protocol/worktrees.md。
-        发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；按 §9.1 完成 arch 最终验收并核验剩余工作，再决定继续、澄清或收尾，不把阶段通过当作交付完成。
+        派测试准备或开发前读 ~/.hwf/protocol/implementation.md §4–6；所有开发含 debug 先过 §6「实现前检查点」，独立 code-review 核准后才派生产代码修改。正常流程进入代码评审或自动化验收前读 ~/.hwf/protocol/review-testing.md §7–8；debug 部署后验收读 §8「debug：部署后验收」，不带入本地服务要求。创建或清理工作树前读 ~/.hwf/protocol/worktrees.md。
+        发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；正常流程按 §9.1 完成 arch 最终验收，debug 只核 implementation 的有限出口。核验剩余工作再决定继续、澄清或收尾，不把阶段通过当作交付完成。
     when:
       - '{{steps.custom.stdout}} == ""'
       - "{{steps.scheduler.stdout}}"
@@ -66,10 +66,10 @@ steps:
       入口已后台提交本条需求、不等待你的回复；进度写入任务记录与 STATE.md。hwf run id 取本 pane 环境变量 $HWF_RUN_ID。
       按 ~/.hwf/protocol/scheduling.md「任务标识与索引」核对 INDEX 与 STATE；任务记录、成员复用、派活与等待均执行该主题；你只做调度，不代做成员工作。
       发通知、拆独立 issue 或收到跨 issue 回复前，读 ~/.hwf/protocol/communication.md「通知模式」「独立需求与飞书话题」「GitLab 收件箱」。需求以「【对话模式】」开头时，只派用户点名角色只读分析（未点名派 arch），原样转贴成员结论；你不分析、不读代码、不判复杂度，直到用户 /go 或明确开工才走交付步骤。
-      debug 仅由用户明确要求触发（debug 模式、改bug、/go debug、/go 改bug，兼容极简模式、/go 极简）；按 ~/.hwf/protocol/implementation.md「debug 模式」执行，角色与模型取 ~/.hwf/herdr/config.yaml，不能自行选择 debug。
+      debug/修bug/改bug/极简模式及对应 /go 指令仅由用户明确要求触发；按 ~/.hwf/protocol/implementation.md「debug 模式」执行，用普通 dev/dev-fe/dev-be，单测与实现前核验后实现，合 develop 等部署，再由 test 在项目 smoke 地址及必要的测试客户端真实验收，通过后只创建 release MR 交用户。不得启动本地 Web/开发版 Electron 验收，也不引入整项代码评审、arch 终审或 release/main 合并；角色模型取 ~/.hwf/herdr/config.yaml，不能自行选择 debug。
       非 debug 先派 arch 按 ~/.hwf/protocol/planning.md §0 判定，§0.1 用户确认后才走对应路径；方案确认、spec、拆分和 issue 标签均按该主题相应章节执行。
-      派测试准备或开发前读 ~/.hwf/protocol/implementation.md §4–6；所有开发含 debug 先过 §6「实现前检查点」，独立 code-review 核准后才派生产代码修改。进入代码评审或自动化验收前读 ~/.hwf/protocol/review-testing.md §7–8；创建或清理工作树前读 ~/.hwf/protocol/worktrees.md。
-      发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；按 §9.1 完成 arch 最终验收并核验剩余工作，再决定继续、澄清或收尾，不把阶段通过当作交付完成。
+      派测试准备或开发前读 ~/.hwf/protocol/implementation.md §4–6；所有开发含 debug 先过 §6「实现前检查点」，独立 code-review 核准后才派生产代码修改。正常流程进入代码评审或自动化验收前读 ~/.hwf/protocol/review-testing.md §7–8；debug 部署后验收读 §8「debug：部署后验收」，不带入本地服务要求。创建或清理工作树前读 ~/.hwf/protocol/worktrees.md。
+      发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；正常流程按 §9.1 完成 arch 最终验收，debug 只核 implementation 的有限出口。核验剩余工作再决定继续、澄清或收尾，不把阶段通过当作交付完成。
     using: scheduler
     # 每个调度者独占新 tab，不在入口或收件箱旁创建成员；
     # 它的成员按协议在这个 tab 里分屏，多个交付互不挤占。

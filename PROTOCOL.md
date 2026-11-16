@@ -7,7 +7,7 @@
 - 用户启动 team-up 或明确要求按本流程交付时适用；普通咨询不自动启动团队。GitLab 对话模式和开工条件见 [communication.md](protocol/communication.md)「GitLab 收件箱」。
 - 协议由本入口及 `protocol/` 主题共同组成，安装在用户级 `~/.hwf/`，不复制到业务仓库。源码： https://git.bootingai.net/ai-hub/skills/workflow/team-up 。历史以 Git、issue 和任务记录为准。
 - 项目值只读仓库 `docs/agents/herdr-project.yaml`：GitLab 项目、登记池、看板、测试/上线分支、冒烟地址。本协议的 develop 指 `branches.test`，main 指 `branches.main`；仓库和域名示例不作为其他项目默认值。
-- 缺配置、标签、登记池或看板时，不猜、不自行创建；告知用户先运行 `python3 ~/.hwf/scripts/init-project.py <仓库路径>` 查看事项，确认后加 `--apply`。测试分支为 null 时，先确认合并与冒烟顺序。
+- 缺配置、标签、登记池或看板时，不猜、不自行创建；告知用户先运行 `python3 ~/.hwf/scripts/init-project.py <仓库路径>` 查看事项，确认后加 `--apply`。测试分支为 null 时先确认合并与冒烟顺序；debug 按 implementation 的阻塞规则处理，不转本地验收。
 - 角色参数以 hwf 配置为准，层级和替换授权见 [scheduling.md](protocol/scheduling.md)「角色与启动配置」。项目规则仍约束各仓库实现；不沿用旧任务的账号、安装器、生产文件或路径权限。
 
 ## 共同边界
@@ -82,7 +82,7 @@
 
 - **直达不是免测试**：仅跳过方案阶段，仍走用例、实现前核验、评审和自动化。
 - **步骤/子issue继承方案用例**：最多根→步骤两层，默认根进度列表；建子issue条件在planning §3.1，各步骤从§6进入，仍有实现前检查。
-- **debug仅用户明确触发**：按implementation的有限出口推进，仍有开发侧测试先行；调度者不按“简单”自行选择。
+- **debug/修bug/极简仅用户明确触发**：按 implementation「debug 模式」用普通 dev 角色完成单测先行、实现前核验、实现、develop 合并部署与真实验收，再只创建 release MR 交用户。不做本地端到端验收、整项代码评审或 arch 终审；调度者不按“简单”自行选择。
 - **前后端并行**：先接口约定再各自开发/评审，前端真实测试与合并等待后端部署；详见scheduling。
 - **防风险不另开路径**：所有正常路径命中时加回滚、上线顺序和兼容验证，条件与确认见planning §0。
 

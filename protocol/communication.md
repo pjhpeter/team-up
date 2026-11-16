@@ -23,7 +23,7 @@
 | 开工、派活、继续、纯收到 | 只记 STATE；回执由收件箱/秘书负责 | 不追加重复确认 |
 
 - STATE 顶部「通知模式」记录模式和来源；没写即免打扰。用户单独发送 `/免打扰`/`/quiet` 或 `/详尽`/`/verbose`，或在会话直接要求，即从收到起切换；收件箱回确认后调度者只改 STATE，不再确认，不补发或撤回历史评论。
-- 步骤汇总按 [delivery.md](delivery.md) §9 内容一次附评审、本地测试截图、测试分支 MR/部署/逐条冒烟截图、release MR/SHA、待定项条数；失败旧轮次证据放 details 保留。步骤标题「步骤 <序号> 完成：<名称>」写根 issue。整项汇总在最终验收通过后附上线 MR，收尾回执照常。
+- 正常流程的步骤汇总按 [delivery.md](delivery.md) §9 一次附评审、本地测试截图、测试分支 MR/部署/逐条冒烟截图、release MR/SHA、待定项条数；步骤标题「步骤 <序号> 完成：<名称>」写根 issue，整项汇总在 arch 最终验收通过后附上线 MR。debug 只按 [implementation.md](implementation.md)「debug 模式」的有限出口与证据汇总：本地单测与实现前核验、develop MR/成功部署/逐条真实验收截图、待用户处理的 release MR，不要求本地端到端截图、整项评审或 arch 最终验收。两种路径均保留旧失败轮次证据，收尾回执照常。
 - 免打扰下待定清单在首次步骤完成时一起建（无项不建），后续更新同一条；阶段截图、分支创建和进度不单发。截图/关闭/最终验收所需评论链接指向已发且已回读的汇总，不能因免打扰省证据。
 - 发送前读 STATE 的模式和最近用户通知，判断类别；同一阻塞、风险、动作无变化不重发，换成员、新会话、巡检或重试不算新事实。纠正结论只说变化，旧背景附原链接，不把成员原文和调度总结拆成同义两条。
 
@@ -70,7 +70,7 @@ GitLab 发起任务的确认在发起 issue（无则根 issue）发布并 @发�
 - 默认对话模式。scheduler 只能直接答流程/进度；要读代码材料的技术问题派用户点名角色，未点名派 arch 并注明。多角色分别给原文，不合并改写。
 - 对话派活明确“只读分析，不是复杂度判定”，附用户原话/note、issue、已有分析路径及摘要/全文格式。允许读源码/图谱/git show/GitLab，不改文件、不 checkout、不建分支/worktree/MR/issue、不起服务或测试。需运行取证则报告阻塞申请授权。结尾完成/阻塞，同样后台等待。
 - 同一 issue 同一角色追问沿用该轮分析会话，首次新会话；记录于 STATE。收取原文到 analysis/<序号>-<角色>.md，评论以“<角色> 的分析”开头，用 .comment.md，不加调度者判断。INDEX 用 chat（分析中/已答复待决定）。
-- `/go`（可附说明、debug/改bug和@）或明确“开工/让dev改/按结论做”进入交付，授权等同启动team-up，附全部analysis路径后走 [planning.md](planning.md) §0；明确debug则走 [implementation.md](implementation.md)。单纯认可不算，拿不准先问。记录模式和来源note，INDEX改in-progress；STATE已在交付时后续“对话模式”消息不倒退，/go只作补充。在其他issue发/go也会成为发起issue。
+- `/go`（可附说明、debug/修bug/改bug/极简和@）或明确“开工/让dev改/按结论做”进入交付，授权等同启动team-up，附全部analysis路径后走 [planning.md](planning.md) §0；明确debug/极简则走 [implementation.md](implementation.md)「debug 模式」。单纯认可不算，拿不准先问。记录模式和来源note，INDEX改in-progress；STATE已在交付时后续“对话模式”消息不倒退，/go只作补充。在其他issue发/go也会成为发起issue。
 
 ### 消息与运行参数
 

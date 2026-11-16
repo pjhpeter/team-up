@@ -53,8 +53,7 @@ NOTES_PER_ISSUE = 3
 NOTE_CAP = 400
 STATUS_TEXT = {"working": "正在干活", "idle": "空闲", "done": "空闲", "blocked": "卡在确认界面", "unknown": "状态不明"}
 ROLE_TEXT = {"arch": "架构师", "arch-lite": "方案作者", "precheck": "取证", "code-review": "代码评审", "test-writer": "写用例",
-             "test": "测试", "test-herdr": "测试", "dev": "开发", "dev-fe": "前端开发", "dev-be": "后端开发",
-             "dev-mini": "开发", "dev-fe-mini": "前端开发", "dev-be-mini": "后端开发"}
+             "test": "测试", "test-herdr": "测试", "dev": "开发", "dev-fe": "前端开发", "dev-be": "后端开发"}
 DEFAULT_MODEL = {"model": "jc-gpt/gpt-6-luna", "thinking": "medium", "timeout_s": 120}
 SYSTEM_PROMPT = (
     "你是用户的交付秘书，替他盯着多个由 Agent 团队推进的需求。只根据给你的「任务总览」「各需求最近的评论」「最近转达」回答，"

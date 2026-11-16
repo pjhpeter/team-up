@@ -571,22 +571,108 @@ class InboxTests(unittest.TestCase):
         make(world, state).poll()
         self.assertIn("交付模式", world.prompts[-1])
 
-    def test_go_debug_skips_complexity_and_keeps_rest_as_extra(self) -> None:
-        cases = (("@pjhagent /go debug 先只改文案", "先只改文案"), ("/go 改bug 按钮点不动", "按钮点不动"),
-                 ("/go 改 bug", ""), ("/go Debug 模式", ""), ("/go debug模式", ""),
-                 ("/go 极简 先只改文案", "先只改文案"), ("/go minimal", ""))
-        for body, extra in cases:
-            state = self.origin_state()
-            state["origins"][URL]["mode"] = INBOX.CHAT
-            world = FakeWorld([], notes=[note(6) | {"body": body}])
-            make(world, state).poll()
-            self.assertIn("debug 模式", world.prompts[0], body)
-            self.assertNotIn("§0 复杂度判定开始", world.prompts[0])
-            if extra:
+    def assert_debug_delivery_contract(self, text: str) -> None:
+        self.assertIn("protocol/implementation.md", text)
+        for role in ("dev", "dev-fe", "dev-be"):
+            self.assertRegex(text, rf"(?<![\w-]){role}(?![\w-])")
+        self.assertRegex(text, r"单元测试|单测")
+        self.assertRegex(text, r"develop.*自动化.*release-<根编号>")
+        self.assertNotIn("§0 复杂度判定开始", text)
+        for obsolete in ("dev-mini", "dev-fe-mini", "dev-be-mini", "不测试", "只开发"):
+            self.assertNotIn(obsolete, text)
+
+    def test_debug_commands_route_existing_and_new_issues_to_delivery(self) -> None:
+        aliases = ("debug", "DEBUG", "debug模式", "Debug 模式", "改bug", "改 BUG",
+                   "修bug", "修 Bug", "极简", "极简模式", "极简 模式", "minimal", "MINIMAL")
+        for alias in aliases:
+            for prefix in ("", "/go ", "/GO "):
+                for existing in (True, False):
+                    body = f"@PJHAGENT {prefix}{alias}"
+                    with self.subTest(body=body, existing=existing):
+                        state = self.origin_state() if existing else {}
+                        if existing:
+                            state["origins"][URL]["mode"] = INBOX.CHAT
+                        world = FakeWorld([] if existing else [todo("mentioned", url=f"{URL}#note_6")],
+                                          notes=[note(6, body=body)], owners=None if existing else {})
+                        inbox = make(world, state)
+                        inbox.poll()
+                        self.assertIn(URL, inbox.state["origins"])
+                        self.assertEqual(inbox.state["origins"][URL]["mode"], INBOX.DELIVER)
+                        self.assertEqual(inbox.state["origins"][URL]["initiator"], "pengjh")
+                        dispatched = world.prompts if existing else world.launched
+                        self.assertEqual(len(dispatched), 1)
+                        self.assertFalse(dispatched[0].startswith(INBOX.CHAT_TAG))
+                        self.assert_debug_delivery_contract(dispatched[0])
+                        self.assertNotIn("用户补充", dispatched[0])
+                        for obsolete in ("mini", "不测试", "只开发"):
+                            self.assertNotIn(obsolete, " ".join(world.comments))
+
+    def test_go_debug_keeps_extra_instructions(self) -> None:
+        for command in ("debug", "修 Bug", "极简 模式", "MINIMAL"):
+            with self.subTest(command=command):
+                state = self.origin_state()
+                state["origins"][URL]["mode"] = INBOX.CHAT
+                extra = "按钮点不动，保留 debug 日志"
+                world = FakeWorld([], notes=[note(6, body=f"/go {command} {extra}")])
+                make(world, state).poll()
+                self.assertEqual(state["origins"][URL]["mode"], INBOX.DELIVER)
+                self.assert_debug_delivery_contract(world.prompts[0])
                 self.assertIn(f"用户补充：{extra}", world.prompts[0])
-            else:
-                self.assertNotIn("用户补充", world.prompts[0], body)
-            self.assertIn("debug 模式", world.comments[0])
+
+    def test_debug_mentions_and_negations_remain_conversation(self) -> None:
+        for body in ("不要 debug", "不要极简模式", "不是修bug", "这次不使用 minimal",
+                     "debug 日志在哪里", "极简模式是什么", "请解释 /go debug", "按极简模式推进"):
+            for existing in (True, False):
+                with self.subTest(body=body, existing=existing):
+                    state = self.origin_state() if existing else {}
+                    if existing:
+                        state["origins"][URL]["mode"] = INBOX.CHAT
+                    world = FakeWorld([] if existing else [todo("mentioned", url=f"{URL}#note_6")],
+                                      notes=[note(6, body=body)])
+                    inbox = make(world, state)
+                    inbox.poll()
+                    if existing:
+                        self.assertEqual(inbox.state["origins"][URL]["mode"], INBOX.CHAT)
+                    else:
+                        self.assertNotIn(URL, inbox.state["origins"])
+                    self.assertEqual(len(world.prompts), 1)
+                    self.assertIn(body, world.prompts[0])
+                    self.assertEqual(world.launched, [])
+
+    def test_debug_bridge_footer_routes_standalone_mode(self) -> None:
+        for footer in ("_（来自飞书）_", "_（来自飞书秘书）_"):
+            for existing in (True, False):
+                with self.subTest(footer=footer, existing=existing):
+                    state = self.origin_state() if existing else {}
+                    if existing:
+                        state["origins"][URL]["mode"] = INBOX.CHAT
+                    body = f"极简模式\n\n{footer}"
+                    world = FakeWorld([] if existing else [todo("mentioned", url=f"{URL}#note_6")],
+                                      notes=[note(6, body=body)], owners=None if existing else {})
+                    inbox = make(world, state)
+                    inbox.poll()
+                    self.assertIn(URL, inbox.state["origins"])
+                    self.assertEqual(inbox.state["origins"][URL]["mode"], INBOX.DELIVER)
+                    dispatched = world.prompts if existing else world.launched
+                    self.assertEqual(len(dispatched), 1)
+                    self.assert_debug_delivery_contract(dispatched[0])
+                    self.assertNotIn("用户补充", dispatched[0])
+
+    def test_debug_bridge_footer_preserves_noncommand_body(self) -> None:
+        for footer in ("_（来自飞书）_", "_（来自飞书秘书）_"):
+            for text in ("不要极简模式", "> 极简模式", "极简模式\n\n> 引用上一条消息",
+                         "> 上一条消息\n\n极简模式", f"极简模式\n\n{footer}\n正文仍有内容",
+                         "极简模式 _（来自其他系统）_"):
+                with self.subTest(footer=footer, text=text):
+                    state = self.origin_state()
+                    state["origins"][URL]["mode"] = INBOX.CHAT
+                    body = f"{text}\n\n{footer}"
+                    world = FakeWorld([], notes=[note(6, body=body)])
+                    make(world, state).poll()
+                    self.assertEqual(state["origins"][URL]["mode"], INBOX.CHAT)
+                    self.assertEqual(len(world.prompts), 1)
+                    self.assertIn(body, world.prompts[0])
+                    self.assertEqual(world.launched, [])
 
     def test_go_with_other_extra_is_not_debug(self) -> None:
         state = self.origin_state()

@@ -492,12 +492,14 @@ arch 每轮输出明确问题、严重程度、对应证据与修正建议；arc
 
 最终方案在**提交用户确认之前**上传为 GitLab 项目 snippet（代码段），确认请求附它的链接；用户确认后把同一个 snippet 标为已确认并把链接附到 issue。
 
+**代码段可见性（2026-11-16 用户授权，方案与测试用例统一适用）**：GitLab 限制创建 `private` 代码段，统一使用 `internal`，避免上传被 403 阻断。`internal` 是内部可见，受 GitLab 项目与用户访问规则约束，不等于仅项目成员可见；不得上传凭据或敏感数据，不得改为 `public`。上传后回读确认 `visibility` 为 `internal`。本规则用于后续上传，不批量修改历史代码段，也不撤销用户针对单项任务指定的其他存档方式。
+
 1. **上传（确认前）**：使用 origin 对应的项目，不凭其他 remote 推断：
    ```bash
    glab snippet create -R <origin GROUP/REPO> \
      --title "<issue IID> 最终技术方案 r<N>（待确认）" \
      --filename "<方案文件名>" \
-     --visibility private \
+     --visibility internal \
      --description "<issue URL>；SHA-256 <sha>；待用户确认" \
      <方案文件>
    ```
@@ -505,7 +507,7 @@ arch 每轮输出明确问题、严重程度、对应证据与修正建议；arc
 2. **回读**：从命令输出取得 snippet ID/URL，再用 `glab api projects/:fullpath/snippets/<id>` 回读 `web_url` 与文件内容；核对方案 SHA-256 与提交确认的版本一致。回读通过后才发确认请求（会话回复、issue 评论、ntfy 正文都附 `web_url`）。不得只凭本地路径或口头摘要代替。
 3. **确认后标记并回填 issue**：用户确认后，用 `glab api --method PUT projects/:fullpath/snippets/<id>` 把标题改为“<issue IID> 最终技术方案 r<N>（已确认）”、描述补上用户确认时间与确认来源，回读确认；再在发起该交付的 issue 下评论 snippet URL、方案文件名、SHA-256、用户确认时间，回读评论，确认链接存在且 snippet 可访问。用户确认的版本与 snippet 内容不一致时，不得标记，按第 1 步重新上传并重新确认。
 4. **后续引用**：第 3 阶段创建的 spec issue 与实现子 issue 必须带同一个已确认 snippet 链接；STATE 记录 snippet URL、snippet ID、创建时间、确认时间、方案 SHA 与 issue 评论定位。
-5. **失败处理**：上传失败或回读不一致时报告阻塞并保留本地方案与恢复信息，不得在没有链接的情况下请用户确认，也不得跳过上传直接进入 spec。snippet 使用项目私有可见性（项目成员可见），不得改为 public。
+5. **失败处理**：上传失败或回读不一致时报告阻塞并保留本地方案与恢复信息，不得在没有链接的情况下请用户确认，也不得跳过上传直接进入 spec。可见性遵守本节统一规则。
 
 ### 3. 调度者编写 spec 与 GitLab issues
 
@@ -558,7 +560,7 @@ code-review 核对用例是否逐条覆盖 arch 的验收条件（方案路径�
    glab snippet create -R <origin GROUP/REPO> \
      --title "<issue IID> 测试用例（已评审）" \
      --filename "<用例文件名>" \
-     --visibility private \
+     --visibility internal \
      --description "<issue URL>；用例评审通过轮次 <N>；通过时间 <ISO8601>" \
      <用例文件>
    ```
@@ -566,7 +568,7 @@ code-review 核对用例是否逐条覆盖 arch 的验收条件（方案路径�
 2. **回读**：从命令输出取得 snippet ID/URL，再用 `glab api projects/:fullpath/snippets/<id>` 回读 `web_url` 与文件内容；核对用例 SHA-256 与评审通过的版本一致。不得只凭本地路径或口头摘要代替。
 3. **回填 issue**：在用例对应的 issue 下发表评论（用例覆盖多个 issue 时，至少回填父 spec，并在每个相关实现子 issue 的派活中附链接），附 snippet URL、用例文件名、SHA-256、评审通过轮次与时间；回读评论，确认链接存在且 snippet 可访问。
 4. **后续引用**：dev/test 派活、代码评审交接包和测试报告必须引用该 snippet 链接；§8 自动化测试必须对应这个已评审版本。STATE 记录 snippet URL、snippet ID、创建时间、用例 SHA、评审轮次与 issue 评论定位。
-5. **失败处理**：上传失败或回读不一致时报告阻塞并保留本地用例与恢复信息，不得跳过上传直接进入开发。snippet 使用项目私有可见性（项目成员可见），不得改为 public。
+5. **失败处理**：上传失败或回读不一致时报告阻塞并保留本地用例与恢复信息，不得跳过上传直接进入开发。可见性遵守 §2.2 的统一规则，使用 `internal` 并回读确认，不得改为 `public`。
 
 ### 6. 开发人员开发
 

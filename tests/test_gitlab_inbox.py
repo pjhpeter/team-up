@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import shlex
 import sys
 import tempfile
 from typing import Any
@@ -868,9 +869,92 @@ class ProtocolChangeTests(unittest.TestCase):
         world = self.world("bbbb2222")
         self.run_round(world, state)
         self.assertEqual(world.prompt_panes, ["w1:p1"])  # 没有未收尾交付的调度者不打扰
-        self.assertIn("git -C ~/.hwf diff aaaa1111 bbbb2222 -- PROTOCOL.md", world.prompts[0])
+        command = next(part for part in world.prompts[0].split("`") if part.startswith("git "))
+        self.assertEqual(shlex.split(command)[3:], ["diff", "aaaa1111", "bbbb2222", "--", "PROTOCOL.md", "protocol/"])
         self.run_round(world, state)
         self.assertEqual(len(world.prompts), 1)
+
+    def test_topic_only_commit_notifies_and_unrelated_commit_does_not(self) -> None:
+        # 真正的 Git 历史验证路径范围，避免假执行器无论查哪个文件都返回同一个版本。
+        with tempfile.TemporaryDirectory(prefix="hwf-protocol-") as directory:
+            root = Path(directory)
+
+            def git(*args: str) -> str:
+                return subprocess.run(["git", "-C", directory, *args], check=True,
+                                      capture_output=True, text=True).stdout.strip()
+
+            git("init", "--quiet")
+            git("config", "user.name", "Protocol Test")
+            git("config", "user.email", "protocol-test@example.invalid")
+            git("config", "commit.gpgsign", "false")
+            git("config", "core.hooksPath", "/dev/null")
+            (root / "PROTOCOL.md").write_text("Protocol entry\n")
+            (root / "protocol").mkdir()
+            topic = root / "protocol/communication.md"
+            topic.write_text("Original notification rules\n")
+            git("add", ".")
+            git("commit", "--quiet", "-m", "Initial protocol")
+            old = git("rev-parse", "HEAD")
+            state: dict[str, Any] = {"protocol_rev": old}
+            world = self.world("")
+            original_call = world.call
+
+            def call(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+                if argv[0] == "git":
+                    return subprocess.run(argv, capture_output=True, text=True)
+                return original_call(argv, **kw)
+
+            world.call = call
+            topic.write_text("Updated notification rules\n")
+            git("add", "protocol/")
+            git("commit", "--quiet", "-m", "Update topic only")
+            revised = git("rev-parse", "HEAD")
+            with patch.object(INBOX, "HWF_HOME", root):
+                self.run_round(world, state)
+                self.assertEqual(state["protocol_rev"], revised)
+                self.assertEqual(world.prompt_panes, ["w1:p1"])
+                command = next(part for part in world.prompts[0].split("`") if part.startswith("git "))
+                diff = git(*shlex.split(command)[3:])
+                self.assertIn("+Updated notification rules", diff)
+                self.run_round(world, state)
+                (root / "unrelated.txt").write_text("Not a protocol change\n")
+                git("add", "unrelated.txt")
+                git("commit", "--quiet", "-m", "Unrelated change")
+                self.run_round(world, state)
+            self.assertEqual(state["protocol_rev"], revised)
+            self.assertEqual(len(world.prompts), 1)
+
+    def test_failed_notice_keeps_old_revision_for_retry(self) -> None:
+        state: dict[str, Any] = {"protocol_rev": "aaaa1111"}
+        world = self.world("bbbb2222")
+        world.prompt_rc = 1
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "aaaa1111")
+        world.prompt_rc = 0
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "bbbb2222")
+        self.assertEqual(world.prompt_panes, ["w1:p1", "w1:p1"])
+        self.run_round(world, state)
+        self.assertEqual(len(world.prompts), 2)
+
+    def test_scheduler_query_failure_keeps_old_revision_for_retry(self) -> None:
+        state: dict[str, Any] = {"protocol_rev": "aaaa1111"}
+        world = self.world("bbbb2222")
+        original_call = world.call
+
+        def call(argv: list[str], **kw: Any) -> subprocess.CompletedProcess[str]:
+            if argv[:3] == ["herdr", "agent", "list"]:
+                return subprocess.CompletedProcess(argv, 1, "", "Agent list unavailable")
+            return original_call(argv, **kw)
+
+        world.call = call
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "aaaa1111")
+        self.assertEqual(world.prompts, [])
+        world.call = original_call
+        self.run_round(world, state)
+        self.assertEqual(state["protocol_rev"], "bbbb2222")
+        self.assertEqual(world.prompt_panes, ["w1:p1"])
 
     def test_find_scheduler_module_really_loads(self) -> None:
         with patch.object(INBOX, "_FIND_SCHEDULER", None):

@@ -25,7 +25,7 @@
      只有 `/免打扰`（`/quiet`）或 `/详尽`（`/verbose`）的评论切换本交付的通知模式：转给调度者记入 STATE，
      收件箱回一条确认，调度者不再另发确认评论。
   用户回复「状态:等你处理」的 issue 时，收件箱按标签历史把它改回进入等待前的阶段，并告诉调度者（仍要用户处理时由调度者改回）。
-  ~/.hwf/PROTOCOL.md 有新提交时，提醒名下有未收尾交付的在线调度者看改动（它们只在启动时读协议）。
+  ~/.hwf/PROTOCOL.md 或 protocol/ 有新提交时，提醒名下有未收尾交付的在线调度者看改动。
   每条转交的评论都会立即得到回执（转给谁、它在不在干活、在做什么）；调度者卡在确认界面时在发起 issue @发起人一次。
   卡住时能读出界面上的单选题，就把题目和编号选项贴出来；发起人回复一个数字（如 `1`、`选 2`），收件箱核对界面
   没变后替他按键选中，并回帖结果（2026-11-03 用户指示：不在电脑旁也能在飞书里作答）。
@@ -69,12 +69,12 @@ LAUNCH_COOLDOWN_S = 600
 RESET_COMMANDS = frozenset({"/new", "/clear"})
 STATUS_COMMANDS = frozenset({"/status"})
 GO_COMMANDS = frozenset({"/go"})
-# 通知模式（见 PROTOCOL「通知模式」）：免打扰 = 只在大步骤完成和需要用户处理时发评论；详尽 = 每个小阶段都发。
+# 通知模式（见 protocol/communication.md「通知模式」）：免打扰 = 只在大步骤完成和需要用户处理时发评论；详尽 = 每个小阶段都发。
 QUIET, VERBOSE = "quiet", "verbose"
 NOTIFY_COMMANDS = {"/免打扰": QUIET, "/quiet": QUIET, "/详尽": VERBOSE, "/verbose": VERBOSE}
 NOTIFY_LABELS = {QUIET: ("免打扰", "之后只在每个步骤完成、整项交付完成和需要你处理时发消息"),
                  VERBOSE: ("详尽", "之后每个小阶段都会发消息")}
-# `/go` 后紧跟其中一个词 = 用户明确要求 debug 模式（只开发 + 提交 MR 到 release-<根编号>，见 PROTOCOL「debug 模式」）。
+# `/go` 后紧跟其中一个词 = 用户明确要求 debug 模式（只开发 + 提交 MR 到 release-<根编号>，见 protocol/implementation.md「debug 模式」）。
 # 「极简」「minimal」是改名前的旧叫法，保留兼容。前两个词连起来也认，覆盖「/go debug 模式」「/go 改 bug」。
 DEBUG_WORDS = frozenset({"debug", "debug模式", "改bug", "极简", "极简模式", "minimal"})
 # 发起 issue 的两种模式：对话 = 只读 + 评论答疑；交付 = 跑完整交付流程。指派后默认对话，/go 切到交付。
@@ -102,7 +102,7 @@ THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "a
 # 每次投递都把通知规则放回上下文，避免调度者只在首次启动时读过、续跑后忘记。
 NOTIFY_REMINDER = (
     "\n[通知检查] issue 评论只用 ~/.hwf/scripts/task-record.py note 发（请用户同意或授权时带 --will，脚本先自查做不做得了）；"
-    "发之前先读 ~/.hwf/PROTOCOL.md「通知模式」的发送前核对与同一件事只说一次，"
+    "发之前先读 ~/.hwf/protocol/communication.md「通知模式」的发送前核对与同一件事只说一次，"
     "再对照本任务 STATE 的通知模式和最近用户通知。未记录模式时按免打扰；"
     "本条若是用户切换通知模式的指令，先应用切换。只有收到/开始/派工的确认写 STATE，"
     "回执由收件箱或秘书承担；实质答复、新风险和新增用户待办按协议及时通知。"
@@ -246,8 +246,8 @@ class Inbox:
             return None
         self.prompt(pane, (
             f"[GitLab 收件箱] 用户要求清空上下文，你已在新会话中。你是任务 {task} 的调度者：按 "
-            "~/.hwf/PROTOCOL.md 开头「调度者阅读指引与省词元」读必读章节，用 herdr agent get 核对登记身份（不要改名），再按 .hwf/tmp/INDEX.md 与该任务 "
-            "STATE.md 接续；在 STATE 记录新会话。结束回合或收到关闭通知前，按协议「阶段通过不等于交付完成」和 §9「关闭前核对」核验剩余工作。"))
+            "~/.hwf/PROTOCOL.md 的阅读入口读取 ~/.hwf/protocol/scheduling.md，用 herdr agent get 核对登记身份（不要改名），再按 .hwf/tmp/INDEX.md 与该任务 "
+            "STATE.md 接续；在 STATE 记录新会话。结束回合或收到关闭通知前，按 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」核验剩余工作。"))
         return result.stdout
 
     def comment(self, where: Mapping[str, Any], body: str) -> None:
@@ -309,7 +309,7 @@ class Inbox:
             self.comment(where, f"@{user} 这个 issue 现在没有对应的交付，开工后再发 {command}。")
             return True
         text = (f"[GitLab 收件箱] 用户在 {url}#note_{note['id']} 发出 {command}：把本交付的通知模式切换为「{label}」，"
-                "写进 STATE 顶部「通知模式」（附该 note 链接），之后按 ~/.hwf/PROTOCOL.md「通知模式」执行。"
+                "写进 STATE 顶部「通知模式」（附该 note 链接），之后按 ~/.hwf/protocol/communication.md「通知模式」执行。"
                 "收件箱已在 issue 回复确认，你不要再发确认评论。")
         receipt = self.deliver(repo, url, text, self.mode_of(url))
         if receipt is None:
@@ -342,8 +342,8 @@ class Inbox:
             forwarded = bool(rest) and self.deliver(repo, url, self.message(url, note, True), DELIVER) is not None
             self.comment(where, f"@{user} 这个 issue 已经在交付流程中了。" + ("补充说明已转给调度者。" if forwarded else ""))
             return True
-        flow = ("用户明确要求 debug 模式：按 ~/.hwf/PROTOCOL.md「debug 模式」领取 dev-mini 开发并提交 MR 到 release-<根编号>，不做复杂度判定"
-                if debug else "按 ~/.hwf/PROTOCOL.md 从 §0 复杂度判定开始")
+        flow = ("用户明确要求 debug 模式：按 ~/.hwf/protocol/implementation.md「debug 模式」领取 dev-mini 开发并提交 MR 到 release-<根编号>，不做复杂度判定"
+                if debug else "按 ~/.hwf/protocol/planning.md 从 §0 复杂度判定开始")
         go = (f"[GitLab 收件箱] 用户在 {url}#note_{note['id']} 发出 /go：从对话模式切换到交付流程，"
               f"{flow}交付这个 issue（发起人 @{user}）。"
               + (f"\n用户补充：{extra}" if extra else ""))
@@ -454,9 +454,9 @@ class Inbox:
             f"{note['body']}\n"
             f"这条回复只属于上方所附 issue（{url}）。正文提到其他编号不改变归属，"
             "不得因此移交到其他 issue，也不得把本条的同意、确认或合并授权用于其他 issue。"
-            "如果确实提出了独立新需求，按 ~/.hwf/PROTOCOL.md 的拆分流程建立独立 issue 和话题，"
+            "如果确实提出了独立新需求，按 ~/.hwf/protocol/communication.md「独立需求与飞书话题」建立独立 issue 和话题，"
             "在来源话题留下跳转链接，不得在当前会话悄悄接管新需求。"
-            "按 ~/.hwf/PROTOCOL.md「GitLab 收件箱」处理这条用户消息。"
+            "按 ~/.hwf/protocol/communication.md「GitLab 收件箱」处理这条用户消息。"
         )
 
     def remember(self, note_id: int) -> None:
@@ -619,8 +619,8 @@ class Inbox:
             # 关闭是平台状态，不是交付结论；是否收尾由调度者核对证据与用户取消意图后决定。
             _, pane = self.owner(origin["repo"], url)
             if pane:
-                self.prompt(pane, f"[GitLab 收件箱] 检测到发起 issue 已关闭 {url}。先按 ~/.hwf/PROTOCOL.md "
-                                  "§9「关闭前核对」核验交付证据和剩余工作；关闭事件本身不代表验收或交付完成。"
+                self.prompt(pane, f"[GitLab 收件箱] 检测到发起 issue 已关闭 {url}。先按 ~/.hwf/protocol/delivery.md "
+                                  "§9「完成评论与关闭前核对」「发起 issue 的关闭授权」核验交付证据和剩余工作；关闭事件本身不代表验收或交付完成。"
                                   "仍有未完成项且用户未明确取消时，在原 issue 说明缺项，请用户重开继续或明确取消，"
                                   "INDEX 保持 blocked，保留成员与 worktree；测试服务仍按每轮规则清理。"
                                   "只有确认交付完成或用户明确取消后，才执行 §9「成员收尾与收尾回执」。")
@@ -736,7 +736,7 @@ class Inbox:
     # ---- 协议更新 ----
 
     def protocol_rev(self) -> str:
-        result = self._exec(["git", "-C", str(HWF_HOME), "log", "-1", "--format=%H", "--", "PROTOCOL.md"])
+        result = self._exec(["git", "-C", str(HWF_HOME), "log", "-1", "--format=%H", "--", "PROTOCOL.md", "protocol/"])
         return result.stdout.strip() if result.returncode == 0 else ""
 
     def busy_schedulers(self) -> list[str]:
@@ -752,9 +752,8 @@ class Inbox:
         return sorted(a["pane_id"] for a in agents if a.get("name") in names and a.get("pane_id"))
 
     def notify_protocol_change(self) -> None:
-        """PROTOCOL.md 有新提交时提醒在跑的调度者重读改动：它们只在启动时读协议，
-        新规则（例如 2026-11-13 的免打扰）对已在跑的交付不生效，#478 因此一直按旧习惯每个小阶段都发评论。
-        首次运行只记版本；查不到在线调度者时不推进版本，下一轮重试。"""
+        """入口或主题有新提交时提醒在跑的调度者重读改动。
+        继续沿用提交 SHA 水位，旧 state 无需迁移；查询或投递失败时保留旧版本供下一轮重试。"""
         rev = self.protocol_rev()
         old = self.state.get("protocol_rev")
         if not rev or rev == old:
@@ -765,11 +764,15 @@ class Inbox:
             except Exception as exc:  # 提醒是附带的，任何失败都不能拖垮这一轮收件箱
                 log(f"protocol change notice skipped this round: {exc!r}")
                 return
-            text = (f"[GitLab 收件箱] ~/.hwf/PROTOCOL.md 有更新（{old[:8]} → {rev[:8]}），你启动时读的是旧版。"
-                    f"当前这一步告一段落后，运行 `git -C ~/.hwf diff {old} {rev} -- PROTOCOL.md` 看改了什么，"
+            text = (f"[GitLab 收件箱] ~/.hwf/PROTOCOL.md 或 protocol/ 有更新（{old[:8]} → {rev[:8]}），你启动时读的是旧版。"
+                    f"当前这一步告一段落后，运行 `git -C ~/.hwf diff {old} {rev} -- PROTOCOL.md protocol/` 看改了什么，"
                     "之后按新规则继续本交付（STATE 里需要补的字段一并补上）。这条提醒不用发评论。")
+            delivered = True
             for pane in panes:
-                self.prompt(pane, text)
+                if not self.prompt(pane, text):
+                    delivered = False
+            if not delivered:
+                return
             log(f"protocol {old[:8]} → {rev[:8]}: notified {panes}")
         self.state["protocol_rev"] = rev
         save_state(self.state)

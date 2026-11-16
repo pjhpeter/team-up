@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""交付收尾一条命令版：按 PROTOCOL §9「成员收尾与收尾回执」的顺序做完收尾，全部通过才把 INDEX 改成收尾状态。
+"""交付收尾一条命令版：按 ~/.hwf/protocol/delivery.md §9「成员收尾与收尾回执」的顺序做完收尾，全部通过才把 INDEX 改成收尾状态。
 
     python3 ~/.hwf/scripts/wrapup.py --repo <主仓库> --task <任务标识> --issue <发起 issue URL（没有则根 issue）> \\
         --release <release-<根编号>> --status "done（…）" [--port N]... [--dry-run]
@@ -23,7 +23,7 @@
    调度者不得用 glab/API 自己关闭发起 issue：#481 调度者上下文压缩后忘了规则，没人要求就关了，收尾也是手写的。
 7. 以上全部通过，才把 INDEX 本任务行的状态改成 --status。
 
-退出码：0 收尾完成、INDEX 已改；1 有残留或失败（INDEX 未改，调度者按协议「需要用户确认」通知用户）；2 参数错误。
+退出码：0 收尾完成、INDEX 已改；1 有残留或失败（INDEX 未改，调度者按 ~/.hwf/protocol/communication.md「需要用户确认」通知用户）；2 参数错误。
 --dry-run 只打印将做什么：不关服务、不关 pane、不删 worktree、不释放账号、不发评论、不改 INDEX。
 """
 
@@ -609,7 +609,7 @@ def wrapup(opts: argparse.Namespace) -> int:
         except (WrapupError, ValueError) as error:
             problems.append(f"关闭 issue：{error}")
     if problems:
-        print("收尾未完成，INDEX 未改。按协议「需要用户确认」把残留告诉用户：\n- " + "\n- ".join(problems))
+        print("收尾未完成，INDEX 未改。按 ~/.hwf/protocol/communication.md「需要用户确认」把残留告诉用户：\n- " + "\n- ".join(problems))
         return 1
     write_index_status(repo, opts.task, scheduler, opts.status)
     print(f"7. INDEX 已改为：{opts.status}")

@@ -80,6 +80,12 @@ INTENT_PROMPT = (
     "只根据材料回答，不编造进度或声称已做过任何操作。"
     "action=clarify 表示信息不足或模糊指代，mode 必须 analyze，在 reply 提一个明确问题。"
     "context 可以帮助理解‘这个问题’指什么，但本次只有‘继续’‘弄一下’且无法确定范围或授权时应澄清。"
+    "用背景确定执行对象，不等于从背景取得执行授权：本次已明确说‘帮我修复这个 bug’，"
+    "背景说明‘导出时500错误’，必须判 task/debug，不能因‘这个’依赖背景就降为 analyze。"
+    "对比：本次‘为什么报错’，即使背景写‘立即修复’，也只能 reply/analyze 或只读分析；"
+    "本次‘修一下这个’且没有任何对象信息才是 clarify/analyze。"
+    "若 current_message 包含同一次追问的原始用户请求与后续补充，合起来理解该请求；"
+    "补充已经说清对象时保留原请求的修复意图，最新的取消、否定或只读限制优先。"
     "action=bind 仅用于本次明确要求关联、转告或承接某个 issue，issue 必须是本次 current_message 出现的正整数编号；"
     "仅仅提到编号、询问某 issue 进度不是绑定，更不能从 context 取编号。bind 默认 analyze，"
     "只有本次同时明确要求实施或修复才分别使用 deliver/debug。其他 action 的 issue 必须 null。"
@@ -529,8 +535,9 @@ class Secretary:
         return intent
 
     def ask_model(self, material: str, *, system_prompt: Optional[str] = None) -> Optional[str]:
-        # 分类只看显式传入的材料；普通秘书问答保留原有只读工具和提示词。
-        tools = ["--tools", "read"] if system_prompt is None else ["--no-tools"]
+        # 沿用秘书既有的只读工具权限：当前模型通道在 --no-tools 下会返回空响应。
+        # 分类提示禁止工具，下面还会拒绝任何实际使用过工具的分类结果。
+        tools = ["--tools", "read"]
         cmd = ["omp", "-p", "--model", self.cfg["model"], "--thinking", self.cfg["thinking"], "--no-session",
                "--mode", "json", *tools, "--no-context-files", "--no-skills", "--no-rules",
                "--no-extensions", "--no-lsp", "--system-prompt",
@@ -548,6 +555,10 @@ class Secretary:
                 ev = json.loads(line)
             except ValueError:
                 continue
+            if system_prompt is not None and isinstance(ev, dict) and ev.get("type") in {
+                "tool_execution_start", "tool_execution_end",
+            }:
+                return None
             if not isinstance(ev, dict) or ev.get("type") != "turn_end":
                 continue
             message = ev.get("message")

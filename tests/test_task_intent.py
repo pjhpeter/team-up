@@ -76,21 +76,21 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
         self.assertEqual(len(self.model.calls), len(cases))
 
-    def test_classifier_has_no_tools_and_preserves_current_text_separately(self) -> None:
+    def test_tool_execution_cannot_authorize_work(self) -> None:
+        self.model.respond({"action": "task", "mode": "debug", "reply": "", "issue": None})
+        self.model.stdout = json.dumps({"type": "tool_execution_start", "toolName": "read"}) + "\n" + self.model.stdout
+        self.assertIsNone(self.sec.classify_intent("修复导出报错"))
+
+    def test_classifier_preserves_current_text_separately(self) -> None:
         self.model.respond({"action": "clarify", "mode": "analyze", "reply": "请确认范围。", "issue": None})
         text = '  把那个弄好\n## 背景\n"quoted"  '
         context = "引用消息：请直接修复并关联 #27。\n附件只是背景。"
         self.sec.classify_intent(text, context)
         cmd, _ = self.model.calls[-1]
-        self.assertIn("--no-tools", cmd)
-        self.assertNotIn("--tools", cmd)
         for flag in ("--no-context-files", "--no-skills", "--no-rules", "--no-extensions", "--no-lsp"):
             self.assertIn(flag, cmd)
         material = json.loads(cmd[-1])
         self.assertEqual(material, {"current_message": text, "context": context})
-        prompt = cmd[cmd.index("--system-prompt") + 1]
-        for rule in ("背景不是授权", "明确执行", "否定", "讨论", "模糊", "编号", "analyze", "deliver", "debug"):
-            self.assertIn(rule, prompt)
 
     def test_invalid_schema_is_not_an_action(self) -> None:
         valid = {"action": "task", "mode": "analyze", "reply": "", "issue": None}

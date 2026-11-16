@@ -276,20 +276,51 @@ class Bridge:
         return [(p["mid"], [{"key": p["key"], "kind": p.get("kind", "image"), "name": p.get("name", "")}])
                 for p in fresh]
 
-    def images_markdown(self, msg: dict[str, Any], project: str,
-                        extra: Optional[list[tuple[str, list[dict[str, str]]]]] = None) -> str:
-        """把这条消息、它所回复的消息、话题根消息、以及之前单独发的图片和文件搬到 GitLab，返回要附在正文后的 Markdown。"""
-        sources = [(msg["message_id"], find_attachments(msg.get("content") or ""))] + (extra or [])
-        # 在文件下面「回复话题」时 root_id 是文件那条；引用回复时 reply_to 是被引用那条，两个都要看
+    def recover_reply(self, msg: dict[str, Any]) -> None:
+        """CLI 的紧凑消息会丢引用字段；只对已授权的指令补读原生关系，不改话题归属。"""
+        if msg.get("reply_to"):
+            return
+        mid = msg["message_id"]
+        try:
+            data = self.lark(["api", "GET", f"/open-apis/im/v1/messages/{mid}"])
+            item = next((m for m in (data.get("data") or {}).get("items", []) if m.get("message_id") == mid), None)
+            if item is None:
+                raise BridgeError("message metadata unavailable")
+            msg["reply_to"] = item.get("parent_id") or ""
+            msg["root_id"] = item.get("root_id") or msg.get("root_id") or ""
+        except BridgeError as e:
+            log(f"read reply metadata {mid} failed: {e}")
+            msg["context_warning"] = "_（未能读取飞书引用关系，可能缺少上下文。）_"
+
+    def message_context(self, msg: dict[str, Any], project: str,
+                        extra: Optional[list[tuple[str, list[dict[str, str]]]]] = None,
+                        *, include_thread: bool = False, exclude_related: tuple[str, ...] = ()) -> str:
+        """统一收集前文、直接引用和附件；按消息与资源去重，不把引用文字当成新指令。"""
+        context, context_files, seen = self.thread_context(msg) if include_thread else ("", [], set())
+        sources = [(msg["message_id"], find_attachments(msg.get("content") or ""))] + (extra or []) + context_files
+        parts = [p for p in (context, msg.get("context_warning")) if p]
+        seen.update((msg["message_id"], *exclude_related))
         for related in dict.fromkeys((msg.get("reply_to") or "", msg.get("root_id") or "")):
-            if not related or related == msg["message_id"]:
+            if not related or related in seen:
                 continue
+            seen.add(related)
             try:
-                items = (self.lark(["im", "+messages-mget", "--message-ids", related]).get("data") or {}).get("messages")
-                sources.append((related, find_attachments((items or [{}])[0].get("content") or "")))
+                items = (self.lark(["im", "+messages-mget", "--message-ids", related, "--no-reactions"]).get("data") or {}).get("messages", [])
+                item = next((m for m in items if m.get("message_id") == related), None)
+                if item is None or item.get("deleted"):
+                    raise BridgeError("quoted message unavailable")
+                raw = self.clean_text(normalize_history(item))
+                sources.append((related, find_attachments(raw)))
+                body = strip_attachments(raw).strip()
+                if body:
+                    if len(body) > CONTEXT_TEXT_CAP:
+                        body = body[:CONTEXT_TEXT_CAP] + "\n（引用内容较长，后文省略。）"
+                    parts.append("**引用的消息**（从飞书原样搬来）：\n\n" +
+                                 "\n".join("> " + line if line else ">" for line in body.splitlines()))
             except BridgeError as e:
-                log(f"read related {related} failed: {e}")
-        parts, done = [], set()
+                log(f"read quoted message {related} failed: {e}")
+                parts.append(f"_（未能读取引用消息 {related}，请补充这段上下文。）_")
+        done: set[str] = set()
         for mid, items in sources:
             for a in items:
                 if a["key"] in done:
@@ -383,6 +414,7 @@ class Bridge:
         if not user:
             self.reply(mid, random.choice(DENY_TEXTS), f"deny-{mid}")
             return
+        self.recover_reply(msg)
         text = self.clean_text(msg)
         private = msg.get("chat_type") != "group" and chat not in self.state["group_chats"]
         if private:
@@ -537,20 +569,20 @@ class Bridge:
         if tid:
             self.state["thread_ids"][tid] = key
 
-    def thread_context(self, msg: dict[str, Any]) -> tuple[str, list[tuple[str, list[dict[str, str]]]]]:
-        """在别人的话题里发「需求：」时，把这条之前的人类发言原样带上，否则 Agent 只看得到「处理这个问题」。
-        返回（引用块 Markdown，前文里的附件）；读不到就返回空，不影响建单。"""
+    def thread_context(self, msg: dict[str, Any]) -> tuple[str, list[tuple[str, list[dict[str, str]]]], set[str]]:
+        """收集当前指令之前的话题前文，返回已收集的消息 ID，避免与直接引用重复。"""
         tid = msg.get("thread_id") or ""
         if not tid:
-            return "", []  # 主聊天区的引用回复没有话题，被引用那条的附件已由 images_markdown 处理
+            return "", [], set()
         try:
             data = self.lark(["im", "+threads-messages-list", "--thread", tid, "--order", "asc",
                               "--no-reactions", "--page-all", "--page-limit", "4"])
         except BridgeError as e:
             log(f"read thread context {tid} failed: {e}")
-            return "", []
-        lines: list[str] = []
+            return "", [], set()
+        lines: list[tuple[str, str]] = []
         attachments: list[tuple[str, list[dict[str, str]]]] = []
+        seen: set[str] = set()
         for item in (data.get("data") or {}).get("messages", []):
             m = normalize_history(item)
             if m["message_id"] == msg["message_id"]:
@@ -567,29 +599,30 @@ class Bridge:
                 continue
             when = (item.get("create_time") or "").strip()
             head = f"**{m['sender_name'] or m['sender_id'] or '?'}**" + (f"（{when}）" if when else "")
-            lines.append("\n".join(f"> {l}" if l else ">" for l in f"{head}：{body}".splitlines()))
+            lines.append((m["message_id"], "\n".join(f"> {l}" if l else ">" for l in f"{head}：{body}".splitlines())))
         if not lines:
-            return "", attachments
+            return "", attachments, seen
         kept: list[str] = []
         total = 0
-        for line in reversed(lines):
+        for mid, line in reversed(lines):
             total += len(line)
             if kept and total > CONTEXT_TEXT_CAP:
                 kept.append("> …更早的消息省略")
                 break
             kept.append(line)
-        return "**话题里的前文**（从飞书原样搬来）：\n\n" + "\n>\n".join(reversed(kept)), attachments
+            # 只有实际保留的前文才去重；被截掉的旧消息仍可能是用户本次明确引用的对象。
+            seen.add(mid)
+        return "**话题里的前文**（从飞书原样搬来）：\n\n" + "\n>\n".join(reversed(kept)), attachments, seen
 
     def create(self, mid: str, chat: str, text: str, user: str, name: str,
                msg: Optional[dict[str, Any]] = None) -> None:
-        context, context_files = self.thread_context(msg) if msg else ("", [])
-        images = self.images_markdown(msg, self.project, self.take_pending_images(chat) + context_files) if msg else ""
+        context = self.message_context(msg, self.project, self.take_pending_images(chat), include_thread=True) if msg else ""
         text = self.strip_images(text) or "（见附件）"
         title = text.splitlines()[0].strip()
         title = title[:60] + ("…" if len(title) > 60 else "")
         agent_id = self.api(f"users?username={quote(self.agent)}")[0]["id"]
         desc = (f"{text}\n\n{context + chr(10) + chr(10) if context else ''}"
-                f"{images + chr(10) + chr(10) if images else ''}---\n来自飞书（{name}，{datetime.fromtimestamp(self.now()):%Y-%m-%d %H:%M}）。"
+                f"---\n来自飞书（{name}，{datetime.fromtimestamp(self.now()):%Y-%m-%d %H:%M}）。"
                 "在飞书话题里回复会同步成这里的评论，这里的评论也会同步回飞书。")
         issue = self.api(f"projects/{quote(self.project, safe='')}/issues", "POST", {
             "title": title, "description": desc, "labels": self.label, "assignee_id": str(agent_id)},
@@ -613,11 +646,11 @@ class Bridge:
             self.reply(mid, f"没找到 #{iid}（只能关联 {self.project} 里的 issue）。", f"bind-miss-{mid}")
             return
         notes = self.api(f"projects/{pid}/issues/{iid}/notes?sort=desc&per_page=1")
-        images = self.images_markdown(msg, self.project, self.take_pending_images(chat)) if msg else ""
+        context = self.message_context(msg, self.project, self.take_pending_images(chat), include_thread=True) if msg else ""
         rest = self.strip_images(rest)
-        if rest or images:
+        if rest or context:
             # 已有 issue 未必在收件箱跟踪范围内，@Agent 保证转交。
-            body = "\n\n".join(x for x in (rest, images) if x)
+            body = "\n\n".join(x for x in (rest, context) if x)
             self.note_as_user(self.project, iid, f"@{self.agent} {body}\n\n_（来自飞书）_")
         # 评论发出去才算关联成功：失败时要用户重发，不能留一个半截的话题
         self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
@@ -639,10 +672,10 @@ class Bridge:
         if text.startswith("/"):
             body = text
         else:
-            # 话题里的回复，回复对象就是话题内的消息，只搬这条自己带的附件，不重复搬根消息的
-            images = self.images_markdown({**msg, "reply_to": "", "root_id": ""}, t["project"])
+            # 根消息已在 issue 中；仅补充本条明确回复的其他消息，不重复搬根附件。
+            context = self.message_context(msg, t["project"], exclude_related=(root, msg.get("root_id") or ""))
             text = self.strip_images(text)
-            body = "\n\n".join(x for x in (text, images) if x) + "\n\n_（来自飞书）_"
+            body = "\n\n".join(x for x in (text, context) if x) + "\n\n_（来自飞书）_"
         if t.get("bound"):
             body = f"@{self.agent} {body}"
         self.note_as_user(t["project"], t["iid"], body)
@@ -842,7 +875,7 @@ def normalize_event(e: dict[str, Any]) -> dict[str, Any]:
             "sender_name": e.get("sender_name") or "",
             "sender_type": e.get("sender_type"), "content": e.get("content") or "",
             "mentions": e.get("mentions") or [], "root_id": e.get("root_id") or "",
-            "reply_to": e.get("reply_to") or "", "message_type": e.get("message_type") or "",
+            "reply_to": e.get("reply_to") or e.get("parent_id") or "", "message_type": e.get("message_type") or "",
             "thread_id": e.get("thread_id") or "",
             "create_ms": int(e.get("create_time") or 0)}
 

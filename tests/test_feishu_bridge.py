@@ -35,6 +35,8 @@ class World:
         self.history: dict[str, list] = {}  # chat_id → 聊天记录（补漏用）
         self.unreadable_chats: set[str] = set()
         self.messages: dict[str, str] = {}  # message_id → 渲染后的 content（给 mget 用）
+        self.raw_messages: dict[str, dict] = {}  # 原生消息接口保留引用关系，mget 可以不返回它
+        self.unreadable_messages: set[str] = set()
         self.broken_images: set[str] = set()
         self.downloads: list[tuple] = []
         self.thread_of: dict[str, str] = {}  # 被机器人在话题里回复过的消息 → thread_id
@@ -81,8 +83,16 @@ class World:
         raise AssertionError(f"unexpected {method} {path}")
 
     def lark(self, cmd, stdin, cwd=None):
+        if cmd[1:3] == ["api", "GET"]:
+            mid = cmd[3].rsplit("/", 1)[-1]
+            if mid in self.unreadable_messages:
+                return ok({"ok": False, "error": {"message": "access denied"}})
+            item = self.raw_messages.get(mid, {"message_id": mid})
+            return ok({"ok": True, "data": {"items": [item]}})
         if cmd[1:3] == ["im", "+messages-mget"]:
             mid = cmd[cmd.index("--message-ids") + 1]
+            if mid in self.unreadable_messages:
+                return ok({"ok": False, "error": {"message": "access denied"}})
             return ok({"ok": True, "data": {"messages": [{"message_id": mid, "content": self.messages.get(mid, ""),
                                                           "thread_id": self.thread_of.get(mid, "")}]}})
         if cmd[1:3] == ["im", "+messages-resources-download"]:
@@ -621,6 +631,87 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.w.downloads, [("om_zip", "file_v3_00174_zip", "file", "历史面板 · 可交互-html.zip")])
         self.assertEqual(self.uploads, [("frontend/web-v1", "历史面板 · 可交互-html.zip")])
         self.assertEqual(list(self.b.media_dir.iterdir()), [])  # 中转文件搬完就删
+
+    def test_quoted_group_demand_keeps_text_and_attachment_once(self) -> None:
+        self.w.messages["om_report"] = "邮箱出现在注册网址里\n点 Continue 后发生 [Image: img_quote]"
+        bot = [{"id": BOT, "key": "@_user_1", "name": "嘉辉的Agent"}]
+        self.b.handle(msg("om_req", "需求：修复这个小 bug", root="om_report", reply_to="om_report",
+                          chat="oc_g", chat_type="group", mentions=bot))
+        fields = next(w[2] for w in self.w.writes if w[1].endswith("/issues"))
+        self.assertEqual(fields["title"], "修复这个小 bug")
+        self.assertEqual(fields["description"].count("邮箱出现在注册网址里"), 1)
+        self.assertIn("点 Continue 后发生", fields["description"])
+        self.assertIn("![img_quote.jpg](/uploads/x/img_quote.jpg)", fields["description"])
+        self.assertEqual(self.w.downloads, [("om_report", "img_quote")])
+
+    def test_demand_recovers_quote_relationship_missing_from_compact_message(self) -> None:
+        self.w.raw_messages["om_req"] = {"message_id": "om_req", "parent_id": "om_report",
+                                        "root_id": "om_report"}
+        self.w.messages["om_report"] = "邮箱不应出现在网址里"
+        # 历史 mget 只保留正文和新话题号，原引用仍由原生接口提供。
+        self.b.handle(msg("om_req", "需求：修这个", thread="omt_new"))
+        fields = next(w[2] for w in self.w.writes if w[1].endswith("/issues"))
+        self.assertIn("邮箱不应出现在网址里", fields["description"])
+
+    def test_binding_existing_issue_carries_quoted_text(self) -> None:
+        self.w.messages["om_report"] = "上传后图片是空白"
+        self.b.handle(msg("om_bind", "#7 排查这条", root="om_report", reply_to="om_report"))
+        self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
+        self.assertIn("上传后图片是空白", self.w.issues[7]["notes"][-1]["body"])
+
+    def test_follow_up_carries_selected_reply_without_reuploading_root(self) -> None:
+        self.b.handle(msg("om_root", "需求：图片问题 [Image: img_root]"))
+        self.w.messages["om_detail"] = "只在点击撤销后失败 [Image: img_detail]"
+        self.b.handle(msg("om_reply", "请看这条", root="om_root", reply_to="om_detail"))
+        body = self.w.issues[8]["notes"][-1]["body"]
+        self.assertIn("只在点击撤销后失败", body)
+        self.assertIn("img_detail.jpg", body)
+        self.assertNotIn("img_root", body)
+        self.assertEqual(self.w.downloads, [("om_root", "img_root"), ("om_detail", "img_detail")])
+
+    def test_unreadable_quote_is_reported_instead_of_silently_dropped(self) -> None:
+        self.w.unreadable_messages.add("om_report")
+        self.b.handle(msg("om_req", "需求：修这个", root="om_report", reply_to="om_report"))
+        fields = next(w[2] for w in self.w.writes if w[1].endswith("/issues"))
+        self.assertIn("引用", fields["description"])
+        self.assertIn("未能读取", fields["description"])
+
+    def test_follow_up_slash_command_is_not_polluted_by_quote(self) -> None:
+        self.b.handle(msg("om_root", "需求：图片问题"))
+        self.w.messages["om_detail"] = "这条不是指令参数"
+        self.b.handle(msg("om_go", "/go", root="om_root", reply_to="om_detail"))
+        self.assertEqual(self.w.issues[8]["notes"][-1]["body"], "/go")
+
+    def test_raw_parent_id_in_event_keeps_quoted_content(self) -> None:
+        self.w.messages["om_report"] = "按钮点不动"
+        event = msg("om_req", "需求：处理这个")
+        event["parent_id"] = "om_report"
+        self.b.handle(FB.normalize_event(event))
+        fields = next(w[2] for w in self.w.writes if w[1].endswith("/issues"))
+        self.assertIn("按钮点不动", fields["description"])
+
+    def test_selected_quote_survives_thread_context_truncation(self) -> None:
+        self.w.messages["om_early"] = "必须保留的直接引用"
+        self.w.threads["omt_old"] = [
+            {"message_id": "om_early", "content": self.w.messages["om_early"],
+             "sender": {"id": ME, "name": "同事", "sender_type": "user"}},
+            {"message_id": "om_later", "content": "后续讨论" * FB.CONTEXT_TEXT_CAP,
+             "sender": {"id": ME, "name": "同事", "sender_type": "user"}},
+            {"message_id": "om_req", "content": "需求：修这个"},
+        ]
+        self.b.handle(msg("om_req", "需求：修这个", root="om_early", reply_to="om_early", thread="omt_old"))
+        fields = next(w[2] for w in self.w.writes if w[1].endswith("/issues"))
+        self.assertEqual(fields["description"].count("必须保留的直接引用"), 1)
+
+    def test_private_relay_recovers_quoted_request_and_keeps_its_text(self) -> None:
+        self.b.secretary.learn("oc_1")
+        self.state["secretary"]["msgs"]["om_agent"] = "https://git.example.com/frontend/web-v1/-/issues/7"
+        self.w.messages["om_agent"] = "原问题是保存后图片消失"
+        self.w.raw_messages["om_reply"] = {"message_id": "om_reply", "parent_id": "om_agent", "root_id": "om_agent"}
+        self.b.handle(msg("om_reply", "按这个修"))
+        body = self.w.issues[7]["notes"][-1]["body"]
+        self.assertIn("按这个修", body)
+        self.assertIn("原问题是保存后图片消失", body)
 
     def test_demand_in_someone_elses_thread_carries_earlier_text(self) -> None:
         # 2026-11-12 实测（#479）：同事在话题里描述问题，我回「需求：处理这个问题」，问题描述曾被丢掉

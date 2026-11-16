@@ -104,7 +104,7 @@ class SecretaryTest(unittest.TestCase):
     def test_group_message_does_not_become_secretary_chat(self) -> None:
         self.b.handle(msg("om_g", "进度", chat="oc_g", chat_type="group", mentions=[{"id": TFB.BOT}]))
         self.assertEqual(self.state["secretary"]["chat_id"], "oc_1")
-        self.assertEqual(self.w.replies[-1]["text"], FB.HELP_TEXT)
+        self.assertIn("尚未新建或启动", self.w.replies[-1]["text"])
 
     def test_private_thread_and_secretary_send_each_note_once(self) -> None:
         self.b.handle(msg("om_bind", "#7"))
@@ -400,18 +400,22 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("#7", self.w.replies[-1]["text"])
         self.assertFalse(self.w.replies[-1]["in_thread"])
 
-    def test_question_uses_model_and_falls_back_to_overview(self) -> None:
-        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": "#7 在开发"}]}})
+    def test_question_uses_classified_reply_and_reports_unavailable_model(self) -> None:
+        decision = {"action": "reply", "mode": "analyze", "reply": "#7 在开发", "issue": None}
+        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
+            {"type": "text", "text": json.dumps(decision)}]}})
         self.b.handle(msg("om_q2", "现在哪个最急？"))
         self.assertEqual(self.w.replies[-1]["text"], f"[#7]({URL7}) 在开发")
         self.assertFalse(self.w.replies[-1]["in_thread"])
         self.w.omp_out = ""
         self.b.handle(msg("om_q3", "还有吗？"))
-        self.assertIn("这会儿没法回答", self.w.replies[-1]["text"])
+        self.assertIn("尚未新建或启动", self.w.replies[-1]["text"])
 
     def test_model_answer_links_known_issue_numbers(self) -> None:
         answer = "**#7 旧单**：开发中；[#7](x) 已有链接不重复；#70 不认识；见 note#7a"
-        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [{"type": "text", "text": answer}]}})
+        decision = {"action": "reply", "mode": "analyze", "reply": answer, "issue": None}
+        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
+            {"type": "text", "text": json.dumps(decision)}]}})
         self.b.handle(msg("om_q4", "现在有哪些需求？"))
         self.assertEqual(self.w.replies[-1]["text"],
                          f"**[#7]({URL7}) 旧单**：开发中；[#7](x) 已有链接不重复；#70 不认识；见 note#7a")
@@ -430,17 +434,17 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("#7 Agent", material)
         self.assertIn("A、B 里选一个", material)
 
-    def test_ask_scheduler_line_becomes_user_comment_on_that_issue(self) -> None:
+    def test_natural_scheduler_request_binds_without_replacing_user_text(self) -> None:
+        decision = {"action": "bind", "mode": "analyze", "reply": "", "issue": 7}
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
-            {"type": "text", "text": "转给 #7：用户想知道为什么状态还是等你处理，需要他做什么？"}]}})
-        self.b.handle(msg("om_q7", "你帮我问7的调度，为什么状态还是等我处理？"))
+            {"type": "text", "text": json.dumps(decision)}]}})
+        text = "你帮我问7的调度，为什么状态还是等我处理？"
+        self.b.handle(msg("om_q7", text))
         method, path, fields, as_user = self.w.writes[-1]
         self.assertEqual((method, path, as_user), ("POST", "projects/frontend/web-v1/issues/7/notes", True))
-        self.assertTrue(fields["body"].startswith("@pjhagent 用户想知道为什么状态还是等你处理"))
-        self.assertIn("用户原话：你帮我问7的调度", fields["body"])
-        self.assertIn("已转给", self.w.replies[-1]["text"])
-        self.assertIn("调度者回复后我会转到这里", self.w.replies[-1]["text"])
-        self.assertFalse(self.w.replies[-1]["in_thread"])
+        self.assertTrue(fields["body"].startswith("@pjhagent " + text))
+        self.assertIn("已关联", self.w.replies[-1]["text"])
+        self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
 
     def test_closed_origin_drops_out_of_watch(self) -> None:
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))

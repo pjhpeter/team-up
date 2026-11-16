@@ -224,8 +224,8 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("![img_only.jpg](/uploads/x/img_only.jpg)", creates[0][2]["description"])
 
     def test_attachment_does_not_turn_prose_or_empty_requirement_into_command(self) -> None:
-        # 私聊里不是命令的话交给秘书回答（模型不可用时回总览），空的「需求：」回用法
-        cases = (("[Image: img_prose]\n这里写着需求：不是发起命令", "这会儿没法回答"), ("需求：", FB.HELP_TEXT))
+        # 普通私聊先分类，模型不可用时明确没有新建或开工；空命令仍回用法。
+        cases = (("[Image: img_prose]\n这里写着需求：不是发起命令", "尚未新建或启动"), ("需求：", FB.HELP_TEXT))
         for index, (text, expected) in enumerate(cases):
             with self.subTest(text=text):
                 self.b.handle(msg(f"om_not_command_{index}", text, chat=f"oc_not_command_{index}"))
@@ -436,12 +436,12 @@ class BridgeTest(unittest.TestCase):
         self.assertGreater(len(texts), 1)  # 不是固定一句
         self.assertEqual(self.w.writes, [])
 
-    def test_group_small_talk_gets_help_once_per_cooldown(self) -> None:
+    def test_group_model_unavailable_reports_each_unprocessed_message(self) -> None:
         bot = [{"id": BOT}]
         self.b.handle(msg("om_1", "你叫什么名字？", chat="oc_g", chat_type="group", mentions=bot))
         self.b.handle(msg("om_2", "在吗", chat="oc_g", chat_type="group", mentions=bot))
-        self.assertEqual(len(self.w.replies), 1)
-        self.assertIn("用法", self.w.replies[0]["text"])
+        self.assertEqual(len(self.w.replies), 2)
+        self.assertTrue(all("尚未新建或启动" in reply["text"] for reply in self.w.replies))
         self.assertEqual(self.w.writes, [])
 
     def test_group_mention_of_bot_is_stripped(self) -> None:
@@ -564,16 +564,17 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(titles, ["补漏到的"])
         self.assertFalse(any("用法" in r["text"] for r in self.w.replies))
 
-    def test_reply_in_unknown_thread_asks_to_bind(self) -> None:
+    def test_model_unavailable_in_unknown_thread_does_not_create_task(self) -> None:
         self.b.handle(msg("om_2", "这是啥", root="om_unknown", thread="omt_unknown"))
-        self.assertIn("还没关联 issue", self.w.replies[0]["text"])
+        self.assertEqual(self.w.writes, [])
+        self.assertEqual(self.state["threads"], {})
+        self.assertEqual([r["to"] for r in self.w.replies], ["om_2"])
 
     def test_quote_reply_to_image_makes_one_thread_with_image(self) -> None:
         # 2026-11-02 实测：先单独发图，再对图「回复」（主对话里的引用回复）写「需求：…」
         self.w.messages["om_img"] = "[Image: img_v3_abc-1]"
         self.b.handle(msg("om_img", "[Image: img_v3_abc-1]"))
         hint = self.w.replies[-1]
-        self.assertIn("接着发「需求", hint["text"])
         self.assertFalse(hint["in_thread"])  # 提示不开话题
         self.b.handle(msg("om_req", "需求：测试环境报这个错，帮忙排查", root="om_img", reply_to="om_img"))
         create = [w for w in self.w.writes if w[1].endswith("/issues")][0]

@@ -8,15 +8,16 @@
   飞书 → GitLab：本脚本（收消息、建 issue、把话题回复写成 issue 评论）
   GitLab → Agent：原有的 gitlab-inbox.py（不改）
   GitLab → 飞书：轮询新评论；私聊统一由秘书通知，群聊保留原话题回复
-桥只做搬运，以后推广到公司时可整体挪到一台常开的机器上。
+桥负责识别入口与搬运；实际分析、交付仍由 GitLab 收件箱处理。
 
 飞书里怎么用（只认 users 白名单里的人）：
+  直接说「希望增加…」「帮我修这个 bug」→ 新功能默认先分析，明确修复请求走 /go debug；缺信息时先追问
   「需求：<内容>」或「/需求 <内容>」  → 在 default_project 建 issue（打开关标签、指派给 Agent 账号），回帖 issue 链接
   「#123 <可选内容>」或贴 issue 链接   → 把这条消息的话题关联到已有 issue，内容写成评论（带 @Agent 以便转交）
   在上面两种消息的话题里回复         → 写成该 issue 的评论；/go、/status、/new、/免打扰、/详尽 等指令原样生效
   私聊里对秘书转达的消息点「回复」   → 写成那个需求 issue 的评论（私聊窗口就是秘书，见 secretary.py）
-  私聊里的其他话                     → 交给秘书：「进度」回总览，「帮助」回用法，其余当提问回答
-  群里的其他顶层消息                 → 回一段用法说明（同一会话 10 分钟内只回一次）
+  私聊里的其他话                     → 「进度」回总览，「帮助」回用法；讨论只回答，不建单或开工
+  群里自然说需求或回复话题           → 同样识别意图，但每条都必须 @机器人；引用前文只是背景，不算执行授权
 发到 GitLab 的内容用用户自己的 GitLab 令牌（钥匙串里取），这样收件箱才认得是用户本人在说话。
 
 依赖：lark-cli（首次使用按引导建好机器人应用，只用机器人身份）、glab。
@@ -81,7 +82,7 @@ FILE_TAG_RE = re.compile(r"<(?:file|video|audio)\b[^>]*?\bkey=\"([^\"]+)\"[^>]*?
 NAME_ATTR_RE = re.compile(r"\bname=\"([^\"]*)\"")
 FOLDER_TAG_RE = re.compile(r"</?folder\b[^>]*>")
 PENDING_IMAGE_S = 600  # 单独发的图片/文件在这段时间内会自动带进下一条「需求：」/「#编号」
-IMAGE_HINT = "收到附件。10 分钟内接着发「需求：<要做的事>」或「#编号」，我会把它一起带上。"
+IMAGE_HINT = "收到附件。10 分钟内接着说要做什么，或发「#编号」关联已有 issue，我会把附件一起带上。"
 # 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉
 BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*")
 FAILED_TEXT = "这条没处理成功，请重发。"
@@ -102,9 +103,9 @@ DENY_TEXTS = (
 )
 HELP_TEXT = (
     "用法：\n"
-    "1. 发「需求：<要做的事>」→ 我在 GitLab 建 issue，Agent 先分析，结论会回到这条消息的话题里\n"
+    "1. 直接说要做什么（也支持「需求：<要做的事>」）→ 新需求默认先分析；明确说「帮我修这个 bug」会进入修复流程\n"
     "2. 发「#123 <补充>」→ 关联已有 issue，之后在话题里回复就会同步过去\n"
-    "3. 在话题里回复 /go 开工、/status 看进度、/new 让调度者重开会话\n"
+    "3. 在话题里说「开始修复」或「开工」即可交付，也支持 /go、/status 看进度、/new 重开会话\n"
     "4. 嫌消息多就回复 /免打扰（只在步骤完成、交付完成和要你处理时发），想看每一步就回复 /详尽\n"
     "5. 私聊窗口就是秘书：各需求的进度都会转到这里，对转达点「回复」就能回给那个需求，发「进度」看总览，其他话直接问\n"
     "在群里每句话（包括话题里的回复）都要 @我，我才收得到"
@@ -197,6 +198,7 @@ class Bridge:
         state.setdefault("group_chats", [])  # 收到过群消息的 chat_id（补漏时群里只处理 @ 机器人的）
         state.setdefault("thread_ids", {})   # 飞书话题 thread_id → threads 的键（话题里任何一条消息都带 thread_id）
         state.setdefault("pending_images", {})  # chat_id → [{mid, key, kind, name, ts}] 单独发、还没用上的图片/文件
+        state.setdefault("pending_intents", {})  # 会话/用户/话题隔离的待补充需求，保留原话而非模型摘要
         self._secretary: Any = None
         self.delivered: Optional[dict[str, Any]] = None  # 处理当前这条消息时已代用户写进评论的 issue（project、iid）
         self.history_requested = threading.Event()
@@ -294,11 +296,17 @@ class Bridge:
 
     def message_context(self, msg: dict[str, Any], project: str,
                         extra: Optional[list[tuple[str, list[dict[str, str]]]]] = None,
-                        *, include_thread: bool = False, exclude_related: tuple[str, ...] = ()) -> str:
-        """统一收集前文、直接引用和附件；按消息与资源去重，不把引用文字当成新指令。"""
+                        *, include_thread: bool = False, exclude_related: tuple[str, ...] = (),
+                        upload: bool = True) -> str:
+        """收集背景；分类阶段只读文字和附件标记，确定任务后才搬附件。"""
         context, context_files, seen = self.thread_context(msg) if include_thread else ("", [], set())
         sources = [(msg["message_id"], find_attachments(msg.get("content") or ""))] + (extra or []) + context_files
         parts = [p for p in (context, msg.get("context_warning")) if p]
+        for previous in msg.get("intent_history", []):
+            parts.append("**此前的用户原话**：\n\n" + self.clean_text(previous))
+            previous_context = self.message_context(previous, project, include_thread=True, upload=upload)
+            if previous_context:
+                parts.append(previous_context)
         seen.update((msg["message_id"], *exclude_related))
         for related in dict.fromkeys((msg.get("reply_to") or "", msg.get("root_id") or "")):
             if not related or related in seen:
@@ -326,7 +334,8 @@ class Bridge:
                 if a["key"] in done:
                     continue
                 done.add(a["key"])
-                parts.append(self.transfer(project, mid, a))
+                parts.append(self.transfer(project, mid, a) if upload else
+                             ("[图片]" if a["kind"] == "image" else f"[文件 {a['name'] or '未命名'}]"))
         return "\n\n".join(parts)
 
     def transfer(self, project: str, mid: str, a: dict[str, str]) -> str:
@@ -381,6 +390,9 @@ class Bridge:
         if msg.get("sender_type") != "user" or msg.get("sender_id") not in self.users:
             return
         text = f"[#{t['iid']}]({self.issue_url(t['project'], t['iid'])}) 已经弄好了，不用重发。" if t else FAILED_TEXT
+        if t and t.get("execution_pending"):
+            text = (f"[#{t['iid']}]({self.issue_url(t['project'], t['iid'])}) 已建单，但开工指令未发送成功。"
+                    "不要重发需求；请在这条消息下回复「开始修复」或「开工」。")
         # 主聊天区的引用回复也带 root_id（被引用那条），但不是话题；只有真在话题里才用话题回，否则会凭空开出一个话题
         in_thread = bool(mid in self.state["threads"] or msg.get("thread_id")
                          or msg.get("root_id") in self.state["threads"])
@@ -420,7 +432,13 @@ class Bridge:
         if private:
             self.secretary.learn(chat)
             if self.secretary.is_relay(msg):
-                self.secretary.handle(msg, text)
+                target = self.secretary.target(msg)
+                mode = "analyze"
+                if not text.startswith("/"):
+                    intent = self.classify_message(msg, text, f"当前回复已关联任务 {target}，不要新建。")
+                    if intent and intent["action"] == "task":
+                        mode = intent["mode"]
+                self.secretary.relay(target, msg, text, mode=mode)
                 return
         root, tid = msg.get("root_id") or "", msg.get("thread_id") or ""
         linked = self.state["thread_ids"].get(tid) if tid else None
@@ -431,7 +449,7 @@ class Bridge:
         c = CREATE_RE.match(command_text)
         candidate = command_text[c.end():] if c else command_text
         m = BIND_RE.match(candidate)
-        if linked and m:
+        if m:
             iid = int(m.group(1) or m.group(2))
             if m.group(2):
                 url = re.match(r"https?://[^\s,，。;；]+", candidate.strip()).group(0)
@@ -440,24 +458,28 @@ class Bridge:
                 except topics_module().TopicError:
                     self.reply(mid, "该链接不属于当前配置的项目；本话题绑定不变，这条消息未转发。", f"wrong-project-{mid}")
                     return
-            if iid != self.state["threads"][linked]["iid"]:
+            if linked and iid != self.state["threads"][linked]["iid"]:
                 topics_module().redirect(self, linked, msg, iid)
                 return
         if linked:
-            self.follow_up(linked, msg, text)
+            mode = "analyze"
+            if not text.startswith("/") and not self.state["threads"][linked].get("closed"):
+                target = self.state["threads"][linked]
+                intent = self.classify_message(msg, text, f"当前已关联 #{target['iid']}，只能处理这张已有任务。")
+                if intent and intent["action"] == "task":
+                    mode = intent["mode"]
+            self.follow_up(linked, msg, text, mode=mode)
             return
         # 引用回复（主对话里的「回复 xxx」）不算话题，按普通消息处理；真在话题里但还没关联的，发「需求：」也认
         # 「需求：」后面紧跟已有 issue 的链接或 #编号，是让 Agent 处理那张单，关联它而不是新建
         # 图文消息可能先放附件；命令只看文字，上传仍从原始 msg 提取附件。
         if m:
-            self.bind(mid, chat, int(m.group(1) or m.group(2)), m.string[m.end():].strip(), user, msg)
+            self.bind(mid, chat, iid, m.string[m.end():].strip(), user, msg)
             return
         if c and (command_text[c.end():].strip() or find_attachments(text)):
             self.create(mid, chat, command_text[c.end():].strip(), user, msg.get("sender_name") or user, msg)
             return
-        if tid:
-            self.reply(mid, "这条话题还没关联 issue。在这里发「需求：…」新建，或发「#编号」关联已有 issue。", f"orphan-{mid}")
-            return
+        # 未关联话题也能直接说需求，不再要求命令前缀。
         attachments = find_attachments(text)
         if attachments and not self.strip_images(text):
             # 单独发图片/文件：记下来等下一条需求带上；提示用引用回复，不开话题，免得多出一个空话题
@@ -465,8 +487,11 @@ class Bridge:
                 {"mid": mid, "ts": self.now(), **a} for a in attachments)
             self.reply(mid, IMAGE_HINT, f"img-hint-{mid}", in_thread=False)
             return
-        if private and not c and self.strip_images(text).strip().lower() not in HELP_WORDS:
-            self.secretary.handle(msg, text)
+        if not c and command_text.strip().lower() not in HELP_WORDS:
+            if private and command_text.strip().lower() in secretary_module().STATUS_WORDS:
+                self.secretary.handle(msg, text)
+            else:
+                self.natural_entry(msg, text, user)
             return
         if private:
             self.reply(mid, HELP_TEXT, f"help-{mid}", in_thread=False)
@@ -475,6 +500,83 @@ class Bridge:
         if self.now() - last >= HELP_COOLDOWN_S:
             self.state["help_sent"][chat] = self.now()
             self.reply(mid, HELP_TEXT, f"help-{mid}")
+
+    def classify_message(self, msg: dict[str, Any], text: str, target: str = "") -> Optional[dict]:
+        context = self.message_context(msg, self.project, include_thread=True, upload=False)
+        if msg.get("intent_question"):
+            context += "\n\n机器人上次追问（仅作背景）：\n" + msg["intent_question"]
+        context = "\n\n".join(part for part in (target, context, f"## 机器人用法\n{HELP_TEXT}") if part)
+        if not target and msg.get("chat_type") != "group":
+            context += ("\n\n## 任务总览\n" + "\n".join(self.secretary.overview())
+                        + "\n\n## 各需求最近的评论\n" + "\n".join(self.secretary.recent_notes()))
+        return self.secretary.classify_intent(text, context)
+
+    def natural_entry(self, msg: dict[str, Any], text: str, user: str) -> None:
+        mid, chat = msg["message_id"], msg.get("chat_id", "")
+        pending = self.state["pending_intents"]
+        scope = msg.get("thread_id") or msg.get("reply_to") or msg.get("root_id") or "main"
+        key = json.dumps([chat, msg.get("sender_id"), scope])
+        # 指向追问的回复可以承接原需求；其他会话、用户、话题的问答不能串进来。
+        related = {msg.get("reply_to"), msg.get("root_id")} - {None, ""}
+        for old_key, item in pending.items():
+            if item["chat"] == chat and item["sender"] == msg.get("sender_id") \
+                    and (not msg.get("thread_id") or item["thread"] in ("", msg["thread_id"])) \
+                    and related.intersection(item["reply_ids"]):
+                key = old_key
+                break
+        if key not in pending and scope == "main":
+            candidates = [old_key for old_key, item in pending.items()
+                          if item["chat"] == chat and item["sender"] == msg.get("sender_id") and not item["thread"]]
+            if len(candidates) == 1:
+                key = candidates[0]
+        previous = pending.get(key)
+        source = {**msg, "intent_history": previous["messages"], "intent_question": previous["question"]} if previous else msg
+        request = text
+        if previous:
+            request = ("同一次待澄清请求的用户原话：\n"
+                       + "\n\n".join(self.clean_text(item) for item in previous["messages"])
+                       + "\n\n本次用户补充（若改变或撤销原意，以本次为准）：\n" + text)
+        intent = self.classify_message(source, request)
+        in_thread = bool(msg.get("thread_id"))
+        if intent is None:
+            self.reply(mid, "这会儿没法判断你的意思，尚未新建或启动任务，请稍后再试。",
+                       f"intent-failed-{mid}", in_thread=in_thread)
+            return
+        action, mode = intent["action"], intent["mode"]
+        if action in ("reply", "clarify"):
+            reply_id = self.reply(mid, self.secretary.linkify(intent["reply"]), f"intent-{mid}", in_thread=in_thread)
+            if action == "clarify":
+                pending[key] = {"chat": chat, "sender": msg.get("sender_id"),
+                                "thread": msg.get("thread_id") or "",
+                                "question": intent["reply"],
+                                "messages": (previous["messages"] if previous else []) + [dict(msg)],
+                                "reply_ids": (previous["reply_ids"] if previous else []) + [mid, reply_id]}
+            else:
+                pending.pop(key, None)
+            return
+        if action == "bind":
+            iid = intent["issue"]
+            # 模型只选动作，项目边界与编号仍由本次原文校验，引用背景不能替用户授权。
+            urls = re.findall(r"https?://[^\s<>，。；]+", text)
+            for url in urls:
+                if "/-/issues/" in url or "/-/work_items/" in url:
+                    try:
+                        topics_module().issue_id(self.cfg, url)
+                    except topics_module().TopicError:
+                        self.reply(mid, "该链接不属于当前配置的项目，这条消息未转发。", f"wrong-project-{mid}", in_thread=in_thread)
+                        return
+            if not iid or not re.search(rf"(?<!\d){iid}(?!\d)", text):
+                self.reply(mid, "请在本条消息里明确要关联的 issue 编号。", f"issue-missing-{mid}", in_thread=in_thread)
+                return
+        try:
+            if action == "bind":
+                self.bind(mid, chat, iid, text, user, source, mode=mode)
+            else:
+                self.create(mid, chat, text, user, msg.get("sender_name") or user, source, mode=mode)
+        finally:
+            # issue 已写入即结束追问；回执失败不应让下一句重新建单。
+            if mid in self.state["threads"]:
+                pending.pop(key, None)
 
     def clean_text(self, msg: dict[str, Any]) -> str:
         # 事件里的 content 已渲染成「@名字」，原始接口里是「@_user_1」占位符，两种都要处理；
@@ -615,7 +717,7 @@ class Bridge:
         return "**话题里的前文**（从飞书原样搬来）：\n\n" + "\n>\n".join(reversed(kept)), attachments, seen
 
     def create(self, mid: str, chat: str, text: str, user: str, name: str,
-               msg: Optional[dict[str, Any]] = None) -> None:
+               msg: Optional[dict[str, Any]] = None, *, mode: str = "analyze") -> None:
         context = self.message_context(msg, self.project, self.take_pending_images(chat), include_thread=True) if msg else ""
         text = self.strip_images(text) or "（见附件）"
         title = text.splitlines()[0].strip()
@@ -630,15 +732,23 @@ class Bridge:
         iid = issue["iid"]
         self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
                                       "last_note": 0, "closed": False}
+        if mode in ("deliver", "debug"):
+            # 先记录建单，再发已有开工协议；开工失败与回执失败必须分开，避免重复建单。
+            self.state["threads"][mid]["execution_pending"] = mode
+            self.note_as_user(self.project, iid, self.execution_body(text, mode))
+            self.state["threads"][mid].pop("execution_pending")
+        status = ("已发送修复开工指令（debug），后续进展会回到这里。" if mode == "debug" else
+                  "已发送交付开工指令，后续进展会回到这里。" if mode == "deliver" else
+                  "Agent 会先只读分析；在这里说「开始修复」或「开工」即可正式交付。")
         self.reply(mid, f"已建 [#{iid}]({self.issue_url(self.project, iid)})：{title}\n"
-                        "Agent 会先只读分析，结论会回到这个话题；在这里回复「/go」或说「开工」才正式交付。",
+                        f"{status}",
                    f"created-{mid}")
         self.link_thread(mid, mid)
         self.mark_handled(msg, chat, iid)
         log(f"created {self.project}#{iid} from {mid} by {user}")
 
     def bind(self, mid: str, chat: str, iid: int, rest: str, user: str,
-             msg: Optional[dict[str, Any]] = None) -> None:
+             msg: Optional[dict[str, Any]] = None, *, mode: str = "analyze") -> None:
         pid = quote(self.project, safe="")
         try:
             issue = self.api(f"projects/{pid}/issues/{iid}")
@@ -651,6 +761,7 @@ class Bridge:
         if rest or context:
             # 已有 issue 未必在收件箱跟踪范围内，@Agent 保证转交。
             body = "\n\n".join(x for x in (rest, context) if x)
+            body = self.execution_body(body, mode)
             self.note_as_user(self.project, iid, f"@{self.agent} {body}\n\n_（来自飞书）_")
         # 评论发出去才算关联成功：失败时要用户重发，不能留一个半截的话题
         self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
@@ -662,11 +773,19 @@ class Bridge:
         self.mark_handled(msg, chat, iid)
         log(f"bound {mid} → {self.project}#{iid} by {user}")
 
-    def follow_up(self, root: str, msg: dict[str, Any], text: str) -> None:
+    @staticmethod
+    def execution_body(text: str, mode: str) -> str:
+        """沿用收件箱 /go 协议；原文保留，分类摘要绝不能替代授权。"""
+        if mode not in ("deliver", "debug"):
+            return text
+        command = "/go debug" if mode == "debug" else "/go"
+        return f"{command}\n\n用户原话：{text}"
+
+    def follow_up(self, root: str, msg: dict[str, Any], text: str, *, mode: str = "analyze") -> None:
         mid = msg["message_id"]
         t = self.state["threads"][root]
         if t.get("closed"):
-            self.reply(mid, "这张 issue 已关闭，这里只保留归档。要继续请回主聊天发新的「需求：…」，或「#编号」进入别的独立话题。", f"closed-{mid}")
+            self.reply(mid, "这张 issue 已关闭，这里只保留归档。要继续请回主聊天说新的需求，或发「#编号」进入别的独立话题。", f"closed-{mid}")
             return
         # /go、/status、/new 这类指令要整条只有指令，收件箱才认得，所以不加尾注。
         if text.startswith("/"):
@@ -676,9 +795,12 @@ class Bridge:
             context = self.message_context(msg, t["project"], exclude_related=(root, msg.get("root_id") or ""))
             text = self.strip_images(text)
             body = "\n\n".join(x for x in (text, context) if x) + "\n\n_（来自飞书）_"
+            body = self.execution_body(body, mode)
         if t.get("bound"):
             body = f"@{self.agent} {body}"
         self.note_as_user(t["project"], t["iid"], body)
+        if mode in ("deliver", "debug"):
+            t.pop("execution_pending", None)
 
     # ---------- GitLab → 飞书 ----------
     def poll_gitlab(self) -> None:

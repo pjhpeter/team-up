@@ -200,6 +200,7 @@ class Bridge:
         state.setdefault("pending_images", {})  # chat_id → [{mid, key, kind, name, ts}] 单独发、还没用上的图片/文件
         state.setdefault("pending_intents", {})  # 会话/用户/话题隔离的待补充需求，保留原话而非模型摘要
         self._secretary: Any = None
+        self._bot_app_id: Optional[str] = None  # 只缓存当前 CLI 身份，不能把任意 cli_ 作者当成本机器人。
         self.delivered: Optional[dict[str, Any]] = None  # 处理当前这条消息时已代用户写进评论的 issue（project、iid）
         self.history_requested = threading.Event()
         self.next_history_poll = 0.0
@@ -293,6 +294,56 @@ class Bridge:
         except BridgeError as e:
             log(f"read reply metadata {mid} failed: {e}")
             msg["context_warning"] = "_（未能读取飞书引用关系，可能缺少上下文。）_"
+
+    def recover_task_reply(self, msg: dict[str, Any], text: str) -> bool:
+        """旧回帖可能没有映射；只从直接引用的本机器人单任务链接恢复，绝不猜新任务。"""
+        quoted = msg.get("reply_to") or ""
+        if (not quoted or quoted == msg["message_id"]) and not msg.get("context_warning"):
+            return False
+        try:
+            if not quoted:
+                raise BridgeError("reply relationship unavailable")
+            items = (self.lark(["im", "+messages-mget", "--message-ids", quoted,
+                                "--no-reactions"]).get("data") or {}).get("messages", [])
+            item = next((m for m in items if m.get("message_id") == quoted), None)
+            if item is None or item.get("deleted"):
+                raise BridgeError("quoted message unavailable")
+            content = self.clean_text(normalize_history(item))
+            sender = item.get("sender") or {}
+            # 普通引用仍只是背景，不改变原有讨论/建单入口。
+            if not re.search(r"/-/(?:issues|work_items)/", content):
+                if re.search(r"(?<![\w/])#[1-9][0-9]*\b", content):
+                    msg["unresolved_task_reference"] = True
+                return False
+            own_bot = False
+            if sender.get("sender_type") in ("app", "bot"):
+                configured = self.cfg.get("bot_open_id")
+                if configured:
+                    own_bot = configured in (sender.get("id"), sender.get("open_bot_id"))
+                else:
+                    if self._bot_app_id is None:
+                        identity = self.lark(["whoami"])
+                        if identity.get("identity") != "bot" or identity.get("available") is not True \
+                                or not identity.get("appId"):
+                            raise BridgeError("current bot identity unavailable")
+                        self._bot_app_id = identity["appId"]
+                    own_bot = sender.get("id") == self._bot_app_id
+            target = self.secretary.single_task_url(content) if own_bot else None
+            if target:
+                iid = topics_module().issue_id(self.cfg, target)
+                issue = self.api(f"projects/{quote(self.project, safe='')}/issues/{iid}")
+                if not issue or issue.get("iid") != iid:
+                    raise BridgeError("quoted task unavailable")
+        except BridgeError as e:
+            log(f"recover quoted task {quoted} failed: {e}")
+            target = None
+        if target:
+            # 引用只确定转交对象，不产生新的执行授权；附件和失败回执仍由已有路径处理。
+            self.secretary.relay(target, msg, text)
+            return True
+        self.reply(msg["message_id"], "没能确认引用对应哪张任务，尚未新建或转交。请在本条消息中写明任务编号或链接。",
+                   f"task-reference-{msg['message_id']}", in_thread=bool(msg.get("thread_id")))
+        return True
 
     def message_context(self, msg: dict[str, Any], project: str,
                         extra: Optional[list[tuple[str, list[dict[str, str]]]]] = None,
@@ -435,7 +486,8 @@ class Bridge:
                 target = self.secretary.target(msg)
                 mode = "analyze"
                 if not text.startswith("/"):
-                    intent = self.classify_message(msg, text, f"当前回复已关联任务 {target}，不要新建。")
+                    intent = self.classify_message(msg, text, f"当前回复已关联任务 {target}，不要新建。",
+                                                   linked_issue=int(target.rsplit("/", 1)[-1]))
                     if intent and intent["action"] == "task":
                         mode = intent["mode"]
                 self.secretary.relay(target, msg, text, mode=mode)
@@ -465,7 +517,8 @@ class Bridge:
             mode = "analyze"
             if not text.startswith("/") and not self.state["threads"][linked].get("closed"):
                 target = self.state["threads"][linked]
-                intent = self.classify_message(msg, text, f"当前已关联 #{target['iid']}，只能处理这张已有任务。")
+                intent = self.classify_message(msg, text, f"当前已关联 #{target['iid']}，只能处理这张已有任务。",
+                                               linked_issue=target["iid"])
                 if intent and intent["action"] == "task":
                     mode = intent["mode"]
             self.follow_up(linked, msg, text, mode=mode)
@@ -488,6 +541,8 @@ class Bridge:
             self.reply(mid, IMAGE_HINT, f"img-hint-{mid}", in_thread=False)
             return
         if not c and command_text.strip().lower() not in HELP_WORDS:
+            if self.recover_task_reply(msg, text):
+                return
             if private and command_text.strip().lower() in secretary_module().STATUS_WORDS:
                 self.secretary.handle(msg, text)
             else:
@@ -501,7 +556,8 @@ class Bridge:
             self.state["help_sent"][chat] = self.now()
             self.reply(mid, HELP_TEXT, f"help-{mid}")
 
-    def classify_message(self, msg: dict[str, Any], text: str, target: str = "") -> Optional[dict]:
+    def classify_message(self, msg: dict[str, Any], text: str, target: str = "", *,
+                         linked_issue: Optional[int] = None) -> Optional[dict]:
         context = self.message_context(msg, self.project, include_thread=True, upload=False)
         if msg.get("intent_question"):
             context += "\n\n机器人上次追问（仅作背景）：\n" + msg["intent_question"]
@@ -509,7 +565,7 @@ class Bridge:
         if not target and msg.get("chat_type") != "group":
             context += ("\n\n## 任务总览\n" + "\n".join(self.secretary.overview())
                         + "\n\n## 各需求最近的评论\n" + "\n".join(self.secretary.recent_notes()))
-        return self.secretary.classify_intent(text, context)
+        return self.secretary.classify_intent(text, context, linked_issue=linked_issue)
 
     def natural_entry(self, msg: dict[str, Any], text: str, user: str) -> None:
         mid, chat = msg["message_id"], msg.get("chat_id", "")
@@ -544,7 +600,10 @@ class Bridge:
             return
         action, mode = intent["action"], intent["mode"]
         if action in ("reply", "clarify"):
-            reply_id = self.reply(mid, self.secretary.linkify(intent["reply"]), f"intent-{mid}", in_thread=in_thread)
+            reply_text = self.secretary.linkify(intent["reply"])
+            reply_id = self.reply(mid, reply_text, f"intent-{mid}", in_thread=in_thread)
+            if action == "reply":
+                self.secretary.remember_reply(reply_id, reply_text)
             if action == "clarify":
                 pending[key] = {"chat": chat, "sender": msg.get("sender_id"),
                                 "thread": msg.get("thread_id") or "",
@@ -553,6 +612,10 @@ class Bridge:
                                 "reply_ids": (previous["reply_ids"] if previous else []) + [mid, reply_id]}
             else:
                 pending.pop(key, None)
+            return
+        if action == "task" and msg.get("unresolved_task_reference"):
+            self.reply(mid, "没能确认引用对应哪张任务，尚未新建或转交。请在本条消息中写明任务编号或链接。",
+                       f"task-reference-{mid}", in_thread=in_thread)
             return
         if action == "bind":
             iid = intent["issue"]

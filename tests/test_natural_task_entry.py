@@ -22,7 +22,7 @@ class NaturalEntryTest(unittest.TestCase):
     setUp = TFB.BridgeTest.setUp
     fake_upload = TFB.BridgeTest.fake_upload
 
-    def model(self, action="task", mode="analyze", reply="", issue=None):
+    def model(self, action="task", mode="analyze", reply="", issue=None, *, relation="new", relation_issue=None):
         decision = {"action": action, "mode": mode, "reply": reply, "issue": issue}
         previous = self.w
         upload_count = len(self.uploads)
@@ -32,8 +32,11 @@ class NaturalEntryTest(unittest.TestCase):
             if cmd[0] == "omp":
                 self.prompts.append(cmd)
                 self.assertEqual(len(self.uploads), upload_count, "分类前不能上传附件")
+                result = ({"relation": relation, "issue": relation_issue, "reply": reply}
+                          if cmd[cmd.index("--system-prompt") + 1] == FB.secretary_module().TASK_RELATION_PROMPT
+                          else decision)
                 event = {"type": "turn_end", "message": {"content": [
-                    {"type": "text", "text": json.dumps(decision, ensure_ascii=False)}]}}
+                    {"type": "text", "text": json.dumps(result, ensure_ascii=False)}]}}
                 return subprocess.CompletedProcess(cmd, 0, json.dumps(event, ensure_ascii=False), "")
             return previous(cmd, **kwargs)
         self.b.run = run
@@ -76,6 +79,162 @@ class NaturalEntryTest(unittest.TestCase):
         self.assertEqual(self.uploads, [])
         self.assertEqual(self.w.replies[-1]["text"], "好的，先讨论，不开工。")
         self.assertIn("帮我修这个 bug #7", self.prompts[-1][-1])
+
+    def quoted_message(self, mid, text, sender=BOT, sender_type="app"):
+        previous = self.b.run
+
+        def run(cmd, **kwargs):
+            if cmd[:3] == ["lark-cli", "im", "+messages-mget"] \
+                    and cmd[cmd.index("--message-ids") + 1] == mid:
+                return TFB.ok({"ok": True, "data": {"messages": [{
+                    "message_id": mid, "content": text,
+                    "sender": {"id": sender, "sender_type": sender_type}}]}})
+            return previous(cmd, **kwargs)
+
+        self.b.run = run
+
+    def test_unknown_bot_progress_reply_routes_pause_without_creating(self):
+        self.w.issues[488] = {"iid": 488, "title": "进度任务", "state": "opened", "notes": []}
+        self.model(action="task", mode="debug")
+        self.quoted_message("om_progress", "#488 还在测试中。\n"
+                            "https://git.example.com/frontend/web-v1/-/issues/488")
+        text = "先暂停测试，测试环境在维护"
+        self.b.handle(msg("om_pause", text, reply_to="om_progress"))
+        self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
+        body = self.w.issues[488]["notes"][-1]["body"]
+        self.assertIn(text, body)
+        self.assertNotIn("/go", body)
+
+    def test_known_progress_reply_preserves_pause_and_attachment(self):
+        self.model(action="task", mode="debug", relation="control", relation_issue=7)
+        self.state["secretary"]["msgs"]["om_progress"] = self.b.issue_url(self.b.project, 7)
+        self.b.handle(msg("om_pause", "先暂停测试，测试环境在维护 [Image: img_pause]",
+                          reply_to="om_progress"))
+        self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
+        body = self.w.issues[7]["notes"][-1]["body"]
+        self.assertIn("先暂停测试，测试环境在维护", body)
+        self.assertIn("/uploads/x/img_pause.jpg", body)
+        self.assertNotIn("/go", body)
+
+    def test_quoted_task_without_trusted_unique_target_never_creates(self):
+        url = self.b.issue_url(self.b.project, 7)
+        cases = [
+            ("user", url, ME, "user"),
+            ("other_bot", url, "cli_other_bot", "app"),
+            ("foreign_project", "https://git.example.com/other/project/-/issues/7", BOT, "app"),
+            ("foreign_host", "https://elsewhere.example/frontend/web-v1/-/issues/7", BOT, "app"),
+            ("multiple", url + " " + self.b.issue_url(self.b.project, 488), BOT, "app"),
+            ("mixed_projects", url + " https://git.example.com/other/project/-/issues/7", BOT, "app"),
+        ]
+        self.model(action="task", mode="debug")
+        for name, quoted, sender, sender_type in cases:
+            with self.subTest(name=name):
+                self.quoted_message("om_" + name, quoted, sender, sender_type)
+                self.b.handle(msg("om_pause_" + name, "先暂停测试，测试环境在维护", reply_to="om_" + name))
+                self.assertEqual(self.w.writes, [])
+                self.assertIn("任务", self.w.replies[-1]["text"])
+
+    def test_unreadable_task_reply_never_falls_back_to_create(self):
+        self.model(action="task", mode="debug")
+        self.w.unreadable_messages.add("om_missing")
+        self.b.handle(msg("om_pause", "先暂停测试，测试环境在维护", reply_to="om_missing"))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("任务", self.w.replies[-1]["text"])
+
+    def test_recovered_bot_reply_keeps_group_mention_gate(self):
+        self.model(action="task", mode="debug")
+        self.quoted_message("om_progress", self.b.issue_url(self.b.project, 7))
+        self.b.handle(msg("om_no_at", "先暂停测试，测试环境在维护", chat="oc_g", chat_type="group",
+                          reply_to="om_progress"))
+        self.assertEqual(self.w.writes, [])
+        self.b.handle(msg("om_at", "先暂停测试，测试环境在维护", chat="oc_g", chat_type="group",
+                          mentions=[{"id": BOT}], reply_to="om_progress"))
+        self.assertEqual(len(self.w.writes), 1)
+        self.assertEqual(self.w.writes[0][1], "projects/frontend/web-v1/issues/7/notes")
+        self.assertNotIn("/go", self.w.writes[0][2]["body"])
+
+    def test_reply_recovers_raw_parent_and_verifies_current_cli_bot(self):
+        self.b.cfg.pop("bot_open_id")
+        self.model(action="task", mode="debug")
+        self.quoted_message("om_progress", self.b.issue_url(self.b.project, 7), sender="cli_this_bot")
+        previous = self.b.run
+        identities = []
+
+        def run(cmd, **kwargs):
+            if cmd[:2] == ["lark-cli", "whoami"]:
+                identities.append(cmd)
+                return TFB.ok({"appId": "cli_this_bot", "identity": "bot", "available": True,
+                               "tokenStatus": "ready"})
+            return previous(cmd, **kwargs)
+
+        self.b.run = run
+        self.w.raw_messages["om_pause"] = {"message_id": "om_pause", "parent_id": "om_progress"}
+        self.b.handle(msg("om_pause", "先暂停测试，测试环境在维护"))
+        self.b.handle(msg("om_again", "测试环境恢复之前不要继续", reply_to="om_progress"))
+        self.assertEqual(len(identities), 1)
+        self.assertEqual(len(self.w.writes), 2)
+        self.assertTrue(all(w[1] == "projects/frontend/web-v1/issues/7/notes" for w in self.w.writes))
+        self.assertTrue(all("/go" not in w[2]["body"] for w in self.w.writes))
+
+    def test_missing_cli_identity_or_issue_cannot_create_from_reply(self):
+        self.model(action="task", mode="debug")
+        self.quoted_message("om_gone", self.b.issue_url(self.b.project, 999))
+        self.b.handle(msg("om_pause_gone", "先暂停测试，测试环境在维护", reply_to="om_gone"))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("尚未新建", self.w.replies[-1]["text"])
+        self.b.cfg.pop("bot_open_id")
+        self.quoted_message("om_unknown_bot", self.b.issue_url(self.b.project, 7), sender="cli_other")
+        previous = self.b.run
+
+        def run(cmd, **kwargs):
+            if cmd[:2] == ["lark-cli", "whoami"]:
+                return TFB.ok({"identity": "bot", "available": False})
+            return previous(cmd, **kwargs)
+
+        self.b.run = run
+        self.b.handle(msg("om_pause_unknown", "先暂停测试，测试环境在维护", reply_to="om_unknown_bot"))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("尚未新建", self.w.replies[-1]["text"])
+
+    def test_natural_progress_reply_records_only_bot_reply_for_followup(self):
+        url = self.b.issue_url(self.b.project, 488)
+        self.w.issues[488] = {"iid": 488, "title": "进度任务", "state": "opened", "notes": []}
+        self.state["secretary"]["issues"][url] = {"iid": 488, "project": self.b.project, "title": "进度任务"}
+        self.model(action="reply", reply="#488 仍在测试，尚未结束。")
+        self.b.handle(msg("om_question_488", "488现在是什么进度？"))
+        reply_id = f"om_r{len(self.w.replies)}"
+        self.assertEqual(self.state["secretary"]["msgs"][reply_id], url)
+        self.assertNotIn("om_question_488", self.state["secretary"]["msgs"])
+        self.model(action="task", mode="debug", relation="control", relation_issue=488)
+        self.b.handle(msg("om_pause_488", "先暂停测试，测试环境在维护", reply_to=reply_id))
+        self.assertEqual(len(self.w.writes), 1)
+        self.assertEqual(self.w.writes[0][1], "projects/frontend/web-v1/issues/488/notes")
+        self.assertIn("先暂停测试，测试环境在维护", self.w.writes[0][2]["body"])
+        self.assertNotIn("/go", self.w.writes[0][2]["body"])
+
+    def test_bare_quoted_task_number_is_not_permission_to_create(self):
+        self.model(action="task", mode="debug")
+        self.w.messages["om_bare"] = "#7 还在测试"
+        self.b.handle(msg("om_pause", "先暂停测试，测试环境在维护", reply_to="om_bare"))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("尚未新建", self.w.replies[-1]["text"])
+
+    def test_missing_reply_metadata_cannot_create(self):
+        self.model(action="task", mode="debug")
+        self.w.unreadable_messages.add("om_pause")
+        self.b.handle(msg("om_pause", "先暂停测试，测试环境在维护"))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("尚未新建", self.w.replies[-1]["text"])
+
+    def test_recovered_reply_keeps_attachment_and_receipt_failure_truthful(self):
+        self.quoted_message("om_progress", self.b.issue_url(self.b.project, 7) + "#note_70")
+        self.w.reply_failures = 1
+        self.b.handle(msg("om_pause", "先暂停测试，测试环境在维护 [Image: img_pause]",
+                          reply_to="om_progress"))
+        self.assertEqual(len(self.w.writes), 1)
+        self.assertIn("/uploads/x/img_pause.jpg", self.w.writes[0][2]["body"])
+        self.assertNotIn("/go", self.w.writes[0][2]["body"])
+        self.assertIn("不用重发", self.w.replies[-1]["text"])
 
     def test_unavailable_model_never_writes_or_claims_started(self):
         self.b.handle(msg("om_failed", "帮我修这个bug [Image: img_no_upload]"))

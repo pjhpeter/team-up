@@ -446,6 +446,79 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("已关联", self.w.replies[-1]["text"])
         self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
 
+    def test_task_misclassification_routes_control_without_new_issue_or_go(self) -> None:
+        for index, text in enumerate(("让7先停止测试，测试环境在维护", "让#7继续验证", "告诉7先别合并")):
+            with self.subTest(text=text):
+                decisions = iter((
+                    {"action": "task", "mode": "deliver", "reply": "", "issue": None},
+                    {"relation": "control", "issue": 7, "reply": ""},
+                ))
+
+                def run(cmd, **kwargs):
+                    if cmd[0] == "omp":
+                        return ok({"type": "turn_end", "message": {"content": [
+                            {"type": "text", "text": json.dumps(next(decisions))}]}})
+                    return self.w(cmd, **kwargs)
+
+                with unittest.mock.patch.object(self.b, "run", side_effect=run):
+                    self.b.handle(msg(f"om_control_{index}", text))
+                self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
+                self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
+                self.assertIn(text, self.w.writes[-1][2]["body"])
+                self.assertNotIn("/go", self.w.writes[-1][2]["body"])
+
+    def test_progress_question_does_not_send_an_instruction(self) -> None:
+        decision = {"action": "reply", "mode": "analyze", "reply": "#7 正在测试。", "issue": None}
+        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
+            {"type": "text", "text": json.dumps(decision)}]}})
+        self.b.handle(msg("om_progress_only", "7进度怎么样？"))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("正在测试", self.w.replies[-1]["text"])
+
+    def test_ordinary_quantity_does_not_bind_existing_task(self) -> None:
+        decisions = iter((
+            {"action": "task", "mode": "analyze", "reply": "", "issue": None},
+            {"relation": "new", "issue": None, "reply": ""},
+        ))
+
+        def run(cmd, **kwargs):
+            if cmd[0] == "omp":
+                return ok({"type": "turn_end", "message": {"content": [
+                    {"type": "text", "text": json.dumps(next(decisions))}]}})
+            return self.w(cmd, **kwargs)
+
+        with unittest.mock.patch.object(self.b, "run", side_effect=run):
+            self.b.handle(msg("om_quantity", "请增加7个测试样本"))
+        self.assertEqual(len([w for w in self.w.writes if w[1].endswith("/issues")]), 1)
+        self.assertFalse(any(w[1].endswith("/issues/7/notes") for w in self.w.writes))
+
+    def test_answer_reply_is_registered_and_followup_reaches_existing_issue(self) -> None:
+        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
+            {"type": "text", "text": "#7 正在测试。"}]}})
+        self.sec.answer(msg("om_question", "7进度怎么样？"), "7进度怎么样？")
+        answer_id = f"om_r{len(self.w.replies)}"
+        self.assertEqual(self.sec.state["msgs"].get(answer_id), URL7)
+        self.w.omp_out = ""
+        text = "先暂停测试，测试环境在维护"
+        self.b.handle(msg("om_pause", text, reply_to=answer_id))
+        self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
+        self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
+        self.assertIn(text, self.w.writes[-1][2]["body"])
+        self.assertNotIn("/go", self.w.writes[-1][2]["body"])
+
+    def test_answer_mapping_rejects_unknown_foreign_and_ambiguous_targets(self) -> None:
+        self.sec.state["issues"][URL7[:-1] + "8"] = {"project": "frontend/web-v1", "iid": 8}
+        answers = ("#7 与 #8 都在测试。", f"{URL7} 和 https://git.example.com/other/project/-/issues/7",
+                   "https://git.example.com/frontend/web-v1/-/issues/99", "没有任务链接。")
+        with unittest.mock.patch.object(self.sec, "overview", return_value=[]), \
+                unittest.mock.patch.object(self.sec, "recent_notes", return_value=[]):
+            for index, answer in enumerate(answers):
+                with self.subTest(answer=answer):
+                    self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
+                        {"type": "text", "text": answer}]}})
+                    self.sec.answer(msg(f"om_ambiguous_{index}", "进度？"), "进度？")
+                    self.assertNotIn(f"om_r{len(self.w.replies)}", self.sec.state["msgs"])
+
     def test_closed_origin_drops_out_of_watch(self) -> None:
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))
         self.sec.poll()

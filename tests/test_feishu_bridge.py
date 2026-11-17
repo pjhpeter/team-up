@@ -48,8 +48,16 @@ class World:
     def __call__(self, cmd, input=None, env=None, cwd=None, **_):
         if cmd[0] == "lark-cli":
             return self.lark(cmd, input, cwd)
-        if cmd[0] == "omp":  # 秘书回答提问用的模型，默认不可用
-            return subprocess.CompletedProcess(cmd, 1, "", "")
+        if cmd[0] == "omp":
+            material = json.loads(cmd[-1])
+            linked = material.get("linked_issue")
+            if linked is None:
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            # 普通话题用合法决策；模型故障用例需显式注入失败。
+            decision = {"action": "relay", "issue": linked, "mode": "analyze", "reply": "",
+                        "reference": "linked", "evidence": material["current_message"]}
+            return ok({"type": "turn_end", "message": {"content": [
+                {"type": "text", "text": json.dumps(decision, ensure_ascii=False)}]}})
         method, path = cmd[cmd.index("-X") + 1], unquote(cmd[cmd.index("-X") + 2])
         fields = dict(cmd[i + 1].split("=", 1) for i, c in enumerate(cmd) if c == "-f")
         as_user = bool(env and env.get("GITLAB_TOKEN") == "tok")

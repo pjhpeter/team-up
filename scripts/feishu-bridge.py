@@ -85,6 +85,8 @@ PENDING_IMAGE_S = 600  # 单独发的图片/文件在这段时间内会自动带
 IMAGE_HINT = "收到附件。10 分钟内接着说要做什么，或发「#编号」关联已有 issue，我会把附件一起带上。"
 # 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉
 BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*")
+# 中文可紧贴任务编号；数字只用于查候选，不代表已获转告授权。
+ISSUE_NUMBER_RE = re.compile(r"(?<![0-9A-Za-z_./])[1-9][0-9]*(?![0-9])")
 FAILED_TEXT = "这条没处理成功，请重发。"
 OBSERVE_IMAGES_PER_MESSAGE = 4  # 观察群一条消息最多下载几张图给模型看
 OBSERVE_DOWNLOAD_TIMEOUT_S = 60  # 观察是顺带做的，单张图下载超时比搬到 GitLab 短，免得拖慢 @ 指令的处理
@@ -175,9 +177,12 @@ class Bridge:
 
     def __init__(self, config: dict[str, Any], state: dict[str, Any], run: Runner = subprocess.run,
                  user_token: str = "", now: Callable[[], float] = time.time,
-                 upload: Optional[Uploader] = None, media_dir: Path = MEDIA_DIR):
+                 upload: Optional[Uploader] = None, media_dir: Path = MEDIA_DIR,
+                 persist: Optional[Callable[[], None]] = None):
         self.cfg, self.state, self.run, self.now = config, state, run, now
         self.upload = upload or self.http_upload
+        self.persist = persist or (lambda: None)
+        self.relay_summary: Optional[str] = None
         self.media_dir = media_dir
         self.host: str = config["gitlab_host"]
         self.project: str = config["default_project"]
@@ -423,6 +428,7 @@ class Bridge:
         self.state["seen"] = cap_list(self.state["seen"] + [mid])
         pending = list(self.state["pending_images"].get(msg.get("chat_id", ""), []))
         self.delivered = None
+        self.relay_summary = None
         try:
             self.dispatch(msg)
         except Exception as e:  # 消息已记为处理过，不会自动重试，无论什么错都要让发消息的人知道
@@ -444,6 +450,8 @@ class Bridge:
         if t and t.get("execution_pending"):
             text = (f"[#{t['iid']}]({self.issue_url(t['project'], t['iid'])}) 已建单，但开工指令未发送成功。"
                     "不要重发需求；请在这条消息下回复「开始修复」或「开工」。")
+        if self.relay_summary:
+            text = self.relay_summary
         # 主聊天区的引用回复也带 root_id（被引用那条），但不是话题；只有真在话题里才用话题回，否则会凭空开出一个话题
         in_thread = bool(mid in self.state["threads"] or msg.get("thread_id")
                          or msg.get("root_id") in self.state["threads"])
@@ -505,8 +513,8 @@ class Bridge:
         c = CREATE_RE.match(command_text)
         candidate = command_text[c.end():] if c else command_text
         m = BIND_RE.match(candidate)
-        if m and not c and self.pending_keys(msg):
-            # 追问后的编号是在补齐原请求，不能丢掉此前的暂停/修复等原话。
+        if m and not c and (self.pending_keys(msg) or len(set(ISSUE_NUMBER_RE.findall(command_text))) > 1):
+            # 补充编号和多目标句子都须完整理解，不能静默只绑定第一个。
             self.natural_entry(msg, text, user, linked=linked, target=target)
             return
         if m:
@@ -593,7 +601,7 @@ class Bridge:
         for item in self.recent_targets(msg):
             known.setdefault(item["iid"], item)
         # GET 确认明确数字引用与当前关联；禁止把引用背景里的编号混入当前用户选择。
-        explicit = {int(n) for n in re.findall(r"(?<![\w/])[1-9][0-9]*(?![0-9])", text)}
+        explicit = {int(n) for n in ISSUE_NUMBER_RE.findall(text)}
         for url in re.findall(r"https?://[^\s<>，。；]+", text):
             if "/-/issues/" in url or "/-/work_items/" in url:
                 explicit.add(topics_module().issue_id(self.cfg, url))
@@ -615,6 +623,9 @@ class Bridge:
             context += "\n\n机器人上次追问（仅作背景）：\n" + msg["intent_question"]
         if msg.get("unresolved_task_reference"):
             context += "\n引用的任务无法核实；不能把它当作新需求，需追问目标。"
+        if msg.get("relay_plan"):
+            context += "\n\n本次转告的逐项状态（sent 已成功，不要重复；其余仍待处理）：\n" + json.dumps(
+                msg["relay_plan"], ensure_ascii=False)
         context += "\n\n## 机器人用法\n" + HELP_TEXT
         context += "\n\n## 候选任务最近评论\n" + "\n".join(self.secretary.recent_notes(candidates=candidates))
         return self.secretary.classify_intent(text, context, candidates=candidates,
@@ -634,6 +645,16 @@ class Bridge:
                 direct.append(key)
         return direct or scoped
 
+    def save_pending_intent(self, key: str, msg: dict, previous: Optional[dict], *,
+                            linked_issue: Optional[int], status: str, question: str = "") -> dict:
+        item = {**(previous or {}), "chat": msg.get("chat_id", ""), "sender": msg.get("sender_id"),
+                "thread": msg.get("thread_id") or "", "linked_issue": linked_issue,
+                "status": status, "question": question,
+                "messages": (previous["messages"] if previous else []) + [dict(msg)],
+                "reply_ids": list(previous["reply_ids"] if previous else [])}
+        self.state["pending_intents"][key] = item
+        return item
+
     def natural_entry(self, msg: dict[str, Any], text: str, user: str, *,
                       linked: Optional[str] = None, target: Optional[str] = None) -> None:
         mid, chat = msg["message_id"], msg.get("chat_id", "")
@@ -641,13 +662,14 @@ class Bridge:
         key = self.intent_scope(msg)
         matches = self.pending_keys(msg)
         if len(matches) > 1:
-            self.reply(mid, "这里还有多项待补充的请求，请直接回复你想继续的那条追问。尚未新建或转交。",
+            self.reply(mid, "这里还有多项未完成请求，请直接回复你想继续的那条消息。尚未新建或转交。",
                        f"pending-choice-{mid}", in_thread=bool(msg.get("thread_id")))
             return
         if matches:
             key = matches[0]
         previous = pending.get(key)
-        source = {**msg, "intent_history": previous["messages"], "intent_question": previous["question"]} if previous else dict(msg)
+        source = {**msg, "intent_history": previous["messages"], "intent_question": previous["question"],
+                  "relay_plan": previous.get("relay_plan", [])} if previous else dict(msg)
         request = text
         if previous:
             request = ("同一次待澄清请求的用户原话：\n"
@@ -668,25 +690,41 @@ class Bridge:
         candidates = self.intent_candidates(msg, request, linked_issue)
         recent = self.recent_targets(msg)
         intent = self.classify_message(source, request, candidates=candidates, linked_issue=linked_issue, recent=recent)
-        if intent is None and linked_issue is not None:
-            # 模型故障只能保持已有原文转交，不产生任何新建或开工授权。
-            intent = {"action": "relay", "issue": linked_issue, "mode": "analyze"}
         if intent is None:
-            intent = {"action": "clarify", "issue": None, "mode": "analyze",
-                      "reply": "这会儿没法确认你指的是哪张任务，尚未新建或启动任务。请补充任务编号或需求对象。"}
+            # 内部故障不等于用户没说清，也不能擅自转给引用里的另一张任务。
+            reason = self.secretary.intent_error or "invalid_decision"
+            log(f"intent failed mid={mid} reason={reason}")
+            item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue, status="failed")
+            self.persist()
+            reply_id = self.reply(mid, "这次消息处理失败，尚未新建或启动任务，也未新增转告。原请求已保留，请回复“重试”。",
+                                  f"intent-failed-{mid}", in_thread=in_thread)
+            if reply_id:
+                item["reply_ids"].append(reply_id)
+            return
         if intent["action"] == "create" and source.get("unresolved_task_reference"):
             intent = {"action": "clarify", "issue": None, "mode": "analyze",
                       "reply": "没能确认引用对应哪张任务，尚未新建或转交。请写明任务编号或链接。"}
+        if intent["action"] == "batch" or intent["action"] == "relay" and previous and previous.get("relay_plan"):
+            if intent["action"] == "batch":
+                actions = intent["actions"]
+            else:
+                old = next((item for item in previous["relay_plan"] if item["issue"] == intent["issue"]), None)
+                directive = (old["text"] + "\n\n用户补充（以本次为准）：\n" + text) if old else text
+                actions = [{**intent, "text": directive}]
+            item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue, status="partial")
+            self.deliver_relay_plan(key, source, actions, item)
+            return
         action, mode, iid = intent["action"], intent["mode"], intent["issue"]
         if action in ("answer", "clarify"):
+            if action == "clarify":
+                item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue,
+                                                status="clarify", question=intent["reply"])
+                self.persist()
             reply_text = self.secretary.linkify(intent["reply"])
             reply_id = self.reply(mid, reply_text, f"intent-{mid}", in_thread=in_thread)
             if action == "clarify":
-                pending[key] = {"chat": chat, "sender": msg.get("sender_id"),
-                                "thread": msg.get("thread_id") or "", "linked_issue": linked_issue,
-                                "question": intent["reply"],
-                                "messages": (previous["messages"] if previous else []) + [dict(msg)],
-                                "reply_ids": (previous["reply_ids"] if previous else []) + ([reply_id] if reply_id else [])}
+                if reply_id:
+                    item["reply_ids"].append(reply_id)
             else:
                 pending.pop(key, None)
                 if iid is not None:
@@ -720,6 +758,92 @@ class Bridge:
                 issue = next((item for item in candidates if item["iid"] == delivered["iid"]),
                              {"iid": delivered["iid"], "title": self.strip_images(text)[:60]})
                 self.remember_target(msg, issue)
+
+    def deliver_relay_plan(self, key: str, source: dict, actions: list[dict], pending: dict) -> None:
+        plan = pending.setdefault("relay_plan", [])
+        by_issue = {item["issue"]: item for item in plan}
+        for action in actions:
+            iid = action["issue"]
+            old = by_issue.get(iid)
+            if old and old["status"] in ("sent", "sending", "unknown"):
+                continue
+            if old:
+                old.update(text=action["text"], mode=action["mode"])
+            else:
+                item = {"issue": iid, "text": action["text"], "mode": action["mode"], "status": "pending"}
+                plan.append(item)
+                by_issue[iid] = item
+        pending.setdefault("origin", source["message_id"])
+        self.persist()
+        # 附件只上传一次；续接使用已保存背景，不重复搬运。
+        if "context" not in pending:
+            pending["context"] = self.message_context(source, self.project,
+                                                       self.take_pending_images(source.get("chat_id", "")))
+            self.persist()
+        selected = {item["issue"] for item in actions}
+        for item in plan:
+            iid = item["issue"]
+            marker = f"<!-- hwf-relay:{pending['origin']}:{iid} -->"
+            if item["status"] in ("sending", "unknown"):
+                # 写入超时可能已成功；只核对，不盲目重发。
+                item["status"] = "unknown"
+                try:
+                    for page in range(1, 6):
+                        notes = self.api(f"projects/{quote(self.project, safe='')}/issues/{iid}/notes"
+                                         f"?sort=desc&per_page=100&page={page}")
+                        found = next((n for n in notes if marker in (n.get("body") or "")), None)
+                        if found:
+                            item.update(status="sent", note_id=found["id"])
+                            self.state["posted_notes"] = cap_list(self.state["posted_notes"] + [found["id"]])
+                            break
+                        if len(notes) < 100:
+                            break
+                except (BridgeError, ValueError):
+                    log(f"relay reconciliation failed mid={pending['origin']} issue={iid}")
+                self.persist()
+            if item["status"] != "pending" or iid not in selected:
+                continue
+            try:
+                issue = self.api(f"projects/{quote(self.project, safe='')}/issues/{iid}")
+                if issue.get("state") == "closed":
+                    item["error"] = "closed"
+                    continue
+                body = self.secretary.relay_body(source, item["text"], mode=item["mode"],
+                                                  project=self.project, context=pending["context"])
+                if not body:
+                    item["error"] = "empty"
+                    continue
+                item["status"] = "sending"
+                self.persist()
+                note_id = self.note_as_user(self.project, iid, f"@{self.agent} {body}\n\n{marker}")
+                item.update(status="sent", note_id=note_id)
+                self.remember_target(source, issue)
+                self.secretary.state["issues"][self.issue_url(self.project, iid)] = {**issue, "project": self.project}
+            except (BridgeError, ValueError):
+                if item["status"] == "sending":
+                    item["status"] = "unknown"
+                item["error"] = "delivery_failed"
+                log(f"relay failed mid={pending['origin']} issue={iid} status={item['status']}")
+            finally:
+                self.persist()
+        lines = []
+        for item in plan:
+            iid = item["issue"]
+            label = f"[#{iid}]({self.issue_url(self.project, iid)})"
+            result = ("已转交" if item["status"] == "sent" else
+                      "发送结果待核实，请先查看任务评论，不要重复发送" if item["status"] == "unknown" else
+                      "任务已关闭，未转交" if item.get("error") == "closed" else "未转交")
+            lines.append(f"{label}：{result}。")
+        if any(item["status"] == "pending" for item in plan):
+            lines.append("未完成项已保留，处理后可回复“重试未完成项”；已成功的不会重复发送。")
+        if all(item["status"] == "sent" for item in plan):
+            self.state["pending_intents"].pop(key, None)
+        self.persist()
+        self.relay_summary = "\n".join(lines)
+        reply_id = self.reply(source["message_id"], self.relay_summary,
+                              f"relay-plan-{source['message_id']}", in_thread=bool(source.get("thread_id")))
+        if reply_id and key in self.state["pending_intents"]:
+            pending["reply_ids"].append(reply_id)
 
     def clean_text(self, msg: dict[str, Any]) -> str:
         # 事件里的 content 已渲染成「@名字」，原始接口里是「@_user_1」占位符，两种都要处理；
@@ -1263,7 +1387,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         consumer_lock = topics.lock_bridge(STATE_PATH) if not args.check else None
         token = keychain_token(cfg.get("gitlab_token_keychain"))
         state = load_json(STATE_PATH, {})
-        bridge = Bridge(cfg, state, user_token=token)
+        bridge = Bridge(cfg, state, user_token=token, persist=lambda: save_json(STATE_PATH, state))
         bot = bridge.lark(["api", "GET", "/open-apis/bot/v3/info"])
         cfg.setdefault("bot_open_id", (bot.get("data") or {}).get("open_id"))
         who = bridge.api("user", as_user=True)["username"] if token else None

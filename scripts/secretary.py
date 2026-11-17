@@ -107,6 +107,7 @@ class Secretary:
         cfg = dict(DEFAULT_MODEL)
         cfg.update(bridge.cfg.get("secretary") or {})
         self.cfg = cfg
+        self.intent_error: str | None = None
 
     def merge_link_forms(self) -> None:
         """旧状态里同一需求可能按两种链接各记了一份：合成一份，攒着的发言按评论 id 去重。"""
@@ -444,24 +445,30 @@ class Secretary:
 
     # ---------- 用户在私聊里对秘书说话 ----------
 
+    def relay_body(self, msg: Mapping[str, Any], text: str, *, mode: str = "analyze",
+                   context: str | None = None, project: str | None = None) -> str:
+        if context is None:
+            # 纯命令不继承引用指令；附件仍归目标项目。
+            source = {**msg, "reply_to": "", "root_id": "", "context_warning": ""} if text.startswith("/") else dict(msg)
+            context = self.bridge.message_context(source, project or self.bridge.project,
+                                                  self.bridge.take_pending_images(msg.get("chat_id", "")))
+        text = self.bridge.strip_images(text)
+        if not text and not context:
+            return ""
+        body = text if text.startswith("/") and not context else \
+            "\n\n".join(x for x in (text, context) if x) + "\n\n_（来自飞书秘书）_"
+        return self.bridge.execution_body(body, mode)
+
     def relay(self, url: str, msg: Mapping[str, Any], text: str, ack: str = "", *, mode: str = "analyze") -> None:
         mid = msg["message_id"]
         thread = bool(msg.get("thread_id"))
         issue = self.state["issues"].get(url)
         project = issue["project"] if issue else self.bridge.project
         iid = issue["iid"] if issue else int(url.rsplit("/", 1)[-1])
-        # 纯指令保持原样；普通引用回复与群消息共用上下文和附件收集。
-        source = {**msg, "reply_to": "", "root_id": "", "context_warning": ""} if text.startswith("/") else dict(msg)
-        context = self.bridge.message_context(source, project,
-                                              self.bridge.take_pending_images(msg.get("chat_id", "")))
-        text = self.bridge.strip_images(text)
-        if not text and not context:
+        body = self.relay_body(msg, text, mode=mode, project=project)
+        if not body:
             self.bridge.reply(mid, "这条没有内容，没转。", f"sec-empty-{mid}", in_thread=thread)
             return
-        body = text if text.startswith("/") and not context else \
-            "\n\n".join(x for x in (text, context) if x) + "\n\n_（来自飞书秘书）_"
-        # 先收齐原文、引用与附件，再封装已获授权的执行模式，避免把自然回复误作裸指令。
-        body = self.bridge.execution_body(body, mode)
         self.bridge.note_as_user(project, iid, f"@{self.bridge.agent} {body}")
         title = f" {issue.get('title', '')}" if issue else ""
         self.bridge.reply(mid, f"已转给 [#{iid}]({url}){title}。{ack}", f"sec-relayed-{mid}", in_thread=thread)
@@ -492,19 +499,29 @@ class Secretary:
     def classify_intent(self, text: str, context: str = "", *, candidates: list[dict] | None = None,
                         linked_issue: int | None = None, recent: list[dict] | None = None) -> dict | None:
         """一次模型决策动作、目标与授权；代码只核验结构和来源，不再次猜语义。"""
+        self.intent_error = None
         # 显式空候选是调用方限制范围，不能回退到秘书的全量登记。
         candidates = list(self.known_tasks().values()) if candidates is None else candidates
         recent = [] if recent is None else recent
-        material = json.dumps({"current_message": text, "context": context, "candidates": candidates,
+        identities = [{key: item[key] for key in ("iid", "title", "project") if key in item}
+                      for item in candidates]
+        material = json.dumps({"current_message": text, "context": context, "candidates": identities,
                                "linked_issue": linked_issue, "recent": recent}, ensure_ascii=False)
         response = self.ask_model(material)
-        try:
-            intent = json.loads(response) if response is not None else None
-        except ValueError:
+        if response is None:
+            self.intent_error = self.intent_error or "no_response"
             return None
-        return _INTENT.validate_intent(intent, text, candidates, linked_issue, recent)
+        try:
+            intent = json.loads(response)
+        except ValueError:
+            self.intent_error = "invalid_json"
+            return None
+        result = _INTENT.validate_intent(intent, text, candidates, linked_issue, recent)
+        self.intent_error = "invalid_intent" if result is None else None
+        return result
 
     def ask_model(self, material: str) -> Optional[str]:
+        self.intent_error = None
         # 沿用秘书既有的只读工具权限：当前模型通道在 --no-tools 下会返回空响应。
         # 分类提示禁止工具，下面还会拒绝任何实际使用过工具的分类结果。
         tools = ["--tools", "read"]
@@ -515,32 +532,57 @@ class Secretary:
         try:
             r = self.bridge.run(cmd, capture_output=True, text=True, timeout=int(self.cfg["timeout_s"]),
                                 check=False, stdin=subprocess.DEVNULL)
-        except (OSError, subprocess.SubprocessError):
+        except subprocess.TimeoutExpired:
+            self.intent_error = "timeout"
+            return None
+        except OSError:
+            self.intent_error = "start_error"
+            return None
+        except subprocess.SubprocessError:
+            self.intent_error = "process_error"
             return None
         if r.returncode != 0:
+            self.intent_error = "process_exit"
             return None
         reply = ""
         for line in (r.stdout or "").splitlines():
             try:
                 ev = json.loads(line)
             except ValueError:
-                continue
-            if isinstance(ev, dict) and ev.get("type") in {
-                "tool_execution_start", "tool_execution_end",
-            }:
+                self.intent_error = "invalid_event"
                 return None
-            if not isinstance(ev, dict) or ev.get("type") != "turn_end":
+            if isinstance(ev, dict) and ev.get("type") in (
+                "tool_execution_start", "tool_execution_end",
+            ):
+                self.intent_error = "tool_used"
+                return None
+            if not isinstance(ev, dict) or not isinstance(ev.get("type"), str):
+                self.intent_error = "invalid_event"
+                return None
+            if ev["type"] != "turn_end":
                 continue
             message = ev.get("message")
-            if not isinstance(message, dict) or message.get("stopReason") not in (None, "stop"):
-                reply = ""
-                continue
+            if not isinstance(message, dict):
+                self.intent_error = "invalid_event"
+                return None
+            if message.get("stopReason") not in (None, "stop"):
+                self.intent_error = "interrupted_turn"
+                return None
             content = message.get("content")
-            if not isinstance(content, list) or any(not isinstance(c, dict) for c in content):
+            if not isinstance(content, list) or any(
+                    not isinstance(c, dict) or not isinstance(c.get("type"), str) for c in content):
+                self.intent_error = "invalid_event"
+                return None
+            if any(c.get("type") in {"toolCall", "tool_use", "tool_call"} for c in content):
+                self.intent_error = "tool_used"
                 return None
             texts = [c.get("text") for c in content if c.get("type") == "text"]
             if any(not isinstance(text, str) for text in texts):
+                self.intent_error = "invalid_event"
                 return None
             reply = "".join(texts)
-        return reply.strip() or None
+        if not reply.strip():
+            self.intent_error = "empty_response"
+            return None
+        return reply.strip()
 

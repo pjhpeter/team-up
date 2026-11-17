@@ -218,11 +218,11 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(len(self.model.calls), 1)
         self.assertIsNone(self.sec.classify_intent("先暂停测试", candidates=[{"iid": 488, "title": "导出"}]))
 
-    def test_multi_target_and_ambiguous_recent_can_only_ask_without_action(self) -> None:
+    def test_ambiguous_recent_can_only_ask_without_action(self) -> None:
         expected = {"action": "clarify", "mode": "analyze", "reply": "请确认先处理哪一个任务？", "issue": None,
                     "reference": "none", "evidence": ""}
         candidates = [{"iid": 484, "title": "导出测试"}, {"iid": 488, "title": "登录测试"}]
-        for text in ("484停一下，488继续", "刚才那个先暂停", "测试先暂停"):
+        for text in ("刚才那个先暂停", "测试先暂停"):
             with self.subTest(text=text):
                 self.model.respond(expected)
                 self.assertEqual(self.sec.classify_intent(text, candidates=candidates, recent=candidates), expected)
@@ -299,6 +299,77 @@ class TaskIntentTest(unittest.TestCase):
                 self.model.stdout = json.dumps({"type": "turn_end", "message": {
                     "stopReason": reason, "content": [{"type": "text", "text": json.dumps(response)}]}})
                 self.assertIsNone(self.sec.classify_intent("请实现透明背景"))
+                self.assertEqual(self.sec.intent_error, "interrupted_turn")
+
+    def test_failure_codes_are_safe_and_never_retry(self) -> None:
+        secret = "private-request-response-token"
+        cases = [
+            ("", 0, None, "empty_response"),
+            (secret, 0, None, "invalid_event"),
+            (json.dumps({"type": []}), 0, None, "invalid_event"),
+            (json.dumps({"type": "turn_end", "message": {"content": [
+                {"type": []}]}}), 0, None, "invalid_event"),
+            ("", 1, None, "process_exit"),
+            ("", 0, OSError(secret), "start_error"),
+            ("", 0, subprocess.TimeoutExpired(secret, 9), "timeout"),
+            ("", 0, subprocess.SubprocessError(secret), "process_error"),
+            (json.dumps({"type": "tool_execution_end"}), 0, None, "tool_used"),
+            (json.dumps({"type": "turn_end", "message": {"content": [
+                {"type": "toolCall", "name": "read"}]}}), 0, None, "tool_used"),
+            (json.dumps({"type": "turn_end", "message": {"content": [
+                {"type": "text", "text": secret}]}}), 0, None, "invalid_json"),
+            (json.dumps({"type": "turn_end", "message": {"content": [
+                {"type": "text", "text": "{}"}]}}), 0, None, "invalid_intent"),
+        ]
+        for stdout, code, error, reason in cases:
+            with self.subTest(reason=reason):
+                self.model.stdout, self.model.returncode, self.model.error = stdout, code, error
+                before = len(self.model.calls)
+                self.assertIsNone(self.sec.classify_intent(secret, candidates=[]))
+                self.assertEqual(self.sec.intent_error, reason)
+                self.assertEqual(len(self.model.calls), before + 1)
+                self.assertNotIn(secret, self.sec.intent_error)
+
+    def test_success_and_clarification_clear_previous_failure(self) -> None:
+        self.assertIsNone(self.sec.intent_error)
+        for action, reply in (("answer", "可以讨论。"), ("clarify", "你指哪个任务？")):
+            self.model.stdout = ""
+            self.assertIsNone(self.sec.classify_intent("那个", candidates=[]))
+            self.assertEqual(self.sec.intent_error, "empty_response")
+            expected = {"action": action, "issue": None, "mode": "analyze", "reply": reply,
+                        "reference": "none", "evidence": ""}
+            self.model.respond(expected)
+            before = len(self.model.calls)
+            self.assertEqual(self.sec.classify_intent("那个", candidates=[]), expected)
+            self.assertIsNone(self.sec.intent_error)
+            self.assertEqual(len(self.model.calls), before + 1)
+
+    def test_missing_response_has_fallback_reason_and_resets_old_error(self) -> None:
+        self.sec.intent_error = "timeout"
+        calls = []
+        self.sec.ask_model = lambda material: calls.append(material)
+        self.assertIsNone(self.sec.classify_intent("那个", candidates=[]))
+        self.assertEqual(self.sec.intent_error, "no_response")
+        self.assertEqual(len(calls), 1)
+
+    def test_candidates_send_only_identity_fields_without_mutation(self) -> None:
+        candidate = {"iid": 484, "title": "导出", "project": "frontend/web-v1",
+                     "description": "private description", "notes": ["private notes"]}
+        expected = {"action": "relay", "issue": 484, "mode": "analyze", "reply": "",
+                    "reference": "explicit", "evidence": "484"}
+        self.model.respond(expected)
+        self.assertEqual(self.sec.classify_intent("484先暂停", candidates=[candidate]), expected)
+        material = json.loads(self.model.calls[-1][0][-1])
+        self.assertEqual(material["candidates"], [{"iid": 484, "title": "导出", "project": "frontend/web-v1"}])
+        self.assertEqual(candidate["description"], "private description")
+
+    def test_relay_body_reuses_context_without_collecting_attachments(self) -> None:
+        self.sec.bridge.strip_images = lambda text: text
+        self.sec.bridge.execution_body = lambda body, mode: f"{mode}:{body}"
+        self.assertEqual(self.sec.relay_body({}, "484先暂停", context="共享附件", mode="analyze"),
+                         "analyze:484先暂停\n\n共享附件\n\n_（来自飞书秘书）_")
+        self.assertEqual(self.sec.relay_body({}, "", context=""), "")
+        self.assertEqual(self.sec.relay_body({}, "/go", context="", mode="deliver"), "deliver:/go")
 
     def test_shared_runner_keeps_read_tool_transport(self) -> None:
         self.model.respond({"action": "answer", "mode": "analyze", "reply": "正在开发。", "issue": None,

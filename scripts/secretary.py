@@ -268,12 +268,27 @@ class Secretary:
                 raise
         held.pop(url, None)
 
+    def track(self, url: str, issue: Mapping[str, Any], last_note: int | None = None) -> dict[str, Any]:
+        """登记要跟进的任务；已有记录保留水位，不能被整张 GitLab issue 覆盖。"""
+        known = self.state["issues"].get(url)
+        if known is None:
+            known = {"project": issue["project"], "iid": int(issue["iid"]), "title": issue.get("title", ""),
+                     "last_agent_at": self.bridge.now()}
+            if last_note is not None:
+                known["last_note"] = last_note
+            self.state["issues"][url] = known
+        return known
+
     def notes_of(self, w: Mapping[str, Any]) -> list[dict[str, Any]]:
         pid = quote(w["project"], safe="")
         return self.bridge.api(f"projects/{pid}/issues/{w['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
 
     def fresh_entries(self, url: str, known: dict[str, Any], notes: list[dict[str, Any]], forward: bool) -> list[dict[str, Any]]:
         """水位之后要转的 Agent 发言，同时推进水位。"""
+        if "last_note" not in known:
+            # 只登记了身份、还没有水位：按第一次看到处理，不回放旧评论。
+            known["last_note"] = max([n["id"] for n in notes] or [0])
+            return []
         fresh = []
         for n in sorted((n for n in notes if n["id"] > known["last_note"]), key=lambda n: n["id"]):
             if forward and self.should_forward(n, include_users=known.get("private_thread", False)):

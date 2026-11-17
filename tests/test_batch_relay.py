@@ -57,6 +57,15 @@ class BatchRelayTest(unittest.TestCase):
         self.assertIn("#488", self.w.replies[0]["text"])
         self.assertEqual(self.state["pending_intents"], {})
 
+    def test_batch_relay_keeps_secretary_watermark(self):
+        self.prepare()
+        self.b.handle(msg("om_batch", "告诉 484 和 488 的调度，测试环境已经可以使用了，继续工作"))
+        for iid in (484, 488):
+            known = self.state["secretary"]["issues"][self.b.issue_url(self.b.project, iid)]
+            self.assertEqual(known["last_note"], self.w.issues[iid]["notes"][-1]["id"])
+            self.assertNotIn("description", known)
+        self.b.secretary.poll()
+
     def test_opposite_instructions_only_reach_their_recipient(self):
         self.prepare([(484, "先暂停测试"), (488, "继续工作")])
         self.b.handle(msg("om_split", "告诉484先暂停测试，告诉488继续工作"))

@@ -214,14 +214,11 @@ class NaturalEntryTest(unittest.TestCase):
         self.state["secretary"]["issues"][url] = {"iid": 488, "project": self.b.project, "title": "进度任务"}
         self.model(action="answer", issue=488, reply="#488 仍在测试，尚未结束。")
         self.b.handle(msg("om_question_488", "488现在是什么进度？"))
-        reply_id = f"om_r{len(self.w.replies)}"
-        self.assertEqual(self.state["secretary"]["msgs"][reply_id], url)
         self.assertNotIn("om_question_488", self.state["secretary"]["msgs"])
-        self.model(action="relay", issue=488)
-        self.b.handle(msg("om_pause_488", "先暂停测试，测试环境在维护", reply_to=reply_id))
         self.assertEqual(len(self.w.writes), 1)
         self.assertEqual(self.w.writes[0][1], "projects/frontend/web-v1/issues/488/notes")
-        self.assertIn("先暂停测试，测试环境在维护", self.w.writes[0][2]["body"])
+        self.assertIn("488现在是什么进度？", self.w.writes[0][2]["body"])
+        self.assertTrue(all("仍在测试" not in r["text"] for r in self.w.replies))
         self.assertNotIn("/go", self.w.writes[0][2]["body"])
 
     def test_bare_quoted_task_number_is_not_permission_to_create(self):
@@ -431,22 +428,21 @@ class NaturalEntryTest(unittest.TestCase):
 
         self.b.secretary.ask_model = answer
 
-    def test_mapped_private_progress_uses_one_decision_without_relay(self):
+    def test_mapped_private_progress_relays_with_one_decision(self):
         url = self.b.issue_url(self.b.project, 7)
         self.state["secretary"]["msgs"]["om_progress"] = url
         self.unified_decision("answer", issue=7, reference="linked", evidence="进展", reply="还在测试。")
         self.b.handle(msg("om_query", "有什么进展？", reply_to="om_progress"))
         self.assertEqual(len(self.decisions), 1)
-        self.assertEqual(self.w.writes, [])
-        self.assertEqual(self.w.replies[-1]["text"], "还在测试。")
-        self.assertEqual(self.state["secretary"]["msgs"]["om_r1"], url)
+        self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
+        self.assertNotEqual(self.w.replies[-1]["text"], "还在测试。")
 
-    def test_recovered_progress_question_does_not_relay(self):
+    def test_recovered_progress_question_relays(self):
         self.quoted_message("om_old", self.b.issue_url(self.b.project, 7))
         self.unified_decision("answer", issue=7, reference="linked", evidence="进展", reply="尚在测试。")
         self.b.handle(msg("om_query", "现在进展怎么样？", reply_to="om_old"))
         self.assertEqual(len(self.decisions), 1)
-        self.assertEqual(self.w.writes, [])
+        self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
 
     def test_task_name_pause_relays_without_opening_topic(self):
         url = self.b.issue_url(self.b.project, 7)
@@ -461,18 +457,19 @@ class NaturalEntryTest(unittest.TestCase):
         self.assertFalse(self.w.replies[-1]["in_thread"])
 
     def test_recent_target_survives_restart_but_not_another_user_scope(self):
-        self.unified_decision("answer", issue=7, reference="explicit", evidence="#7", reply="还在测试。")
+        self.unified_decision("relay", issue=7, reference="explicit", evidence="#7")
         self.b.handle(msg("om_query", "看看 #7 进度"))
+        self.assertEqual(len(self.w.writes), 1)
         restored = json.loads(json.dumps(self.state))
         self.b = FB.Bridge(self.b.cfg, restored, run=self.w, user_token="tok", now=lambda: 1_000_000.0,
                            upload=self.fake_upload, media_dir=Path(self.tmp.name) / "media")
         self.b._secretary = FB.secretary_module().Secretary(self.b, home=Path(self.tmp.name))
         self.unified_decision("relay", issue=7, reference="recent", evidence="刚才那个")
         self.b.handle(msg("om_pause", "刚才那个先暂停测试"))
-        self.assertEqual(len(self.w.writes), 1)
+        self.assertEqual(len(self.w.writes), 2)
         self.b.users["ou_other"] = "other"
         self.b.handle(msg("om_other_pause", "刚才那个先暂停测试", sender="ou_other"))
-        self.assertEqual(len(self.w.writes), 1)
+        self.assertEqual(len(self.w.writes), 2)
 
     def test_group_task_name_cannot_select_other_groups_task(self):
         url = self.b.issue_url(self.b.project, 7)
@@ -487,9 +484,10 @@ class NaturalEntryTest(unittest.TestCase):
             self.w.issues.setdefault(iid, {"iid": iid, "title": f"任务{iid}", "state": "opened", "notes": []})
             self.unified_decision("answer", issue=iid, reference="explicit", evidence=f"#{iid}", reply="还在测试。")
             self.b.handle(msg(f"om_query_{iid}", f"看看 #{iid} 的进度"))
+        before = len(self.w.writes)
         self.unified_decision("relay", issue=9, reference="recent", evidence="刚才那个")
         self.b.handle(msg("om_ambiguous", "刚才那个暂停测试"))
-        self.assertEqual(self.w.writes, [])
+        self.assertEqual(len(self.w.writes), before)
 
     def test_pending_thread_cannot_be_adopted_by_main_chat(self):
         self.unified_decision("clarify", reply="指哪张任务？")

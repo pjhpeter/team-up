@@ -446,7 +446,7 @@ class Bridge:
                 self.state["pending_images"].pop(chat, None)
         if msg.get("sender_type") != "user" or msg.get("sender_id") not in self.users:
             return
-        text = f"[#{t['iid']}]({self.issue_url(t['project'], t['iid'])}) 已经弄好了，不用重发。" if t else FAILED_TEXT
+        text = f"[#{t['iid']}]({self.issue_url(t['project'], t['iid'])}) 已收到这条消息，只是回执没发出去，不用重发。" if t else FAILED_TEXT
         if t and t.get("execution_pending"):
             text = (f"[#{t['iid']}]({self.issue_url(t['project'], t['iid'])}) 已建单，但开工指令未发送成功。"
                     "不要重发需求；请在这条消息下回复「开始修复」或「开工」。")
@@ -731,7 +731,7 @@ class Bridge:
                     issue = next(item for item in candidates if item["iid"] == iid)
                     self.remember_target(msg, issue)
                     url = self.issue_url(self.project, iid)
-                    self.secretary.state["issues"][url] = issue
+                    self.secretary.track(url, issue)
                     if reply_id:
                         self.secretary.state["msgs"][reply_id] = url
                         for old in list(self.secretary.state["msgs"])[:-SEEN_CAP]:
@@ -818,7 +818,8 @@ class Bridge:
                 note_id = self.note_as_user(self.project, iid, f"@{self.agent} {body}\n\n{marker}")
                 item.update(status="sent", note_id=note_id)
                 self.remember_target(source, issue)
-                self.secretary.state["issues"][self.issue_url(self.project, iid)] = {**issue, "project": self.project}
+                self.secretary.track(self.issue_url(self.project, iid), {**issue, "project": self.project},
+                                     last_note=note_id)
             except (BridgeError, ValueError):
                 if item["status"] == "sending":
                     item["status"] = "unknown"

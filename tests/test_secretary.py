@@ -95,6 +95,16 @@ class SecretaryTest(unittest.TestCase):
     def forwarded(self) -> list[dict]:
         return self.w.sent[1:]
 
+    def test_record_without_watermark_does_not_stop_forwarding(self) -> None:
+        # 外部登记只带身份时按第一次看到处理：不回放旧评论，也不能让整轮巡检崩掉。
+        self.state["secretary"]["issues"][URL7] = {"project": "frontend/web-v1", "iid": 7, "title": "x"}
+        self.sec.poll()
+        self.assertEqual(self.forwarded(), [])
+        self.assertEqual(self.state["secretary"]["issues"][URL7]["last_note"], 70)
+        self.w.agent_note(7, "新的进展")
+        self.sec.poll()
+        self.assertIn("新的进展", self.forwarded()[-1]["text"])
+
     def test_first_private_message_learns_chat_and_only_sets_watermark(self) -> None:
         self.assertEqual(self.state["secretary"]["chat_id"], "oc_1")
         self.assertEqual(len(self.w.sent), 1)  # 只有一段说明，旧评论不回放

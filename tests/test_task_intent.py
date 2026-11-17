@@ -9,6 +9,7 @@ import sys
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
     "task_intent_secretary", Path(__file__).resolve().parents[1] / "scripts/secretary.py")
@@ -50,7 +51,9 @@ class TaskIntentTest(unittest.TestCase):
         self.model = ModelProcess()
         bridge = SimpleNamespace(state={}, cfg={"secretary": {
             "model": "test/model", "thinking": "low", "timeout_s": 9}}, run=self.model)
-        self.sec = SEC.Secretary(bridge)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.sec = SEC.Secretary(bridge, home=Path(tmp.name))
 
     def test_structured_intent_uses_shared_model_process(self) -> None:
         cases = [
@@ -131,6 +134,69 @@ class TaskIntentTest(unittest.TestCase):
             with self.subTest(action=action):
                 self.model.respond({"action": action, "mode": "analyze", "reply": "", "issue": 27})
                 self.assertIsNone(self.sec.classify_intent("请处理 #27"))
+
+    def test_existing_task_request_is_rechecked_before_creating(self) -> None:
+        self.sec.bridge.project = "frontend/web-v1"
+        self.sec.bridge.issue_url = lambda project, iid: f"https://git.example.com/{project}/-/issues/{iid}"
+        self.sec.state["issues"] = {
+            f"https://git.example.com/frontend/web-v1/-/issues/{iid}": {"project": "frontend/web-v1", "iid": iid}
+            for iid in (484, 488)
+        }
+        for text, iid in (("让484先停止测试，测试环境在维护", 484),
+                          ("让#488继续验证", 488), ("告诉484先别合并", 484)):
+            with self.subTest(text=text):
+                initial = {"action": "task", "mode": "deliver", "reply": "", "issue": None}
+                checked = {"relation": "control", "issue": iid, "reply": ""}
+                responses = iter((initial, checked))
+
+                def run(cmd, **kwargs):
+                    self.model.respond(next(responses))
+                    return self.model(cmd, **kwargs)
+
+                with patch.object(self.sec.bridge, "run", side_effect=run):
+                    result = self.sec.classify_intent(text)
+                self.assertEqual(result, {"action": "bind", "mode": "analyze", "reply": "", "issue": iid})
+                material = json.loads(self.model.calls[-1][0][-1])
+                self.assertEqual(material["current_message"], text)
+
+    def test_task_number_recheck_distinguishes_question_and_quantity(self) -> None:
+        self.sec.bridge.project = "frontend/web-v1"
+        self.sec.bridge.issue_url = lambda project, iid: f"https://git.example.com/{project}/-/issues/{iid}"
+        self.sec.state["issues"] = {"https://git.example.com/frontend/web-v1/-/issues/484": {
+            "project": "frontend/web-v1", "iid": 484}}
+        cases = [
+            ("484进度怎么样？", {"relation": "question", "issue": 484, "reply": "正在测试。"}, "reply"),
+            ("请增加484个测试样本", {"relation": "new", "issue": None, "reply": ""}, "task"),
+            ("让484先停止测试", {"relation": "control", "issue": 999, "reply": ""}, None),
+            ("让484先停止测试", {"action": "task", "mode": "deliver", "reply": "", "issue": None}, None),
+        ]
+        for text, checked, action in cases:
+            with self.subTest(text=text, checked=checked):
+                responses = iter(({"action": "task", "mode": "analyze", "reply": "", "issue": None}, checked))
+
+                def run(cmd, **kwargs):
+                    self.model.respond(next(responses))
+                    return self.model(cmd, **kwargs)
+
+                with patch.object(self.sec.bridge, "run", side_effect=run):
+                    result = self.sec.classify_intent(text)
+                if action is None:
+                    self.assertIsNone(result)
+                else:
+                    self.assertEqual(result["action"], action)
+                    self.assertEqual(result["mode"], "analyze")
+
+    def test_linked_task_control_does_not_require_repeating_number(self) -> None:
+        initial = {"action": "task", "mode": "debug", "reply": "", "issue": None}
+        responses = iter((initial, {"relation": "control", "issue": 488, "reply": ""}))
+
+        def run(cmd, **kwargs):
+            self.model.respond(next(responses))
+            return self.model(cmd, **kwargs)
+
+        with patch.object(self.sec.bridge, "run", side_effect=run):
+            result = self.sec.classify_intent("先暂停测试，测试环境在维护", linked_issue=488)
+        self.assertEqual(result, {"action": "bind", "mode": "analyze", "reply": "", "issue": 488})
 
     def test_relay_execution_mode_keeps_original_text_quote_and_attachment(self) -> None:
         for action, mode, text in (("task", "deliver", "请实现这个功能"),

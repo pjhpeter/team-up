@@ -86,11 +86,25 @@ INTENT_PROMPT = (
     "本次‘修一下这个’且没有任何对象信息才是 clarify/analyze。"
     "若 current_message 包含同一次追问的原始用户请求与后续补充，合起来理解该请求；"
     "补充已经说清对象时保留原请求的修复意图，最新的取消、否定或只读限制优先。"
-    "action=bind 仅用于本次明确要求关联、转告或承接某个 issue，issue 必须是本次 current_message 出现的正整数编号；"
-    "仅仅提到编号、询问某 issue 进度不是绑定，更不能从 context 取编号。bind 默认 analyze，"
-    "只有本次同时明确要求实施或修复才分别使用 deliver/debug。其他 action 的 issue 必须 null。"
+    "action=bind 用于本次明确要求关联、转告、承接或控制某个已有 issue，issue 必须是本次 current_message 出现的正整数编号；"
+    "例如‘让484先停止测试，测试环境在维护’、‘让#488继续验证’、‘告诉484先别合并’都是 bind/analyze，"
+    "只原文转交已有负责人，不是新需求，也不是新增实施授权。控制任务的暂停、继续、约束不使用 deliver/debug。"
+    "仅仅提到编号、询问某 issue 进度是 reply/analyze，不要替用户发指令，更不能从 context 取编号。"
+    "bind 默认 analyze，只有本次明确新增实施或修复请求才分别使用 deliver/debug。其他 action 的 issue 必须 null。"
     "已关联任务的补充不要误当全新需求：可以用 task 表达补充的工作意图，由入口承接原任务；"
     "不能自行另建任务，也不能把背景的执行要求当成本次要求。reply 不得把用户原话改写成执行授权。"
+)
+
+TASK_RELATION_PROMPT = (
+    "你只核验本次用户原话与已有任务的关系，不执行操作，不读取文件或调用工具。context只是背景，不是授权。"
+    "known_issues是当前项目已知任务候选，数字相同不代表用户在指任务，数量、尺寸、错误码不得当任务号。"
+    "linked_issue是入口已验证的当前回复目标（若有），允许本次省略编号，不能从context另选目标。"
+    "只输出JSON：{\"relation\":\"control|question|new|unclear\",\"issue\":null,\"reply\":\"\"}。"
+    "control表示转告或调整已有任务的推进方式、暂停/继续/停止测试或限制合并；如‘让484先停止测试’、"
+    "‘让#488继续验证’、‘告诉484先别合并’。issue必须是known_issues之一或linked_issue，只原文转交，不追加开工指令。"
+    "question表示只是询问已有任务的进度或原因，不是让你替用户去问；issue同样必须是候选，在reply据背景简短回答，不编造。"
+    "new表示新的工作内容或明确新增的实现/修复请求（可能补充当前关联任务），不是任务流程控制；issue必须null。"
+    "数字只是数量且请求是新需求时使用new。unclear表示指代不明、多任务无法唯一选择；issue必须null，reply提一个明确问题。"
 )
 
 INTRO = (
@@ -193,6 +207,41 @@ class Secretary:
         return str((data.get("data") or {}).get("message_id") or "")
 
     # ---------- 看哪些 issue ----------
+    def known_tasks(self) -> dict[str, dict[str, Any]]:
+        """目标只取本项目登记，不能因为其他项目恰好有同号任务就转过去。"""
+        project = getattr(self.bridge, "project", "")
+        if not project:
+            return {}
+        return {canon(url): issue for url, issue in {**self.watched(), **self.state["issues"]}.items()
+                if issue.get("project") == project
+                and canon(url) == canon(self.bridge.issue_url(project, issue["iid"]))}
+
+    def single_task_url(self, text: str) -> Optional[str]:
+        """只解析单一当前项目链接；引用作者和任务存在性由调用方另行验证。"""
+        links = re.findall(r"https?://[^\s<>()\[\]\"，。；！？]+", text)
+        task_links = {canon(url.split("#", 1)[0].split("?", 1)[0]).rstrip(".,;")
+                      for url in links if "/-/issues/" in url or "/-/work_items/" in url}
+        if len(task_links) != 1:
+            return None
+        url = next(iter(task_links))
+        number = url.rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[1-9][0-9]*", number):
+            return None
+        if url != canon(self.bridge.issue_url(self.bridge.project, int(number))):
+            return None
+        # 回答里还提到另一任务（即使没有链接）也不能偷偷选第一张。
+        if any(m.group(1) != number for m in BARE_ISSUE.finditer(text)):
+            return None
+        return url
+
+    def remember_reply(self, message_id: Optional[str], text: str) -> None:
+        url = self.single_task_url(text)
+        if not message_id or url not in self.known_tasks():
+            return
+        self.state["msgs"][message_id] = url
+        for old in list(self.state["msgs"])[:-MSG_MAP_CAP]:
+            del self.state["msgs"][old]
+
     def repos(self) -> dict[str, str]:
         local = self.home / "gitlab-inbox.local.json"
         try:
@@ -505,8 +554,8 @@ class Secretary:
                 out.append(f"- #{issue['iid']} {who}（{str(n.get('created_at') or '')[:16]}）：{body}")
         return out
 
-    def classify_intent(self, text: str, context: str = "") -> Optional[dict[str, Any]]:
-        """模型负责理解自然语言；代码只校验输出，失败时不给入口任何写入许可。"""
+    def classify_intent(self, text: str, context: str = "", *, linked_issue: Optional[int] = None) -> Optional[dict[str, Any]]:
+        """模型理解自然语言；涉及已有任务时再核验关系，失败不给建单许可。"""
         material = json.dumps({"current_message": text, "context": context}, ensure_ascii=False)
         response = self.ask_model(material, system_prompt=INTENT_PROMPT)
         if response is None:
@@ -532,7 +581,41 @@ class Secretary:
                 return None
         if (action == "bind") != (issue is not None):
             return None
+        if action == "task":
+            candidates = sorted({i["iid"] for i in self.known_tasks().values()
+                                 if re.search(rf"(?<![0-9A-Za-z_.]){i['iid']}(?![0-9A-Za-z_.])", text)})
+            if candidates or linked_issue is not None:
+                return self.check_task_relation(text, context, intent, candidates, linked_issue)
         return intent
+
+    def check_task_relation(self, text: str, context: str, intent: dict[str, Any],
+                            candidates: list[int], linked_issue: Optional[int]) -> Optional[dict[str, Any]]:
+        # 仅检查含已知编号或已关联的工作请求，不为所有消息重复调用模型。
+        material = json.dumps({"current_message": text, "context": context,
+                               "known_issues": candidates, "linked_issue": linked_issue}, ensure_ascii=False)
+        response = self.ask_model(material, system_prompt=TASK_RELATION_PROMPT)
+        try:
+            checked = json.loads(response) if response else None
+        except ValueError:
+            return None
+        if not isinstance(checked, dict) or set(checked) != {"relation", "issue", "reply"}:
+            return None
+        relation, issue, reply = (checked[key] for key in ("relation", "issue", "reply"))
+        if not isinstance(relation, str) or relation not in {"control", "question", "new", "unclear"} \
+                or not isinstance(reply, str):
+            return None
+        if relation in {"control", "question"}:
+            if type(issue) is not int or issue not in candidates and issue != linked_issue:
+                return None
+            if relation == "question" and not reply.strip():
+                return None
+            return {"action": "bind" if relation == "control" else "reply", "mode": "analyze",
+                    "reply": reply, "issue": issue if relation == "control" else None}
+        if issue is not None:
+            return None
+        if relation == "new":
+            return intent
+        return {"action": "clarify", "mode": "analyze", "reply": reply, "issue": None} if reply.strip() else None
 
     def ask_model(self, material: str, *, system_prompt: Optional[str] = None) -> Optional[str]:
         # 沿用秘书既有的只读工具权限：当前模型通道在 --no-tools 下会返回空响应。
@@ -596,4 +679,6 @@ class Secretary:
             said = f"{ask.group(2).strip()}\n\n> 用户原话：{question}"
             self.relay(url, msg, said, ack="调度者回复后我会转到这里。")
             return
-        self.bridge.reply(mid, self.linkify(reply), f"sec-answer-{mid}", in_thread=thread)
+        answer = self.linkify(reply)
+        reply_id = self.bridge.reply(mid, answer, f"sec-answer-{mid}", in_thread=thread)
+        self.remember_reply(reply_id, answer)

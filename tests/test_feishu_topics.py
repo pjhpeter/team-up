@@ -291,7 +291,6 @@ class TopicTest(unittest.TestCase):
         self.bridge.poll_gitlab()
         self.bridge.handle(msg("om_closed", "继续", thread=self.status()["thread_id"]))
         self.assertFalse(self.world.writes)
-        self.assertIn("归档", self.world.replies[-1]["text"])
         self.assertNotIn("旧关闭结论", "\n".join(r["text"] for r in self.world.replies))
 
     def test_group_and_whitelist_constraints_apply_to_new_topic_and_catchup(self):

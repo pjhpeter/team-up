@@ -53,6 +53,10 @@ class World(TFB.World):
             return subprocess.CompletedProcess(cmd, 0, self.omp_out, "")
         return super().__call__(cmd, input, env, cwd, **kw)
 
+    def respond(self, decision: dict) -> None:
+        self.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
+            {"type": "text", "text": json.dumps(decision, ensure_ascii=False)}]}})
+
     def agent_note(self, iid: int, body: str, at: str = "") -> None:
         self.gitlab_comment(iid, body)
         self.issues[iid]["notes"][-1]["author"]["username"] = "pjhagent"
@@ -118,6 +122,8 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(len(self.w.replies), replies)
         self.assertIn("Windows 测试包已准备好", self.w.sent[-1]["text"])
         forwarded = next(reversed(self.sec.state["msgs"]))
+        self.w.respond({"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
+                        "reference": "linked", "evidence": "测试通过"})
         self.b.handle(msg("om_answer", "测试通过", reply_to=forwarded))
         self.assertIn("@pjhagent 测试通过", self.w.issues[7]["notes"][-1]["body"])
 
@@ -204,6 +210,8 @@ class SecretaryTest(unittest.TestCase):
         self.w.agent_note(7, "方案要你确认：1. 选 A 2. 选 B")
         self.sec.poll()
         forwarded = list(self.state["secretary"]["msgs"])[0]
+        self.w.respond({"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
+                        "reference": "linked", "evidence": "1"})
         self.b.handle(msg("om_u1", "1", reply_to=forwarded))
         method, path, fields, as_user = self.w.writes[-1]
         self.assertEqual((method, path, as_user), ("POST", "projects/frontend/web-v1/issues/7/notes", True))
@@ -218,6 +226,8 @@ class SecretaryTest(unittest.TestCase):
         forwarded = list(self.state["secretary"]["msgs"])[0]
         notes = sum(1 for w in self.w.writes if w[1].endswith("/issues/7/notes"))
         self.w.reply_failures = 1  # 评论已写进 issue，只是「已转给」这条回执没发出去
+        self.w.respond({"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
+                        "reference": "linked", "evidence": "好的"})
         self.b.handle(msg("om_u1", "好的", root=forwarded, reply_to=forwarded))  # 引用回复带 root_id，但不在话题里
         self.assertEqual(sum(1 for w in self.w.writes if w[1].endswith("/issues/7/notes")), notes + 1)
         self.assertIn("#7", self.w.replies[-1]["text"])
@@ -229,6 +239,8 @@ class SecretaryTest(unittest.TestCase):
         self.w.agent_note(7, "要你看一下")
         self.sec.poll()
         forwarded = list(self.state["secretary"]["msgs"])[0]
+        self.w.respond({"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
+                        "reference": "linked", "evidence": "看过了"})
         self.b.handle(msg("om_u4", "看过了", root=forwarded, thread="omt_x"))
         self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
         self.assertIn("看过了", self.w.writes[-1][2]["body"])
@@ -394,14 +406,18 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("调度者已退出", text)
         self.assertIn("超过 3 小时没有动静", text)
 
-    def test_status_word_replies_overview(self) -> None:
+    def test_natural_status_question_uses_unified_decision(self) -> None:
+        self.w.respond({"action": "answer", "mode": "analyze", "reply": "#7 正在开发。", "issue": None,
+                        "reference": "none", "evidence": ""})
         self.b.handle(msg("om_q1", "进度"))
-        self.assertIn("**总览**", self.w.replies[-1]["text"])
         self.assertIn("#7", self.w.replies[-1]["text"])
         self.assertFalse(self.w.replies[-1]["in_thread"])
+        self.assertEqual(len(self.w.omp_cmds), 1)
+        self.assertEqual(self.w.writes, [])
 
     def test_question_uses_classified_reply_and_reports_unavailable_model(self) -> None:
-        decision = {"action": "reply", "mode": "analyze", "reply": "#7 在开发", "issue": None}
+        decision = {"action": "answer", "mode": "analyze", "reply": "#7 在开发", "issue": None,
+                    "reference": "none", "evidence": ""}
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
             {"type": "text", "text": json.dumps(decision)}]}})
         self.b.handle(msg("om_q2", "现在哪个最急？"))
@@ -413,7 +429,8 @@ class SecretaryTest(unittest.TestCase):
 
     def test_model_answer_links_known_issue_numbers(self) -> None:
         answer = "**#7 旧单**：开发中；[#7](x) 已有链接不重复；#70 不认识；见 note#7a"
-        decision = {"action": "reply", "mode": "analyze", "reply": answer, "issue": None}
+        decision = {"action": "answer", "mode": "analyze", "reply": answer, "issue": None,
+                    "reference": "none", "evidence": ""}
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
             {"type": "text", "text": json.dumps(decision)}]}})
         self.b.handle(msg("om_q4", "现在有哪些需求？"))
@@ -430,12 +447,18 @@ class SecretaryTest(unittest.TestCase):
         self.w.agent_note(7, "方案要你在 A、B 里选一个，选好前先停着")
         self.b.handle(msg("om_q6", "7 为什么还在等我？"))
         material = self.w.omp_cmds[-1][-1]
-        self.assertIn("## 各需求最近的评论", material)
         self.assertIn("#7 Agent", material)
         self.assertIn("A、B 里选一个", material)
 
+    def test_recent_comments_respect_explicit_candidate_scope(self) -> None:
+        self.w.agent_note(7, "只属于任务七的评论")
+        self.assertEqual(self.sec.recent_notes(candidates=[]), [])
+        notes = self.sec.recent_notes(candidates=[{"project": "frontend/web-v1", "iid": 7}])
+        self.assertTrue(any("只属于任务七的评论" in note for note in notes))
+
     def test_natural_scheduler_request_binds_without_replacing_user_text(self) -> None:
-        decision = {"action": "bind", "mode": "analyze", "reply": "", "issue": 7}
+        decision = {"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
+                    "reference": "explicit", "evidence": "7"}
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
             {"type": "text", "text": json.dumps(decision)}]}})
         text = "你帮我问7的调度，为什么状态还是等我处理？"
@@ -443,32 +466,25 @@ class SecretaryTest(unittest.TestCase):
         method, path, fields, as_user = self.w.writes[-1]
         self.assertEqual((method, path, as_user), ("POST", "projects/frontend/web-v1/issues/7/notes", True))
         self.assertTrue(fields["body"].startswith("@pjhagent " + text))
-        self.assertIn("已关联", self.w.replies[-1]["text"])
+        self.assertIn("#7", self.w.replies[-1]["text"])
         self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
 
-    def test_task_misclassification_routes_control_without_new_issue_or_go(self) -> None:
+    def test_task_control_uses_one_decision_without_new_issue_or_go(self) -> None:
         for index, text in enumerate(("让7先停止测试，测试环境在维护", "让#7继续验证", "告诉7先别合并")):
             with self.subTest(text=text):
-                decisions = iter((
-                    {"action": "task", "mode": "deliver", "reply": "", "issue": None},
-                    {"relation": "control", "issue": 7, "reply": ""},
-                ))
-
-                def run(cmd, **kwargs):
-                    if cmd[0] == "omp":
-                        return ok({"type": "turn_end", "message": {"content": [
-                            {"type": "text", "text": json.dumps(next(decisions))}]}})
-                    return self.w(cmd, **kwargs)
-
-                with unittest.mock.patch.object(self.b, "run", side_effect=run):
-                    self.b.handle(msg(f"om_control_{index}", text))
+                self.w.respond({"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
+                                "reference": "explicit", "evidence": "7"})
+                before = len(self.w.omp_cmds)
+                self.b.handle(msg(f"om_control_{index}", text))
+                self.assertEqual(len(self.w.omp_cmds) - before, 1)
                 self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
                 self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
                 self.assertIn(text, self.w.writes[-1][2]["body"])
                 self.assertNotIn("/go", self.w.writes[-1][2]["body"])
 
     def test_progress_question_does_not_send_an_instruction(self) -> None:
-        decision = {"action": "reply", "mode": "analyze", "reply": "#7 正在测试。", "issue": None}
+        decision = {"action": "answer", "mode": "analyze", "reply": "#7 正在测试。", "issue": 7,
+                    "reference": "explicit", "evidence": "7"}
         self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
             {"type": "text", "text": json.dumps(decision)}]}})
         self.b.handle(msg("om_progress_only", "7进度怎么样？"))
@@ -476,29 +492,21 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("正在测试", self.w.replies[-1]["text"])
 
     def test_ordinary_quantity_does_not_bind_existing_task(self) -> None:
-        decisions = iter((
-            {"action": "task", "mode": "analyze", "reply": "", "issue": None},
-            {"relation": "new", "issue": None, "reply": ""},
-        ))
-
-        def run(cmd, **kwargs):
-            if cmd[0] == "omp":
-                return ok({"type": "turn_end", "message": {"content": [
-                    {"type": "text", "text": json.dumps(next(decisions))}]}})
-            return self.w(cmd, **kwargs)
-
-        with unittest.mock.patch.object(self.b, "run", side_effect=run):
-            self.b.handle(msg("om_quantity", "请增加7个测试样本"))
+        self.w.respond({"action": "create", "mode": "analyze", "reply": "", "issue": None,
+                        "reference": "new", "evidence": "7个测试样本"})
+        self.b.handle(msg("om_quantity", "请增加7个测试样本"))
+        self.assertEqual(len(self.w.omp_cmds), 1)
         self.assertEqual(len([w for w in self.w.writes if w[1].endswith("/issues")]), 1)
         self.assertFalse(any(w[1].endswith("/issues/7/notes") for w in self.w.writes))
 
     def test_answer_reply_is_registered_and_followup_reaches_existing_issue(self) -> None:
-        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
-            {"type": "text", "text": "#7 正在测试。"}]}})
-        self.sec.answer(msg("om_question", "7进度怎么样？"), "7进度怎么样？")
+        self.w.respond({"action": "answer", "mode": "analyze", "reply": "#7 正在测试。", "issue": 7,
+                        "reference": "explicit", "evidence": "7"})
+        self.b.handle(msg("om_question", "7进度怎么样？"))
         answer_id = f"om_r{len(self.w.replies)}"
         self.assertEqual(self.sec.state["msgs"].get(answer_id), URL7)
-        self.w.omp_out = ""
+        self.w.respond({"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
+                        "reference": "linked", "evidence": "先暂停测试"})
         text = "先暂停测试，测试环境在维护"
         self.b.handle(msg("om_pause", text, reply_to=answer_id))
         self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
@@ -510,14 +518,11 @@ class SecretaryTest(unittest.TestCase):
         self.sec.state["issues"][URL7[:-1] + "8"] = {"project": "frontend/web-v1", "iid": 8}
         answers = ("#7 与 #8 都在测试。", f"{URL7} 和 https://git.example.com/other/project/-/issues/7",
                    "https://git.example.com/frontend/web-v1/-/issues/99", "没有任务链接。")
-        with unittest.mock.patch.object(self.sec, "overview", return_value=[]), \
-                unittest.mock.patch.object(self.sec, "recent_notes", return_value=[]):
-            for index, answer in enumerate(answers):
-                with self.subTest(answer=answer):
-                    self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
-                        {"type": "text", "text": answer}]}})
-                    self.sec.answer(msg(f"om_ambiguous_{index}", "进度？"), "进度？")
-                    self.assertNotIn(f"om_r{len(self.w.replies)}", self.sec.state["msgs"])
+        for index, answer in enumerate(answers):
+            with self.subTest(answer=answer):
+                mid = f"om_ambiguous_{index}"
+                self.sec.remember_reply(mid, self.sec.linkify(answer))
+                self.assertNotIn(mid, self.sec.state["msgs"])
 
     def test_closed_origin_drops_out_of_watch(self) -> None:
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}}))

@@ -784,6 +784,32 @@ class BridgeTest(unittest.TestCase):
         bot = FB.normalize_history({"message_id": "om_8", "sender": {"id": "cli_x", "id_type": "app_id"}})
         self.assertEqual(bot["sender_type"], "bot")
 
+    def test_explicit_commands_do_not_call_natural_classifier(self):
+        def forbidden(*args, **kwargs):
+            self.fail("显式指令不能交给模型改写")
+
+        self.b.secretary.classify_intent = forbidden
+        self.b.handle(msg("om_bind", "#7"))
+        self.b.handle(msg("om_go", "/go debug", root="om_bind"))
+        self.assertEqual(self.w.issues[7]["notes"][-1]["body"], "@pjhagent /go debug")
+
+    def test_background_broadcast_does_not_change_recent_user_focus(self):
+        self.b.handle(msg("om_bind", "#7"))
+        before = json.loads(json.dumps(self.state["recent_targets"]))
+        self.b.handle(msg("om_broadcast", "#8 任务完成", sender=BOT, sender_type="bot"))
+        self.assertEqual(self.state["recent_targets"], before)
+        recent = self.b.recent_targets(msg("om_next", "刚才那个"))
+        self.assertEqual([(i["iid"], i["title"]) for i in recent], [(7, "旧单")])
+        self.b.now = lambda: 1_001_801.0
+        self.assertEqual(self.b.recent_targets(msg("om_later", "刚才那个")), [])
+
+    def test_linked_closed_task_never_reopens_on_model_failure(self):
+        self.b.handle(msg("om_bind", "#7"))
+        self.w.issues[7]["state"] = "closed"
+        self.b.handle(msg("om_resume", "继续修复", root="om_bind"))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("已关闭", self.w.replies[-1]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()

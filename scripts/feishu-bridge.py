@@ -714,6 +714,10 @@ class Bridge:
             item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue, status="partial")
             self.deliver_relay_plan(key, source, actions, item)
             return
+        if (intent["action"] == "answer" and target and intent["issue"] in (None, linked_issue)
+                and self.secretary.replies_to_agent(msg)):
+            # 引用调度者转来的发言是在和调度者对话：秘书只转交，不抢答。
+            intent = {**intent, "action": "relay", "issue": linked_issue, "mode": "analyze"}
         action, mode, iid = intent["action"], intent["mode"], intent["issue"]
         if action in ("answer", "clarify"):
             if action == "clarify":

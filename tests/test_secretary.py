@@ -120,6 +120,30 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(self.state["secretary"]["chat_id"], "oc_1")
         self.assertIn("尚未新建或启动", self.w.replies[-1]["text"])
 
+    def test_reply_to_forwarded_agent_question_goes_to_scheduler(self) -> None:
+        # 引用调度者的转发发言提问，是在和调度者说话；秘书不能抢答。
+        self.w.agent_note(7, "尚未交付，后端回退演练还缺一个确认")
+        self.sec.poll()
+        forwarded = next(reversed(self.sec.state["msgs"]))
+        replies = len(self.w.replies)
+        self.w.respond({"action": "answer", "mode": "analyze", "reply": "回滚需要锁定版本。", "issue": 7,
+                        "reference": "linked", "evidence": "为什么搞那么复杂"})
+        self.b.handle(msg("om_why", "回滚不就是代码回滚重新部署吗？为什么搞那么复杂？", reply_to=forwarded))
+        self.assertIn("为什么搞那么复杂", self.w.issues[7]["notes"][-1]["body"])
+        self.assertTrue(all("回滚需要锁定版本" not in r["text"] for r in self.w.replies[replies:]))
+        self.assertIn("已转给", self.w.replies[-1]["text"])
+
+    def test_reply_to_secretary_answer_can_still_be_answered(self) -> None:
+        self.w.respond({"action": "answer", "mode": "analyze", "reply": "#7 正在测试。", "issue": 7,
+                        "reference": "explicit", "evidence": "7"})
+        self.b.handle(msg("om_q1", "7进度怎么样？"))
+        answer_id = f"om_r{len(self.w.replies)}"
+        self.w.respond({"action": "answer", "mode": "analyze", "reply": "预计今天测完。", "issue": 7,
+                        "reference": "linked", "evidence": "什么时候测完"})
+        self.b.handle(msg("om_q2", "什么时候测完？", reply_to=answer_id))
+        self.assertEqual(self.w.writes, [])
+        self.assertIn("预计今天测完", self.w.replies[-1]["text"])
+
     def test_private_thread_and_secretary_send_each_note_once(self) -> None:
         self.b.handle(msg("om_bind", "#7"))
         self.b.handle(msg("om_bind_again", "#7"))

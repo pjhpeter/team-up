@@ -89,6 +89,18 @@ class SessionFileTest(SessionCase):
             self.assertIsNone(SETTLE.session_file({"agent": "other", "kind": "id", "value": "abc"}))
 
 
+    def test_droid_id_and_record_format(self) -> None:
+        reply = {"type": "message", "id": "d2", "message": {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "想"}, {"type": "text", "text": "## 结论"}]}}
+        tool = {"type": "message", "id": "d3", "message": {"role": "assistant", "content": [{"type": "tool_use"}]}}
+        path = self.write("home/.factory/sessions/-Users-x-repo/abc.jsonl", reply, tool,
+                          {"type": "agent_turn_outcome", "reason": "completed"})
+        with patch.dict(os.environ, {"HOME": str(self.dir / "home")}):
+            found = SETTLE.session_file({"agent": "droid", "kind": "id", "value": "abc"})
+        self.assertEqual(found, str(path))
+        self.assertEqual(SETTLE.last_reply(found), "## 结论")
+
+
 class OnScreenTest(unittest.TestCase):
     def test_matches_hard_wrapped_screen_without_markup(self) -> None:
         reply = "## 结论\n\n**不一定要改**，取决于 `html` 入口指什么，以及 Agent 怎么转换。\n\n完成"

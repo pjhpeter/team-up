@@ -23,7 +23,8 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `protocol/` | 七个主题：调度、沟通、规划、实现、评审测试、交付、工作树；进入对应阶段时再读 |
 | `workflows/team-up.yaml` | Herdr 启动团队的入口 |
 | `herdr/config.yaml` | 各角色用什么工具、什么模型（install.sh 把 Herdr 插件配置链接到这里） |
-| `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩） |
+| `herdr/droid-arch.json` | 架构师（droid）的模型与思考档；交互式 droid 只能用 `--settings` 文件指定 |
+| `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
 | `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |

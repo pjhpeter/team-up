@@ -67,6 +67,8 @@ def session_file(session: dict) -> str | None:
     elif agent == "codex":
         root = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
         pattern = os.path.join(root, "sessions", "**", f"rollout-*-{glob.escape(value)}.jsonl")
+    elif agent == "droid":
+        pattern = os.path.join(os.path.expanduser("~/.factory"), "sessions", "*", f"{glob.escape(value)}.jsonl")
     else:
         return None
     matches = glob.glob(pattern, recursive=True)
@@ -74,13 +76,13 @@ def session_file(session: dict) -> str | None:
 
 
 def record_text(record: dict) -> tuple[str, str] | None:
-    """一行会话记录若是成员的正文回复，返回 (消息标识, 文字)；否则返回 None。兼容 claude/omp/codex。"""
+    """一行会话记录若是成员的正文回复，返回 (消息标识, 文字)；否则返回 None。兼容 claude/omp/codex/droid。"""
     if record.get("isSidechain"):  # Claude 子代理的回复，不是成员自己的
         return None
     if record.get("type") == "response_item":  # codex
         message = record.get("payload") or {}
         kinds = {"output_text"}
-    else:  # claude: type=assistant；omp: type=message
+    else:  # claude: type=assistant；omp、droid: type=message
         message = record.get("message") or {}
         kinds = {"text"}
     if not isinstance(message, dict) or message.get("role") != "assistant":

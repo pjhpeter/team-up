@@ -218,6 +218,18 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(len(self.model.calls), 1)
         self.assertIsNone(self.sec.classify_intent("先暂停测试", candidates=[{"iid": 488, "title": "导出"}]))
 
+    def test_linked_target_relays_vague_content_to_scheduler(self) -> None:
+        text = "如果 website-mobile 的流水线跑通了，就帮忙把其他的 scp 命令也改了"
+        expected = {"action": "relay", "issue": 488, "mode": "analyze", "reply": "",
+                    "reference": "linked", "evidence": text}
+        self.model.respond(expected)
+        self.assertEqual(self.sec.classify_intent(text, candidates=[{"iid": 488, "title": "修复这个小 bug"}],
+                                                  linked_issue=488), expected)
+        prompt = self.model.calls[-1][0][self.model.calls[-1][0].index("--system-prompt") + 1]
+        # 内容细节归调度者判断；秘书只在目标或授权不清时追问。
+        self.assertIn("指令内容含糊", prompt)
+        self.assertIn("不得自行判断是否属于该任务", prompt)
+
     def test_ambiguous_recent_can_only_ask_without_action(self) -> None:
         expected = {"action": "clarify", "mode": "analyze", "reply": "请确认先处理哪一个任务？", "issue": None,
                     "reference": "none", "evidence": ""}

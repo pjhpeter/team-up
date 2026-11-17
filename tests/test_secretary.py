@@ -133,16 +133,25 @@ class SecretaryTest(unittest.TestCase):
         self.assertTrue(all("回滚需要锁定版本" not in r["text"] for r in self.w.replies[replies:]))
         self.assertIn("已转给", self.w.replies[-1]["text"])
 
-    def test_reply_to_secretary_answer_can_still_be_answered(self) -> None:
+    def test_task_question_relays_even_if_model_answers(self) -> None:
+        # 已确定任务的提问交给调度者回答；秘书不凭材料代答。
         self.w.respond({"action": "answer", "mode": "analyze", "reply": "#7 正在测试。", "issue": 7,
                         "reference": "explicit", "evidence": "7"})
         self.b.handle(msg("om_q1", "7进度怎么样？"))
-        answer_id = f"om_r{len(self.w.replies)}"
-        self.w.respond({"action": "answer", "mode": "analyze", "reply": "预计今天测完。", "issue": 7,
-                        "reference": "linked", "evidence": "什么时候测完"})
-        self.b.handle(msg("om_q2", "什么时候测完？", reply_to=answer_id))
-        self.assertEqual(self.w.writes, [])
-        self.assertIn("预计今天测完", self.w.replies[-1]["text"])
+        self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
+        self.assertIn("7进度怎么样？", self.w.writes[-1][2]["body"])
+        self.assertNotIn("/go", self.w.writes[-1][2]["body"])
+        self.assertTrue(all("正在测试" not in r["text"] for r in self.w.replies))
+        self.assertIn("已转给", self.w.replies[-1]["text"])
+
+    def test_reply_to_any_task_message_relays_model_answer(self) -> None:
+        self.sec.state["msgs"]["om_old_forward"] = URL7
+        self.w.respond({"action": "answer", "mode": "analyze", "reply": "尚未确认。", "issue": None,
+                        "reference": "none", "evidence": ""})
+        self.b.handle(msg("om_now", "现在什么情况？", reply_to="om_old_forward"))
+        self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
+        self.assertIn("现在什么情况？", self.w.writes[-1][2]["body"])
+        self.assertTrue(all("尚未确认" not in r["text"] for r in self.w.replies))
 
     def test_private_thread_and_secretary_send_each_note_once(self) -> None:
         self.b.handle(msg("om_bind", "#7"))
@@ -516,15 +525,6 @@ class SecretaryTest(unittest.TestCase):
                 self.assertIn(text, self.w.writes[-1][2]["body"])
                 self.assertNotIn("/go", self.w.writes[-1][2]["body"])
 
-    def test_progress_question_does_not_send_an_instruction(self) -> None:
-        decision = {"action": "answer", "mode": "analyze", "reply": "#7 正在测试。", "issue": 7,
-                    "reference": "explicit", "evidence": "7"}
-        self.w.omp_out = json.dumps({"type": "turn_end", "message": {"content": [
-            {"type": "text", "text": json.dumps(decision)}]}})
-        self.b.handle(msg("om_progress_only", "7进度怎么样？"))
-        self.assertEqual(self.w.writes, [])
-        self.assertIn("正在测试", self.w.replies[-1]["text"])
-
     def test_ordinary_quantity_does_not_bind_existing_task(self) -> None:
         self.w.respond({"action": "create", "mode": "analyze", "reply": "", "issue": None,
                         "reference": "new", "evidence": "7个测试样本"})
@@ -532,21 +532,6 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(len(self.w.omp_cmds), 1)
         self.assertEqual(len([w for w in self.w.writes if w[1].endswith("/issues")]), 1)
         self.assertFalse(any(w[1].endswith("/issues/7/notes") for w in self.w.writes))
-
-    def test_answer_reply_is_registered_and_followup_reaches_existing_issue(self) -> None:
-        self.w.respond({"action": "answer", "mode": "analyze", "reply": "#7 正在测试。", "issue": 7,
-                        "reference": "explicit", "evidence": "7"})
-        self.b.handle(msg("om_question", "7进度怎么样？"))
-        answer_id = f"om_r{len(self.w.replies)}"
-        self.assertEqual(self.sec.state["msgs"].get(answer_id), URL7)
-        self.w.respond({"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
-                        "reference": "linked", "evidence": "先暂停测试"})
-        text = "先暂停测试，测试环境在维护"
-        self.b.handle(msg("om_pause", text, reply_to=answer_id))
-        self.assertFalse(any(w[1].endswith("/issues") for w in self.w.writes))
-        self.assertEqual(self.w.writes[-1][1], "projects/frontend/web-v1/issues/7/notes")
-        self.assertIn(text, self.w.writes[-1][2]["body"])
-        self.assertNotIn("/go", self.w.writes[-1][2]["body"])
 
     def test_answer_mapping_rejects_unknown_foreign_and_ambiguous_targets(self) -> None:
         self.sec.state["issues"][URL7[:-1] + "8"] = {"project": "frontend/web-v1", "iid": 8}

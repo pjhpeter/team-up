@@ -714,10 +714,9 @@ class Bridge:
             item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue, status="partial")
             self.deliver_relay_plan(key, source, actions, item)
             return
-        if (intent["action"] == "answer" and target and intent["issue"] in (None, linked_issue)
-                and self.secretary.replies_to_agent(msg)):
-            # 引用调度者转来的发言是在和调度者对话：秘书只转交，不抢答。
-            intent = {**intent, "action": "relay", "issue": linked_issue, "mode": "analyze"}
+        if intent["action"] == "answer" and (intent["issue"] or linked_issue):
+            # 已确定任务的提问由该任务调度者回答：秘书只原文转交，不凭材料代答。
+            intent = {**intent, "action": "relay", "issue": intent["issue"] or linked_issue, "mode": "analyze"}
         action, mode, iid = intent["action"], intent["mode"], intent["issue"]
         if action in ("answer", "clarify"):
             if action == "clarify":
@@ -731,15 +730,6 @@ class Bridge:
                     item["reply_ids"].append(reply_id)
             else:
                 pending.pop(key, None)
-                if iid is not None:
-                    issue = next(item for item in candidates if item["iid"] == iid)
-                    self.remember_target(msg, issue)
-                    url = self.issue_url(self.project, iid)
-                    self.secretary.track(url, issue)
-                    if reply_id:
-                        self.secretary.state["msgs"][reply_id] = url
-                        for old in list(self.secretary.state["msgs"])[:-SEEN_CAP]:
-                            del self.secretary.state["msgs"][old]
             return
         try:
             if action == "relay":

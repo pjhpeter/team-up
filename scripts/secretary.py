@@ -101,7 +101,6 @@ class Secretary:
         self.state: dict[str, Any] = bridge.state.setdefault("secretary", {})
         self.state.setdefault("issues", {})   # issue URL → {project, iid, repo, title, last_note, last_agent_at}
         self.state.setdefault("msgs", {})     # 私聊里的转达消息 id → issue URL（快速回复用）
-        self.state.setdefault("agent_msgs", [])  # 其中由 Agent 发言转来的消息 id；回复它们是在和调度者说话
         self.state.setdefault("held", {})     # issue URL → 飞书没发出去、下一轮重发的 Agent 发言
         self.state.setdefault("recent", [])   # 最近转达的摘要，回答提问时当材料
         self.merge_link_forms()
@@ -145,10 +144,6 @@ class Secretary:
             if key and key in msgs:
                 return canon(msgs[key])
         return None
-
-    def replies_to_agent(self, msg: Mapping[str, Any]) -> bool:
-        agent_msgs = self.state["agent_msgs"]
-        return any(key and key in agent_msgs for key in (msg.get("reply_to"), msg.get("root_id")))
 
     def is_relay(self, msg: Mapping[str, Any]) -> bool:
         return msg.get("chat_id") == self.chat and self.target(msg) is not None
@@ -325,7 +320,6 @@ class Secretary:
             msgs[mid] = url
             for old in list(msgs)[:-MSG_MAP_CAP]:
                 del msgs[old]
-            self.state["agent_msgs"] = (self.state["agent_msgs"] + [mid])[-MSG_MAP_CAP:]
 
     # ---------- 巡检 ----------
     def patrol(self, force: bool = False) -> Optional[str]:

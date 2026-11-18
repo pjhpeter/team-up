@@ -14,9 +14,10 @@
    调度者名下还有别的未收尾任务（同批兄弟任务）时，只关 i<编号>-*。所在 workspace 只剩这一个 pane 时保留
    （关掉会连带关闭 workspace）。只认还在运行、登记名符合成员格式的 agent，不碰调度者、用户 pane 与当前 pane。
    关完回读 pane list / agent list，再跑一次 stop-test-services，防止成员退出后服务成了孤儿进程。
-3. 本任务 worktree（<worktree 根>/*/<任务标识>-*/，含后端等其他仓库，以及嵌在它们里面的）同时满足 干净、HEAD 已在
-   origin/<release> 或 origin/main、没有 pane 在用 时 git worktree remove --force，回读 git worktree list；
-   不满足的保留并写明原因（保留不算失败）。
+3. 本任务 worktree（<worktree 根>/*/<任务标识>-*/，含后端等其他仓库，以及嵌在它们里面的）同时满足 没有未保存内容
+   （工作区与 HEAD 一致、无未跟踪文件、暂存内容在历史里）、HEAD 已在任一远端分支（或按内容进了 release/main）、
+   没有 pane 在用 时 git worktree remove --force，回读 git worktree list；不满足的保留并写明原因（保留不算失败）。
+   只进了 develop 的集成目录也删：#488 收尾时它们因不在 release/main 被一直留着，磁盘越积越多。
 4. test-account.py release --task 释放本任务的测试账号。
 5. 在 issue 发「收尾回执」评论并回读，同时追加到 STATE.md。
 6. 给了 --close-request（用户明确要求关闭的那条评论）且以上全部通过，才关闭 --issue 并回读；没给就不关。
@@ -379,6 +380,37 @@ def shipped(path: str, ref: str) -> bool:
     return cherry.returncode == 0 and not any(line.startswith("+") for line in cherry.stdout.splitlines())
 
 
+def saved_ref(path: str, release: str) -> Optional[str]:
+    """返回保存了 HEAD 的远端分支：先认 release/main（含按内容 cherry-pick 进去的），再认任意远端分支。"""
+    for ref in (release, "main"):
+        if shipped(path, f"origin/{ref}"):
+            return f"origin/{ref}"
+    remote = git(path, "branch", "-r", "--contains", "HEAD", "--format=%(refname:short)").stdout.split()
+    # origin/HEAD 的 short 名是 "origin"，它只是指向别的分支，不单独算
+    remote = [r for r in remote if r.startswith("origin/") and not r.endswith("/HEAD")]
+    return remote[0] if remote else None
+
+
+def unsaved_reason(path: str) -> Optional[str]:
+    """工作区内容和 HEAD 一致、没有未跟踪文件、暂存区里的内容也都在历史里，才算没有未保存的东西。"""
+    tracked = git(path, "diff", "--quiet", "HEAD")
+    if tracked.returncode == 1:
+        return "有未提交改动"
+    if tracked.returncode != 0:
+        return f"git diff 失败：{tracked.stderr.strip()}"
+    if git(path, "ls-files", "--others", "--exclude-standard").stdout.strip():
+        return "有未跟踪文件"
+    # 只有暂存区和 HEAD 不同（例如把旧版本 checkout 进暂存区后工作区又改回）时，暂存的版本若在该文件历史里就不是独有内容
+    for line in git(path, "diff", "--cached", "--raw", "--no-abbrev").stdout.splitlines():
+        meta, _, name = line.partition("\t")
+        fields = meta.split()
+        blob = fields[3] if len(fields) > 3 else ""
+        if not blob or set(blob) == {"0"}:
+            continue
+        if blob not in git(path, "log", "--raw", "--no-abbrev", "--format=", "--", name).stdout:
+            return "暂存区有未提交的内容"
+    return None
+
 def judge_worktrees(worktrees: Sequence[Worktree], release: str, panes: Sequence[dict[str, Any]],
                     services_ok: bool) -> list[str]:
     problems = []
@@ -396,17 +428,14 @@ def judge_worktrees(worktrees: Sequence[Worktree], release: str, panes: Sequence
                  if any(str(p.get(k) or "") and (os.path.realpath(str(p[k])) == wt.path
                                                  or os.path.realpath(str(p[k])).startswith(wt.path + os.sep))
                         for k in ("cwd", "foreground_cwd"))]
-        status = git(wt.path, "status", "--porcelain")
         if not services_ok:
             wt.keep = "测试服务没关干净，先不删"
         elif not fetched[wt.repo]:
-            wt.keep = "取不到远端分支，无法核对代码是否已进 release"
-        elif status.returncode != 0:
-            wt.keep = f"git status 失败：{status.stderr.strip()}"
-        elif status.stdout.strip():
-            wt.keep = "有未提交改动"
-        elif not any(shipped(wt.path, f"origin/{ref}") for ref in (release, "main")):
-            wt.keep = f"HEAD {wt.head[:10]} 有提交不在 origin/{release} 或 origin/main 里（按提交内容比对也没有）"
+            wt.keep = "取不到远端分支，无法核对代码是否已保存到远端"
+        elif reason := unsaved_reason(wt.path):
+            wt.keep = reason
+        elif not saved_ref(wt.path, release):
+            wt.keep = f"HEAD {wt.head[:10]} 不在任何远端分支里（按内容比对 origin/{release}、origin/main 也没有）"
         elif users:
             wt.keep = f"还有 pane 在用：{', '.join(map(str, users))}"
     return problems

@@ -72,8 +72,15 @@ class FakeGit:
             return done(0, tree["upstream"] + "\n") if tree.get("upstream") else done(128, err="no upstream")
         if args[0] == "rev-list":
             return done(0, f"{tree['ahead']}\n")
-        if args[0] == "status":
-            return done(0, " M file.ts\n" if tree.get("dirty") else "")
+        if args[:2] == ("diff", "--quiet"):
+            return done(1 if tree.get("dirty") else 0)
+        if args[:2] == ("diff", "--cached"):
+            staged = tree.get("staged")
+            return done(0, f":100644 100644 {'0' * 40} {staged} M\tfile.ts\n" if staged else "")
+        if args[0] == "ls-files":
+            return done(0, "notes.md\n" if tree.get("untracked") else "")
+        if args[0] == "log":
+            return done(0, f":100644 100644 {'0' * 40} {tree['history']} M\tfile.ts\n" if tree.get("history") else "")
         if args[0] == "merge-base":
             return done(0 if args[3] in tree["in"] else 1)
         if args[0] == "cherry":
@@ -229,6 +236,21 @@ class WrapupTest(Case):
         self.assertIn(("test-account.py", "release", "--task", TASK), self.scripts)
         stops = [s for s in self.scripts if s[0] == "stop-test-services.py"]
         self.assertEqual(len(stops), 2)  # 成员关闭前后各一次
+
+    def test_removes_develop_only_and_index_only_worktrees_keeps_unsaved(self) -> None:
+        develop = self.git.add(f"{self.wt}/{TASK}-develop", branch="fix/47-develop", remote_has=True)
+        stale_index = self.git.add(f"{self.wt}/{TASK}-dev", branch="fix/47", upstream="origin/fix/47",
+                                   **{"in": {"origin/release-40"}}, staged="b" * 40, history="b" * 40)
+        unknown_index = self.git.add(f"{self.wt}/{TASK}-tmp", branch="fix/47-tmp", upstream="origin/fix/47-tmp",
+                                     **{"in": {"origin/release-40"}}, staged="c" * 40)
+        untracked = self.git.add(f"{self.wt}/{TASK}-notes", branch="fix/47-notes", upstream="origin/fix/47-notes",
+                                 **{"in": {"origin/release-40"}}, untracked=True)
+        code, out = self.run_wrapup(FakeHerdr([agent(SCHED, "w1:pS")]))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(self.git.removed), sorted([develop, stale_index]))
+        receipt = next(iter(self.glab.notes.values()))
+        self.assertIn(f"{unknown_index}（暂存区有未提交的内容）", receipt)
+        self.assertIn(f"{untracked}（有未跟踪文件）", receipt)
 
     def test_worktree_still_used_by_other_pane_is_kept(self) -> None:
         dev = self.git.add(f"{self.wt}/{TASK}-dev", branch="fix/47", upstream="origin/fix/47", **{"in": {"origin/main"}})

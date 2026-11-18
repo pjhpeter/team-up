@@ -36,6 +36,7 @@ class World:
         self.unreadable_chats: set[str] = set()
         self.messages: dict[str, str] = {}  # message_id → 渲染后的 content（给 mget 用）
         self.raw_messages: dict[str, dict] = {}  # 原生消息接口保留引用关系，mget 可以不返回它
+        self.message_senders: dict[str, dict] = {}  # message_id → mget 返回的 sender（不设则不返回）
         self.unreadable_messages: set[str] = set()
         self.broken_images: set[str] = set()
         self.downloads: list[tuple] = []
@@ -101,8 +102,10 @@ class World:
             mid = cmd[cmd.index("--message-ids") + 1]
             if mid in self.unreadable_messages:
                 return ok({"ok": False, "error": {"message": "access denied"}})
-            return ok({"ok": True, "data": {"messages": [{"message_id": mid, "content": self.messages.get(mid, ""),
-                                                          "thread_id": self.thread_of.get(mid, "")}]}})
+            item = {"message_id": mid, "content": self.messages.get(mid, ""), "thread_id": self.thread_of.get(mid, "")}
+            if mid in self.message_senders:
+                item["sender"] = self.message_senders[mid]
+            return ok({"ok": True, "data": {"messages": [item]}})
         if cmd[1:3] == ["im", "+messages-resources-download"]:
             mid, key = cmd[cmd.index("--message-id") + 1], cmd[cmd.index("--file-key") + 1]
             if key in self.broken_images:
@@ -722,6 +725,18 @@ class BridgeTest(unittest.TestCase):
         self.assertIn("按这个修", body)
         self.assertIn("原问题是保存后图片消失", body)
 
+    def test_quoted_bot_relay_of_gitlab_note_becomes_link(self) -> None:
+        self.b.secretary.learn("oc_1")
+        note = "https://git.example.com/frontend/web-v1/-/issues/7#note_71"
+        self.state["secretary"]["msgs"]["om_agent"] = "https://git.example.com/frontend/web-v1/-/issues/7"
+        self.w.messages["om_agent"] = f"**[#7]({note}) 旧单**\n@pengjh 很长的调度者原文，接收方能直接打开"
+        self.w.message_senders["om_agent"] = {"id": "cli_x", "sender_type": "app"}
+        self.w.raw_messages["om_reply"] = {"message_id": "om_reply", "parent_id": "om_agent", "root_id": "om_agent"}
+        self.b.handle(msg("om_reply", "按这个修"))
+        body = self.w.issues[7]["notes"][-1]["body"]
+        self.assertIn("按这个修", body)
+        self.assertIn(f"**引用的消息**：{note}", body)
+        self.assertNotIn("很长的调度者原文", body)
     def test_demand_in_someone_elses_thread_carries_earlier_text(self) -> None:
         # 2026-11-12 实测（#479）：同事在话题里描述问题，我回「需求：处理这个问题」，问题描述曾被丢掉
         def item(mid, text, name, sender_type="user", sender="ou_qi", mentions=None):

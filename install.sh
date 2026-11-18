@@ -48,7 +48,23 @@ else
   echo "[注意]   没找到 ~/.omp/agent，omp 扩展未安装（调度者用 omp 时需要）"
 fi
 
-# 4. 依赖检查
+# 4. 成员 skill：链接到所有 Agent 共用的 ~/.agents/skills；Claude Code 只读 ~/.claude/skills，再按其惯例链一层
+mkdir -p "$HOME/.agents/skills"
+for d in "$HWF"/skills/*/; do
+  name=$(basename "$d")
+  link="$HOME/.agents/skills/$name"
+  if [ -e "$link" ] && [ ! -L "$link" ]; then
+    echo "[注意]   $link 是已有的普通目录，没有覆盖；确认可删后重跑本脚本"
+    continue
+  fi
+  ln -sfn "$HWF/skills/$name" "$link"
+  if [ -d "$HOME/.claude/skills" ] && { [ ! -e "$HOME/.claude/skills/$name" ] || [ -L "$HOME/.claude/skills/$name" ]; }; then
+    ln -sfn "../../.agents/skills/$name" "$HOME/.claude/skills/$name"
+  fi
+  echo "[已链接] skill ${name} → $HWF/skills/$name"
+done
+
+# 5. 依赖检查
 python3 -c 'import yaml' 2>/dev/null && echo "[已有]   python3 + PyYAML（只有测试用到）" || echo "[注意]   测试需要 PyYAML：python3 -m pip install pyyaml"
 for c in herdr glab omp claude codex droid; do
   command -v "$c" >/dev/null 2>&1 && echo "[已有]   $c" || echo "[注意]   没装 $c（角色配置里用到）"

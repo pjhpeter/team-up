@@ -355,14 +355,26 @@ class Bridge:
     def message_context(self, msg: dict[str, Any], project: str,
                         extra: Optional[list[tuple[str, list[dict[str, str]]]]] = None,
                         *, include_thread: bool = False, exclude_related: tuple[str, ...] = (),
-                        upload: bool = True) -> str:
-        """收集背景；分类阶段只读文字和附件标记，确定任务后才搬附件。"""
-        context, context_files, seen = self.thread_context(msg) if include_thread else ("", [], set())
+                        upload: bool = True, full: bool = False, done: Optional[set[str]] = None,
+                        covered: Optional[set[str]] = None, history_text: bool = True) -> str:
+        """收集背景；分类阶段只读文字和附件标记，确定任务后才搬附件。
+
+        full 时话题前文不截断（建单用）；covered 收集已写进前文的消息 ID；
+        history_text=False 时调用方自己写追问原话，这里只补它们各自的背景。"""
+        context, context_files, seen = self.thread_context(msg, full=full) if include_thread else ("", [], set())
+        done = set() if done is None else done
+        if covered is not None:
+            covered.update(seen)
         sources = [(msg["message_id"], find_attachments(msg.get("content") or ""))] + (extra or []) + context_files
         parts = [p for p in (context, msg.get("context_warning")) if p]
         for previous in msg.get("intent_history", []):
-            parts.append("**此前的用户原话**：\n\n" + self.clean_text(previous))
-            previous_context = self.message_context(previous, project, include_thread=True, upload=upload)
+            if previous["message_id"] in seen:
+                # 已在话题前文里；再展开会让前文重复、同一张图重复上传
+                continue
+            if history_text:
+                parts.append("**此前的用户原话**：\n\n" + self.clean_text(previous))
+            previous_context = self.message_context(previous, project, include_thread=True, upload=upload,
+                                                    full=full, done=done, covered=covered)
             if previous_context:
                 parts.append(previous_context)
         seen.update((msg["message_id"], *exclude_related))
@@ -390,7 +402,6 @@ class Bridge:
             except BridgeError as e:
                 log(f"read quoted message {related} failed: {e}")
                 parts.append(f"_（未能读取引用消息 {related}，请补充这段上下文。）_")
-        done: set[str] = set()
         for mid, items in sources:
             for a in items:
                 if a["key"] in done:
@@ -749,7 +760,9 @@ class Bridge:
                 else:
                     self.secretary.relay(self.issue_url(self.project, iid), source, request, mode=mode)
             else:
-                self.create(mid, chat, request if previous else text, user, msg.get("sender_name") or user, source, mode=mode)
+                # request 是给模型看的拼接稿；正文只放用户原话
+                self.create(mid, chat, text, user, msg.get("sender_name") or user, source, mode=mode,
+                            title=intent["reply"], earlier=tuple((previous or {}).get("messages", [])))
         finally:
             # 写入成功即收束追问；回执失败不能让下一句重复建单或转交。
             delivered = self.state["threads"].get(mid) or self.delivered
@@ -939,14 +952,15 @@ class Bridge:
         if tid:
             self.state["thread_ids"][tid] = key
 
-    def thread_context(self, msg: dict[str, Any]) -> tuple[str, list[tuple[str, list[dict[str, str]]]], set[str]]:
+    def thread_context(self, msg: dict[str, Any], *, full: bool = False
+                       ) -> tuple[str, list[tuple[str, list[dict[str, str]]]], set[str]]:
         """收集当前指令之前的话题前文，返回已收集的消息 ID，避免与直接引用重复。"""
         tid = msg.get("thread_id") or ""
         if not tid:
             return "", [], set()
         try:
             data = self.lark(["im", "+threads-messages-list", "--thread", tid, "--order", "asc",
-                              "--no-reactions", "--page-all", "--page-limit", "4"])
+                              "--no-reactions", "--page-all", "--page-limit", "20" if full else "4"])
         except BridgeError as e:
             log(f"read thread context {tid} failed: {e}")
             return "", [], set()
@@ -976,7 +990,7 @@ class Bridge:
         total = 0
         for mid, line in reversed(lines):
             total += len(line)
-            if kept and total > CONTEXT_TEXT_CAP:
+            if kept and not full and total > CONTEXT_TEXT_CAP:
                 kept.append("> …更早的消息省略")
                 break
             kept.append(line)
@@ -985,10 +999,16 @@ class Bridge:
         return "**话题里的前文**（从飞书原样搬来）：\n\n" + "\n>\n".join(reversed(kept)), attachments, seen
 
     def create(self, mid: str, chat: str, text: str, user: str, name: str,
-               msg: Optional[dict[str, Any]] = None, *, mode: str = "analyze") -> None:
-        context = self.message_context(msg, self.project, self.take_pending_images(chat), include_thread=True) if msg else ""
-        text = self.strip_images(text) or "（见附件）"
-        title = text.splitlines()[0].strip()
+               msg: Optional[dict[str, Any]] = None, *, mode: str = "analyze", title: str = "",
+               earlier: tuple[dict[str, Any], ...] = ()) -> None:
+        # issue 正文要带上触发句之前的全部对话，不能沿用分类时的字数截断
+        covered: set[str] = set()
+        context = self.message_context(msg, self.project, self.take_pending_images(chat), include_thread=True,
+                                       full=True, covered=covered, history_text=False) if msg else ""
+        said = [self.clean_text(m) for m in earlier if m["message_id"] not in covered]
+        text = "\n\n".join(x for x in (*map(self.strip_images, said), self.strip_images(text)) if x.strip()) \
+            or "（见附件）"
+        title = (title.strip() or text.splitlines()[0]).strip()
         title = title[:60] + ("…" if len(title) > 60 else "")
         agent_id = self.api(f"users?username={quote(self.agent)}")[0]["id"]
         desc = (f"{text}\n\n{context + chr(10) + chr(10) if context else ''}"

@@ -158,20 +158,25 @@ arch 可以决定取舍，不能把客观不可执行、验收证据缺失或数
 
 方案在用户确认前上传项目 snippet，确认后标记同一个 snippet 并附 issue。方案与测试用例统一使用 `internal`：不是仅项目成员可见，受 GitLab 项目与用户访问规则约束；不得上传凭据或敏感数据、不得改 `public`。上传后回读 `visibility=internal`。此规则只管后续上传，不批量改历史 snippet，不撤销用户给单项任务指定的其他存档方式。
 
-1. 从 origin 确认项目，不凭其他 remote 推断：
+1. 用脚本上传并回读。脚本从 `--repo` 的 origin 确定项目（不凭其他 remote 推断），用 internal，描述自动补 SHA-256，回读可见性、文件名与线上内容 SHA-256，不一致退出 1：
 
    ```bash
-   glab snippet create -R <origin GROUP/REPO> \
+   python3 ~/.hwf/scripts/upload-snippet.py create --repo <仓库路径> --file <方案文件> \
      --title "<issue IID> 最终技术方案 r<N>（待确认）" \
-     --filename "<方案文件名>" \
-     --visibility internal \
-     --description "<issue URL>；SHA-256 <sha>；待用户确认" \
-     <方案文件>
+     --description "<issue URL>；待用户确认"
    ```
 
    上传内容与提交确认版本完全一致；修改后另建新版 snippet，不覆盖旧版。
-2. 取得 ID/URL，用 `glab api projects/:fullpath/snippets/<id>` 回读 `web_url` 与文件内容，核对 SHA-256。通过后才发确认，会话、issue 评论和 ntfy 均附 `web_url`，不拿本地路径或摘要代替。
-3. 用户确认后，用 `glab api --method PUT projects/:fullpath/snippets/<id>` 改标题为「<issue IID> 最终技术方案 r<N>（已确认）」、描述补确认时间与来源并回读。再在发起 issue 评论 URL、文件名、SHA-256、确认时间；回读评论及 snippet 可访问性。确认版本与内容不符则不得标记，重传并重新确认。
+2. 以脚本输出的 `web_url`、`id`、`sha256` 为准，通过后才发确认，会话、issue 评论和 ntfy 均附 `web_url`，不拿本地路径或摘要代替。
+3. 用户确认后标记同一个 snippet。脚本先核对线上内容与确认版本一致才改标题和描述，改完回读；不一致退出 1，此时不得标记，重传并重新确认：
+
+   ```bash
+   python3 ~/.hwf/scripts/upload-snippet.py mark --repo <仓库路径> --id <snippet ID> --file <确认版本文件> \
+     --title "<issue IID> 最终技术方案 r<N>（已确认）" \
+     --description "<issue URL>；确认时间 <ISO8601>；来源 <note 链接>"
+   ```
+
+   再在发起 issue 评论 URL、文件名、SHA-256、确认时间；回读评论及 snippet 可访问性。
 4. spec 与实现子 issue 带同一已确认链接；STATE 记 URL、ID、创建/确认时间、方案 SHA 与评论定位。
 5. 上传失败或回读不一致即阻塞，保留本地方案与恢复信息；无链接不请确认，不跳过上传进 spec。
 

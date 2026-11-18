@@ -21,12 +21,13 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | --- | --- |
 | `PROTOCOL.md` | 短入口：共同边界、阶段路由、按需阅读与规则维护方式 |
 | `protocol/` | 七个主题：调度、沟通、规划、实现、评审测试、交付、工作树；进入对应阶段时再读 |
+| `skills/` | 成员干活的具体做法（install.sh 链接到 `~/.agents/skills/` 和 `~/.claude/skills/`，不走团队流程时也能用）：`acceptance-test-cases` 写和评测试用例，`test-first-evidence` 测试先行留证与实现前核验，`scoped-code-review` 限定范围的代码评审与回改核验，`real-browser-acceptance` 真实浏览器验收与清理。协议管何时做、谁做、出口，skill 管怎么做 |
 | `workflows/team-up.yaml` | Herdr 启动团队的入口 |
 | `herdr/config.yaml` | 各角色用什么工具、什么模型（install.sh 把 Herdr 插件配置链接到这里） |
 | `herdr/droid-arch.json` | 架构师（droid）的模型与思考档；交互式 droid 只能用 `--settings` 文件指定 |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
+| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `omp-extensions/` | omp 扩展：调度者手改 INDEX 或直接用 glab 发 issue 评论时拦下，要求改用 `task-record.py`（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
@@ -103,4 +104,4 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 2. 按 `PROTOCOL.md`「规则维护方式」修改对应条款，不追加事故流水账；workflow 用 loader 校验，脚本只跑直接相关的测试文件或用例。
 3. 推送并开 MR，合并后其他电脑 `git -C ~/.hwf pull` 即生效（改了 `herdr/config.yaml` 且不是本人电脑的，再跑一次 `install.sh`）。
 
-协议入口和主题在本机更新后，调度者下次读取时生效；收件箱监听 `PROTOCOL.md` 与 `protocol/` 的提交变化并提醒在途调度者。常驻 Python 脚本改动需在原窗格重启相应进程后生效，不因文件已更新就假定正在运行的进程已重载。
+协议入口、主题和 skill 在本机更新后，下次读取时生效；收件箱监听 `PROTOCOL.md`、`protocol/` 与 `skills/` 的提交变化并提醒在途调度者。新增 skill 后要再跑一次 `install.sh` 才会链接到各 Agent。常驻 Python 脚本改动需在原窗格重启相应进程后生效，不因文件已更新就假定正在运行的进程已重载。

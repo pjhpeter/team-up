@@ -956,7 +956,7 @@ class ProtocolChangeTests(unittest.TestCase):
         self.run_round(world, state)
         self.assertEqual(world.prompt_panes, ["w1:p1"])  # 没有未收尾交付的调度者不打扰
         command = next(part for part in world.prompts[0].split("`") if part.startswith("git "))
-        self.assertEqual(shlex.split(command)[3:], ["diff", "aaaa1111", "bbbb2222", "--", "PROTOCOL.md", "protocol/"])
+        self.assertEqual(shlex.split(command)[3:], ["diff", "aaaa1111", "bbbb2222", "--", "PROTOCOL.md", "protocol/", "skills/"])
         self.run_round(world, state)
         self.assertEqual(len(world.prompts), 1)
 
@@ -1007,8 +1007,15 @@ class ProtocolChangeTests(unittest.TestCase):
                 git("add", "unrelated.txt")
                 git("commit", "--quiet", "-m", "Unrelated change")
                 self.run_round(world, state)
-            self.assertEqual(state["protocol_rev"], revised)
-            self.assertEqual(len(world.prompts), 1)
+                self.assertEqual(state["protocol_rev"], revised)
+                self.assertEqual(len(world.prompts), 1)
+                (root / "skills/demo").mkdir(parents=True)
+                (root / "skills/demo/SKILL.md").write_text("Skill rules\n")
+                git("add", "skills/")
+                git("commit", "--quiet", "-m", "Skill only")
+                self.run_round(world, state)
+            self.assertEqual(state["protocol_rev"], git("rev-parse", "HEAD"))
+            self.assertEqual(len(world.prompts), 2)
 
     def test_failed_notice_keeps_old_revision_for_retry(self) -> None:
         state: dict[str, Any] = {"protocol_rev": "aaaa1111"}

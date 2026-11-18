@@ -66,6 +66,50 @@ class NaturalEntryTest(unittest.TestCase):
         self.assertTrue(all(w[3] for w in self.w.writes))
         self.assertIn("修复", self.w.replies[-1]["text"])
 
+    def test_retry_in_thread_claims_colleague_request_with_full_prior_conversation(self):
+        # 2026-11-18 #492：同事在群里提需求，用户在话题里只说「处理这个问题」，首次模型超时后「重试」
+        self.model(reply="Cookie 弹窗缩小并自动接受")
+        succeed = self.b.run
+        failures = [1]
+
+        def run(cmd, **kwargs):
+            if cmd[0] == "omp" and failures:
+                failures.pop()
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            return succeed(cmd, **kwargs)
+        self.b.run = run
+
+        def item(mid, text, name, sender="ou_tj", sender_type="user"):
+            return {"message_id": mid, "chat_id": "oc_g", "content": text, "create_time": "2026-11-18 18:19",
+                    "thread_id": "omt_c", "sender": {"id": sender, "name": name, "sender_type": sender_type}}
+        bot = [{"id": BOT, "key": "@_user_1", "name": "嘉辉的Agent"}]
+        request = "处理一下这个弹窗吧，最多只弹一次，弄小一点，收在右下角"
+        self.w.messages["om_tj"] = f"![Image](img_cookie)\n{request}"
+        self.w.threads["omt_c"] = [
+            item("om_tj", self.w.messages["om_tj"], "唐杰"),
+            item("om_deny", "你 @ 我也没用", "嘉辉的Agent", sender="cli_x", sender_type="app"),
+            item("om_early", "最早的补充：海外站也有", "钟超", sender="ou_zc"),
+            item("om_long", "后续讨论" * FB.CONTEXT_TEXT_CAP, "钟超", sender="ou_zc"),
+            item("om_a", "@_user_1 处理这个问题", "彭嘉辉", sender=ME),
+            item("om_fail", "这次消息处理失败", "嘉辉的Agent", sender="cli_x", sender_type="app"),
+            item("om_b", "@_user_1 重试", "彭嘉辉", sender=ME),
+        ]
+        for mid, text in (("om_a", "@_user_1 处理这个问题"), ("om_b", "@_user_1 重试")):
+            self.b.handle(msg(mid, text, root="om_tj", reply_to="om_tj", thread="omt_c",
+                              chat="oc_g", chat_type="group", mentions=bot))
+        creates = [w[2] for w in self.w.writes if w[1].endswith("/issues")]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(creates[0]["title"], "Cookie 弹窗缩小并自动接受")
+        desc = creates[0]["description"]
+        self.assertEqual(desc.count(request), 1, desc)
+        self.assertIn("最早的补充：海外站也有", desc)
+        self.assertNotIn("更早的消息省略", desc)
+        self.assertNotIn("同一次待澄清请求", desc)
+        self.assertNotIn("此前的用户原话", desc)
+        self.assertEqual(desc.count("处理这个问题"), 1, desc)
+        self.assertEqual(self.w.downloads, [("om_tj", "img_cookie")])
+        self.assertEqual(self.uploads, [("frontend/web-v1", "img_cookie.jpg")])
+
 
     def test_feature_request_defaults_to_analysis_in_mentioned_group(self):
         self.model()

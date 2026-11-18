@@ -71,6 +71,8 @@ HELP_COOLDOWN_S = 600
 NOTE_RETRIES = 3  # 一条评论连续发送失败几次后改发 GitLab 链接
 FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
 CONTEXT_TEXT_CAP = 6000  # 建单时带上的话题前文总字数上限，超出只留最近的
+# 秘书或话题同步搬到飞书的 GitLab 评论，首行带该评论链接。
+RELAYED_NOTE_HEAD = re.compile(r"^[^\n]*?\((https?://[^\s()]+/-/(?:issues|work_items)/\d+#note_\d+)\)")
 FOLDED = re.compile(r"<details>.*?</details>", re.S)  # 评论里折叠的全文
 CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
 # lark-cli 把消息里的附件渲染成这些标记（见 lark-im 文档 messages-resources-download）：
@@ -376,7 +378,11 @@ class Bridge:
                 raw = self.clean_text(normalize_history(item))
                 sources.append((related, find_attachments(raw)))
                 body = strip_attachments(raw).strip()
-                if body:
+                relayed = RELAYED_NOTE_HEAD.match(body) if (item.get("sender") or {}).get("sender_type") in ("app", "bot") else None
+                if relayed:
+                    # 机器人搬来的 GitLab 评论，接收方能直接打开原评论，附全文只会重复。
+                    parts.append(f"**引用的消息**：{relayed.group(1)}")
+                elif body:
                     if len(body) > CONTEXT_TEXT_CAP:
                         body = body[:CONTEXT_TEXT_CAP] + "\n（引用内容较长，后文省略。）"
                     parts.append("**引用的消息**（从飞书原样搬来）：\n\n" +

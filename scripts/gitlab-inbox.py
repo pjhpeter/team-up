@@ -100,13 +100,7 @@ STAGE_PREFIX = "状态:"
 WAITING_LABEL = "状态:等你处理"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")  # omp --thinking 可选值
 # 每次投递都把通知规则放回上下文，避免调度者只在首次启动时读过、续跑后忘记。
-NOTIFY_REMINDER = (
-    "\n[通知检查] issue 评论只用 ~/.hwf/scripts/task-record.py note 发（请用户同意或授权时带 --will，脚本先自查做不做得了）；"
-    "发之前先读 ~/.hwf/protocol/communication.md「通知模式」的发送前核对与同一件事只说一次，"
-    "再对照本任务 STATE 的通知模式和最近用户通知。未记录模式时按免打扰；"
-    "本条若是用户切换通知模式的指令，先应用切换。只有收到/开始/派工的确认写 STATE，"
-    "回执由收件箱或秘书承担；实质答复、新风险和新增用户待办按协议及时通知。"
-)
+NOTIFY_REMINDER = "\n[通知] issue 评论只用 task-record.py note，发前按 ~/.hwf/protocol/communication.md「通知模式」「发布入口」核对。"
 
 
 class InboxError(RuntimeError):
@@ -409,8 +403,7 @@ class Inbox:
             return ""
         self.labels_seen[url] = [l for l in labels if l != WAITING_LABEL] + [stage]
         log(f"{url}: {WAITING_LABEL} → {stage} after user reply")
-        return (f"\n用户已回复，收件箱已把这张 issue 的进度标签从「{WAITING_LABEL}」改回「{stage}」。"
-                f"看完这条回复如果仍需要用户处理，改回「{WAITING_LABEL}」；根 issue 另有进度标签时按实际阶段一并更新。")
+        return (f"\n[标签] 已改回「{stage}」；仍需要用户处理，改回「{WAITING_LABEL}」，根 issue 按实际阶段同步。")
     def handle_note(self, url: str, repo: str, note: Mapping[str, Any], where: Mapping[str, Any]) -> bool:
         """评论统一入口。返回 False 表示下一轮重试。
 
@@ -453,17 +446,12 @@ class Inbox:
             kind = "@提及"
         else:
             kind = "本账号参与的 issue 下的回复"
-        mode = ("交付模式：按交付流程处理" if self.mode_of(url) == DELIVER else
-                "对话模式：你自己不分析，按用户点名派角色只读分析（没点名派 arch），把成员结论原样转贴到 issue；"
-                "用户发 /go 或明确说开工才进入交付流程；STATE 已是交付模式时以 STATE 为准")
+        mode = "交付模式" if self.mode_of(url) == DELIVER else "对话模式：你自己不分析，派用户点名角色只读分析（没点名派 arch）并原样转贴；/go 或明确开工才交付，STATE 已是交付模式时以 STATE 为准"
         return (
             f"[GitLab 收件箱] {kind}（{mode}）：@{note['author']['username']} 在 {url}#note_{note['id']} 评论：\n"
             f"{note['body']}\n"
-            f"这条回复只属于上方所附 issue（{url}）。正文提到其他编号不改变归属，"
-            "不得因此移交到其他 issue，也不得把本条的同意、确认或合并授权用于其他 issue。"
-            "如果确实提出了独立新需求，按 ~/.hwf/protocol/communication.md「独立需求与飞书话题」建立独立 issue 和话题，"
-            "在来源话题留下跳转链接，不得在当前会话悄悄接管新需求。"
-            "按 ~/.hwf/protocol/communication.md「GitLab 收件箱」处理这条用户消息。"
+            "[归属] 本条只属于上方 issue，授权不用于其他 issue；按 ~/.hwf/protocol/communication.md「GitLab 收件箱」"
+            "处理，独立新需求按其「独立需求与飞书话题」另建。"
         )
 
     def remember(self, note_id: int) -> None:

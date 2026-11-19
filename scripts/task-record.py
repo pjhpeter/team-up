@@ -339,10 +339,22 @@ def render_steps(host: str, release: str, steps: Sequence[dict[str, Any]]) -> li
         line = f"- [{'x' if done else ' '}] {number}. {title}"
         if done:
             line += f"（已在 {release}）"
+        else:
+            status = step.get("status", "待核实")
+            if status not in ("待核实", "未开始", "进行中", "修复中", "待验证", "待汇总", "受阻"):
+                raise RecordError(f"第 {number} 步的状态不支持：{status}")
+            remaining = step.get("remaining", "")
+            if not isinstance(remaining, str) or len(remaining) > 80 or len(remaining.splitlines()) > 1:
+                raise RecordError(f"第 {number} 步的剩余事项限一行、80 字")
+            if status == "受阻" and not remaining.strip():
+                raise RecordError(f"第 {number} 步受阻，请说明在等什么")
+            line = f"- [ ] {number}. **{status}**｜{title}"
+            if remaining.strip():
+                line += f"。{remaining.strip()}"
         if step.get("child"):
             line += f" → #{int(step['child'])}（子 issue）"
         if step.get("blocked_by") and not done:
-            line += "　Blocked by " + "、".join(str(int(n)) for n in step["blocked_by"])
+            line += "（依赖步骤 " + "、".join(str(int(n)) for n in step["blocked_by"]) + "）"
         lines.append(line)
     return lines
 

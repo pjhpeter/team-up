@@ -206,7 +206,8 @@ class ProgressTests(Case):
         self.addCleanup(patcher.stop)
         self.steps = {"steps": [
             {"title": "接口接入", "commits": [{"project": "group/proj", "sha": SHIPPED}]},
-            {"title": "页面改版", "blocked_by": [1], "commits": [{"project": "group/proj", "sha": PENDING}]},
+            {"title": "页面改版", "status": "待汇总", "remaining": "等待合入发布分支", "blocked_by": [1],
+             "commits": [{"project": "group/proj", "sha": PENDING}]},
             {"title": "桌面端移植", "blocked_by": [2]}]}
 
     def test_ticks_only_what_reached_release_and_keeps_user_text(self) -> None:
@@ -215,8 +216,8 @@ class ProgressTests(Case):
         TR.progress(self.repo, TASK, ISSUE, self.steps)
         text = self.issue.description
         self.assertIn("- [x] 1. 接口接入（已在 release-47）", text)
-        self.assertIn("- [ ] 2. 页面改版　Blocked by 1", text)
-        self.assertIn("- [ ] 3. 桌面端移植　Blocked by 2", text)
+        self.assertIn("- [ ] 2. **待汇总**｜页面改版。等待合入发布分支（依赖步骤 1）", text)
+        self.assertIn("- [ ] 3. **待核实**｜桌面端移植（依赖步骤 2）", text)
         self.assertIn("**现在**：页面改版开发中", text)
         self.assertIn("**等你处理**：无", text)
         self.assertIn("| frontend/web-v1 | release-47 | 接口接入 | 无 |", text)

@@ -174,6 +174,11 @@ class Inbox:
         else:
             raise InboxError(f"Issue state unavailable for {url}")
         result = f"目标 issue {url}：{progress}。"
+        # 进度区的三行状态由 task-record.py progress 写在描述里，也来自目标 issue，一并带上（2026-11-19 #484）。
+        area = re.search(r"<!-- hwf:start.*?<!-- hwf:end -->", issue.get("description") or "", re.S)
+        lines = re.findall(r"^\*\*(现在|下一步|等你处理)\*\*：(.+?)\s*$", area.group(0) if area else "", re.M)
+        if lines:
+            result += "\n" + "\n".join(f"- {name}：{value}" for name, value in lines) + "\n"
         info = self.owner_info(repo, url)
         if info["task"] is None:
             return result + "会话状态：没有对应的调度者记录。"

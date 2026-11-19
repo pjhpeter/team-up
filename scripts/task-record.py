@@ -7,6 +7,7 @@
     task-record.py note      --repo <主仓库> --task <任务标识> --issue <issue URL> --kind <类别> --body-file <文件> [--will …]
     task-record.py preflight --will <动作>...
     task-record.py card-check --file <arch 判定落盘文件>
+    task-record.py progress  --repo <主仓库> --task <任务标识> [--issue <根 issue URL> --steps-file <步骤 JSON>]
 
 为什么有它：
 - 2026-11-15 #483：调度者手写 INDEX 行没加反引号，收件箱找不到负责人，用户的回复晚到约 7 分钟。
@@ -28,6 +29,15 @@ todo（要用户处理或授权）必须用 --will 写明用户同意后本账�
 
 card-check：按 ~/.hwf/protocol/planning.md §0 核对 arch 判定里的「需求理解卡」（现状带 file:line、历史与坑不为空、验收条件每条写了证据）。
 2026-11-15 用户同意：编码前对项目了解不够、验收太粗；只写进协议的要求聊几句就忘，所以由脚本拦。缺项时退出码 3。
+
+progress：根 issue 描述顶部的「进度」维护区只由它写。2026-11-19 #484：进度区手写了 7 小时没更新，代码还没进
+release-484 就打了勾，单项里塞满分支、流水线和验收细节，用户看不出现在做到哪、在等谁。所以：
+- 「现在 / 下一步 / 等你处理」三行直接取 STATE 顶部；state-set 改这三项时自动刷新 issue 描述，不用另记。
+- 勾不勾由脚本核对：步骤的 commits 全部是对应项目 release-<根编号> 的祖先才打勾，调度者不能手勾。
+- 步骤标题限 80 字、三行各限 150 字；细节、证据写评论。用户原文和「上线清单」原样保留，写完回读。
+步骤 JSON：{"steps": [{"title": "接口接入", "blocked_by": [1], "child": 12,
+            "commits": [{"project": "frontend/web-v1", "sha": "<提交>"}]}]}
+第一次带 --issue 与 --steps-file，存到 <任务目录>/progress.json；步骤变了（新增、拆分、汇总了新提交）再带 --steps-file。
 """
 
 from __future__ import annotations
@@ -65,6 +75,13 @@ QUIET, VERBOSE = "免打扰", "详尽"
 TOP_OPEN = "<!-- hwf:top 本段只由 task-record.py 改 -->"
 TOP_CLOSE = "<!-- /hwf:top -->"
 TOP_FIELDS = ("通知模式", "当前阶段", "下一动作", "待用户事项", "最近用户通知")
+# 这三项会原样显示在根 issue 进度区，必须短到一眼看完（2026-11-19 #484）。
+PROGRESS_FIELDS = {"当前阶段": "现在", "下一动作": "下一步", "待用户事项": "等你处理"}
+NOW_LIMIT, TITLE_LIMIT = 150, 80
+AREA_OPEN = "<!-- hwf:start 以下由交付流程维护 -->"
+AREA_CLOSE = "<!-- hwf:end -->"
+AREA = re.compile(r"<!-- hwf:start[^>]*-->.*?<!-- hwf:end -->\n*", re.S)
+EMPTY_RELEASE = "## 上线清单\n| 仓库 | release 分支 | 改了什么 | 有没有数据库改动 |\n| --- | --- | --- | --- |"
 LEGACY_MODE = re.compile(r"通知模式[:：]\s*(免打扰|详尽)")
 # 免打扰下只有这几类发；stage 是阶段进度，只在详尽模式发（protocol/communication.md「通知模式」）。
 # record 是登记或存档（登记池评论、待定清单评论），不是发给用户看进度的。
@@ -157,6 +174,8 @@ def state_set(repo: str, task: str, name: str, value: str) -> None:
     if name not in TOP_FIELDS:
         raise RecordError(f"STATE 顶部没有「{name}」这一项，可用：{'、'.join(TOP_FIELDS)}")
     value = " ".join(value.split())
+    if name in PROGRESS_FIELDS and len(value) > NOW_LIMIT:
+        raise RecordError(f"「{name}」会显示在 issue 进度区，限 {NOW_LIMIT} 字（现在 {len(value)} 字）：只写一句结论，细节写评论或 STATE 正文")
     if name == "通知模式" and not value.startswith((QUIET, VERBOSE)):
         raise RecordError(f"通知模式只能以「{QUIET}」或「{VERBOSE}」开头")
     path = state_path(repo, task)
@@ -176,6 +195,8 @@ def state_set(repo: str, task: str, name: str, value: str) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+    if name in PROGRESS_FIELDS and progress_path(repo, task).exists():
+        progress(repo, task)
 
 
 # ---------- 自查：同意之后本账号做不做得了 ----------
@@ -287,6 +308,82 @@ def card_check(text: str) -> list[str]:
     return problems
 
 
+# ---------- 根 issue 进度区 ----------
+
+def progress_path(repo: str, task: str) -> Path:
+    return state_path(repo, task).with_name("progress.json")
+
+
+def in_release(host: str, project: str, sha: str, release: str) -> bool:
+    """sha 是 release 的祖先（两者的共同祖先就是 sha 本身）才算已汇总；release 分支还没建也算没汇总。"""
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise RecordError(f"commits 里的 sha 要写完整 40 位：{sha}")
+    path = f"projects/{quote(project, safe='')}/repository/merge_base?refs[]={sha}&refs[]={quote(release)}"
+    try:
+        base = _WR.glab_api(host, "GET", path)
+    except _WR.WrapupError as error:
+        if f"Could not find ref: {release}" in str(error):
+            return False
+        raise
+    return str(base.get("id") or "") == sha
+
+
+def render_steps(host: str, release: str, steps: Sequence[dict[str, Any]]) -> list[str]:
+    lines = []
+    for number, step in enumerate(steps, 1):
+        title = " ".join(str(step.get("title") or "").split())
+        if not title or len(title) > TITLE_LIMIT:
+            raise RecordError(f"第 {number} 步标题要有、且不超过 {TITLE_LIMIT} 字（现在 {len(title)} 字）：分支、流水线、验收细节写评论")
+        commits = step.get("commits") or []
+        done = bool(commits) and all(in_release(host, c["project"], c["sha"], release) for c in commits)
+        line = f"- [{'x' if done else ' '}] {number}. {title}"
+        if done:
+            line += f"（已在 {release}）"
+        if step.get("child"):
+            line += f" → #{int(step['child'])}（子 issue）"
+        if step.get("blocked_by") and not done:
+            line += "　Blocked by " + "、".join(str(int(n)) for n in step["blocked_by"])
+        lines.append(line)
+    return lines
+
+
+def progress(repo: str, task: str, issue_url: Optional[str] = None, steps: Optional[dict[str, Any]] = None) -> str:
+    """按 STATE 顶部和步骤重写根 issue 描述顶部的维护区，回读确认；返回 issue 链接。"""
+    saved = progress_path(repo, task)
+    record = json.loads(saved.read_text(encoding="utf-8")) if saved.exists() else {}
+    if issue_url:
+        record["issue"] = issue_url.split("#", 1)[0]
+    if steps is not None:
+        record["steps"] = steps.get("steps") or []
+    if not record.get("issue") or not record.get("steps"):
+        raise RecordError("第一次要带 --issue 和 --steps-file（steps 不能为空）")
+    issue = _WR.parse_issue(record["issue"])
+    release = f"release-{issue.iid}"
+    top = read_top(state_path(repo, task).read_text(encoding="utf-8")) if state_path(repo, task).exists() else {}
+    head = [f"**{label}**：{top.get(field) or '无'}" for field, label in PROGRESS_FIELDS.items()]
+    body = render_steps(issue.host, release, record["steps"])
+    api = f"projects/{quote(issue.project, safe='')}/issues/{issue.iid}"
+    old = str(_WR.glab_api(issue.host, "GET", api).get("description") or "")
+    found = AREA.search(old)
+    release_table = EMPTY_RELEASE
+    if found:
+        table = re.search(r"## 上线清单\n.*?(?=\n+---\n|\n*<!-- hwf:end)", found.group(0), re.S)
+        release_table = table.group(0).strip() if table else EMPTY_RELEASE
+    original = AREA.sub("", old, count=1).strip("\n")
+    area = "\n".join([AREA_OPEN, "## 进度", "", "  \n".join(head), "",
+                      f"_更新于 {time.strftime('%Y-%m-%d %H:%M')}；勾选表示代码已进 `{release}`，细节见评论_", "",
+                      *body, "", release_table, "", "---", AREA_CLOSE])
+    new = area + ("\n\n" + original if original else "") + "\n"
+    if new.strip() != old.strip():
+        _WR.glab_api(issue.host, "PUT", api, f"description={new}")
+        back = str(_WR.glab_api(issue.host, "GET", api).get("description") or "")
+        if back.strip() != new.strip():
+            raise RecordError(f"进度区回读不一致：{issue.url}")
+    saved.parent.mkdir(parents=True, exist_ok=True)
+    saved.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return issue.url
+
+
 # ---------- 评论 ----------
 
 def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequence[str]) -> tuple[int, str]:
@@ -347,6 +444,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pre.add_argument("--will", action="append", required=True)
     card = sub.add_parser("card-check")
     card.add_argument("--file", required=True, help="arch §0 判定的落盘文件")
+    prog = sub.add_parser("progress", parents=[common])
+    prog.add_argument("--issue", help="根 issue URL；第一次必填")
+    prog.add_argument("--steps-file", help="步骤 JSON；第一次或步骤变化时给")
     opts = parser.parse_args(argv)
     try:
         if opts.command == "index-add":
@@ -362,6 +462,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               Path(opts.body_file).read_text(encoding="utf-8"), opts.will)
             print(text)
             return code
+        elif opts.command == "progress":
+            steps = json.loads(Path(opts.steps_file).read_text(encoding="utf-8")) if opts.steps_file else None
+            print(f"进度区已更新并回读：{progress(opts.repo, opts.task, opts.issue, steps)}")
         elif opts.command == "card-check":
             problems = card_check(Path(opts.file).read_text(encoding="utf-8"))
             for problem in problems:

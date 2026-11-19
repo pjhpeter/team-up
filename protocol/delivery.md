@@ -36,7 +36,7 @@
 ### 汇总登记与完整性核对
 
 - 被替代、作废、仅 develop 实验等不上线情况，必须写根 issue 并获用户确认，不能默认只进 develop。
-- 子 issue 关闭前代码已在汇总分支或登记不上线。完成评论记录 develop MR、冒烟结果、汇总 MR/SHA，并更新「上线清单」。步骤不是 issue：根评论标题用「步骤 <序号> 完成：<名称>」，记录相同内容并勾进度。
+- 子 issue 关闭前代码已在汇总分支或登记不上线。完成评论记录 develop MR、冒烟结果、汇总 MR/SHA，并更新「上线清单」。步骤不是 issue：根评论标题用「步骤 <序号> 完成：<名称>」，记录相同内容，再把汇总后的提交写进步骤 JSON、用 `task-record.py progress --steps-file` 重跑，由脚本核对后打勾。
 - 全部步骤完成、子 issue 关闭或登记不上线后，scheduler 派 precheck 取证、code-review 核对：
   1. 完成评论源 SHA 都是汇总分支祖先（`git merge-base --is-ancestor`）。
   2. 各 issue 改过的每个文件与 develop 内容一致；差异逐个解释，其他需求差异可接受，本需求缺失不行。
@@ -76,7 +76,7 @@ scheduler 回收实际输出，核对：
 - 已关 issue 但缺证且未明确取消：不自动重开、不标已交付，说明缺项，请用户重开继续或明确取消，INDEX 保持 blocked。每轮测试服务仍关闭，成员/worktree 留到用户决定；关闭事件不触发破坏性清理。
 - 全部完成或用户明确取消才收尾；取消记录未交付项与用户原话。发起 issue 按本节「发起 issue 的关闭授权」处理；验收回复不替代 main 合并授权。
 
-冒烟通过且代码已汇总后，原 issue 中文完成评论写结果、HEAD、develop MR、冒烟结果、汇总 MR/SHA、证据、本步新增待定项数量；更新上线清单与进度，再关子 issue 并回读 `state=closed`。步骤只勾选。子 issue 关闭/步骤勾选仅表示进入可上线分支，不代表部署。发起/根 issue 完成评论必须等 §9.1 通过。
+冒烟通过且代码已汇总后，原 issue 中文完成评论写结果、HEAD、develop MR、冒烟结果、汇总 MR/SHA、证据、本步新增待定项数量；更新上线清单，用 `task-record.py progress --steps-file` 刷新进度（勾选由脚本核对），再关子 issue 并回读 `state=closed`。子 issue 关闭/步骤勾选仅表示进入可上线分支，不代表部署。发起/根 issue 完成评论必须等 §9.1 通过。
 
 失败或缺证项保持未完成，列阻塞与恢复动作；标签按 `planning.md`「issue 数量与进度标签」，需用户处理时 `状态:等你处理`。
 

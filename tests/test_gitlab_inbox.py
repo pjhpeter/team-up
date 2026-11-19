@@ -452,6 +452,16 @@ class InboxTests(unittest.TestCase):
         self.assertNotIn("#99", world.comments[0])
         self.assertEqual((world.prompts, world.launched), ([], []))
 
+    def test_status_includes_now_next_and_waiting_from_issue_progress_area(self) -> None:
+        # 2026-11-19 #484：用户要能随时看到现在做到哪、下一步、在等谁。
+        world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")], notes=[note(6, body="/status")])
+        world.issue_details = {"projects/10/issues/7": {"state": "opened", "labels": ["状态:开发中"], "description":
+                               "<!-- hwf:start -->\n## 进度\n\n**现在**：第 4 项收尾  \n**下一步**：重跑第 13 条\n"
+                               "**等你处理**：拍板续传时机\n<!-- hwf:end -->\n用户原文 **现在**：不算"}}
+        make(world).poll()
+        self.assertIn("- 现在：第 4 项收尾\n- 下一步：重跑第 13 条\n- 等你处理：拍板续传时机\n", world.comments[0])
+        self.assertEqual(world.comments[0].count("现在"), 1)
+
     def test_status_closed_takes_priority_over_stale_labels(self) -> None:
         world = FakeWorld([todo("mentioned", url=f"{URL}#note_6")], notes=[note(6, body="/status")])
         world.issue_state = "closed"

@@ -162,6 +162,94 @@ class NoteTests(Case):
         self.assertIn("读不到", self.glab.posted[-1])
 
 
+SHIPPED, PENDING = "a" * 40, "b" * 40
+OLD_DESCRIPTION = """<!-- hwf:start 以下由交付流程维护 -->
+## 进度
+- [x] 1. 手勾的步骤，后面跟着一长串分支和流水线
+
+## 上线清单
+| 仓库 | release 分支 | 改了什么 | 有没有数据库改动 |
+| --- | --- | --- | --- |
+| frontend/web-v1 | release-47 | 接口接入 | 无 |
+
+---
+<!-- hwf:end -->
+
+## 用户原文
+别动我"""
+
+
+class ProgressGlab:
+    """issue 描述可读写；merge_base 只把 SHIPPED 判为已进 release。"""
+
+    def __init__(self) -> None:
+        self.description = OLD_DESCRIPTION
+        self.puts = 0
+
+    def __call__(self, host: str, method: str, path: str, *fields: str) -> Any:
+        if "merge_base" in path:
+            sha = path.split("refs[]=")[1].split("&")[0]
+            return {"id": sha if sha == SHIPPED else "c" * 40}
+        if method == "PUT":
+            self.puts += 1
+            self.description = fields[0].split("=", 1)[1]
+            return {}
+        return {"description": self.description}
+
+
+class ProgressTests(Case):
+    def setUp(self) -> None:
+        super().setUp()
+        self.issue = ProgressGlab()
+        patcher = patch.object(TR._WR, "glab_api", self.issue)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.steps = {"steps": [
+            {"title": "接口接入", "commits": [{"project": "group/proj", "sha": SHIPPED}]},
+            {"title": "页面改版", "blocked_by": [1], "commits": [{"project": "group/proj", "sha": PENDING}]},
+            {"title": "桌面端移植", "blocked_by": [2]}]}
+
+    def test_ticks_only_what_reached_release_and_keeps_user_text(self) -> None:
+        # 2026-11-19 #484：代码还没进 release-484 就手勾了 9 项。
+        TR.state_set(self.repo, TASK, "当前阶段", "页面改版开发中")
+        TR.progress(self.repo, TASK, ISSUE, self.steps)
+        text = self.issue.description
+        self.assertIn("- [x] 1. 接口接入（已在 release-47）", text)
+        self.assertIn("- [ ] 2. 页面改版　Blocked by 1", text)
+        self.assertIn("- [ ] 3. 桌面端移植　Blocked by 2", text)
+        self.assertIn("**现在**：页面改版开发中", text)
+        self.assertIn("**等你处理**：无", text)
+        self.assertIn("| frontend/web-v1 | release-47 | 接口接入 | 无 |", text)
+        self.assertTrue(text.rstrip().endswith("## 用户原文\n别动我"))
+        self.assertEqual(text.count(TR.AREA_OPEN), 1)
+        self.assertNotIn("手勾的步骤", text)
+
+    def test_state_change_refreshes_issue_without_restating_steps(self) -> None:
+        # 2026-11-19 #484：进展只记在 STATE 和评论里，正文 7 小时没变。
+        TR.progress(self.repo, TASK, ISSUE, self.steps)
+        TR.state_set(self.repo, TASK, "待用户事项", "请拍板续传时机 note_27074")
+        self.assertIn("**等你处理**：请拍板续传时机 note_27074", self.issue.description)
+        TR.state_set(self.repo, TASK, "最近用户通知", "note_1")
+        self.assertEqual(self.issue.puts, 2)
+
+    def test_long_lines_are_refused_before_anything_is_written(self) -> None:
+        TR.progress(self.repo, TASK, ISSUE, self.steps)
+        with self.assertRaises(TR.RecordError):
+            TR.state_set(self.repo, TASK, "当前阶段", "细" * (TR.NOW_LIMIT + 1))
+        with self.assertRaises(TR.RecordError):
+            TR.progress(self.repo, TASK, steps={"steps": [{"title": "长" * (TR.TITLE_LIMIT + 1)}]})
+        self.assertEqual(self.issue.puts, 1)
+
+    def test_missing_release_branch_means_nothing_ticked(self) -> None:
+        def no_branch(host: str, method: str, path: str, *fields: str) -> Any:
+            if "merge_base" in path:
+                raise TR._WR.WrapupError("glab api GET 失败：Could not find ref: release-47")
+            return self.issue(host, method, path, *fields)
+        with patch.object(TR._WR, "glab_api", no_branch):
+            TR.progress(self.repo, TASK, ISSUE, self.steps)
+        self.assertNotIn("[x]", self.issue.description)
+
+
 CARD = """## 给用户的摘要
 直达路径。
 

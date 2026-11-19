@@ -55,7 +55,7 @@
 - 正式任务附角色、完整 issue URL、spec/方案路径、阶段、worktree/分支/HEAD、唯一可写范围、验收条目、评审剩余轮数及交付路径。临时只读分析附问题原话、链接、证据位置和结尾格式。成员先读主入口与本角色/阶段指向的规则，不通读所有主题。
 - 评审另附 in-scope/out-of-scope、复核项、预算、停止条件，并要求终审先独立列严重项再读 precheck；缺范围契约不得派。用户可见结论的摘要/全文格式按 [communication.md](communication.md)「原文与材料」。
 - 开发首次派活的权限边界按 [implementation.md](implementation.md) §6 实现前检查点；不能用笼统“开发”跳过只写测试的阶段。
-- 成员的具体做法在 skill 里，派活只写本阶段要用的 skill 名，不复述其内容：test-writer 写用例、code-review 评用例用 `acceptance-test-cases`；dev 留证与 code-review 实现前核验用 `test-first-evidence`；code-review 代码评审与回改核验用 `scoped-code-review`；test 验收与冒烟用 `real-browser-acceptance`。
+- test 验收与冒烟只派验收目标与交付要求，不指定工具或 skill。其他角色派活只写本阶段要用的 skill 名，不复述其内容：test-writer 写用例、code-review 评用例用 `acceptance-test-cases`；dev 留证与 code-review 实现前核验用 `test-first-evidence`；code-review 代码评审与回改核验用 `scoped-code-review`。
 
 ### 等待与完成判定
 

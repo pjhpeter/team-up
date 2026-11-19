@@ -16,6 +16,8 @@ const INDEX_WRITE = /(>>?\s*["']?[^\s"'|;&]*\.hwf\/tmp\/INDEX\.md)|(\b(sed\s+-i|
 const ISSUE_NOTE = /\bglab\s+issue\s+(note|comment)\b/;
 const ISSUE_NOTES_API = /\bglab\s+api\b[^|;&]*\/issues\/[^/\s]+\/notes(?![\/\w])/;
 const API_WRITE = /(-X|--method)[=\s]+["']?POST|\s(-f|-F|--field|--raw-field)[=\s]/i;
+const BARE_WAIT = /\bherdr\s+agent\s+wait\s+(?!--help)\S/;
+const WAIT_REASON = "等成员不用 herdr agent wait（2026-11-19 #484：成员断网后 herdr 仍报 working，干等了约 2 小时没人发现）。改用：python3 ~/.hwf/scripts/member-wait.py <成员> [--until …] --repo <主仓库> --task <任务标识>，用 bash async: true 后台运行；它每次最多等 10 分钟，会看屏幕判断卡住，并自动更新 issue 正文。";
 
 // 返回拦截理由；不该拦返回 null。
 export function violation(toolName, input) {
@@ -24,6 +26,7 @@ export function violation(toolName, input) {
     if (command.includes("task-record.py") || command.includes("wrapup.py")) return null;
     if (INDEX_WRITE.test(command)) return indexReason();
     if (ISSUE_NOTE.test(command) || (ISSUE_NOTES_API.test(command) && API_WRITE.test(command))) return noteReason();
+    if (BARE_WAIT.test(command)) return WAIT_REASON;
     return null;
   }
   if (toolName === "write" || toolName === "edit") {

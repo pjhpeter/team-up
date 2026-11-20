@@ -9,12 +9,13 @@
     test-account.py claim --repo <主仓库> --task <任务标识> [--issue <编号>] --candidates <账号> [<账号>…]
         从候选里领一个没人占的账号，stdout 只输出账号。同一占用方再领时原样交回已领的账号（复测沿用）。
         候选全被占时退出码 3，stderr 列出占用方，不抢占。
-    test-account.py release --task <任务标识> [--issue <编号>]
-        释放该 issue 的账号；不带 --issue 释放整个任务的全部账号。
+    test-account.py release --task <任务标识> [--issue <编号>] [--account <账号> [<账号>…]]
+        传 --account 时只释放指定闲置账号（保留本任务仍在用的账号；误指他人账号时报错退出 1）；
+        不传 --account 时释放该 issue（或整个任务）的全部账号。
     test-account.py list
-        打印当前占用表（JSON）。
+        清理已收尾任务的残留占用后，打印当前占用表（JSON）。
 
-过期清理：每次 claim 时，占用方任务在其仓库 `.hwf/tmp/INDEX.md` 里已收尾（done/delivered/closed/cancelled）
+过期清理：每次 claim / list 时，占用方任务在其仓库 `.hwf/tmp/INDEX.md` 最后一行已收尾（done/delivered/closed/cancelled）
 的占用自动释放，防止忘记 release 的任务一直占着账号。INDEX 里找不到该任务时保留占用，宁可少一个可用账号，
 也不把在用的账号分给别人。
 
@@ -30,6 +31,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any, Iterator, Sequence
@@ -48,8 +50,23 @@ EXIT_ERROR = 1
 EXIT_ALL_BUSY = 3
 
 
+_ISSUE_URL_OR_HASH = re.compile(r"(?:^#?|/(?:issues|work_items)/)(\d+)/?(?:[#?].*)?$")
+
+
+def normalize_issue(raw: str | None) -> str | None:
+    """将 '#494' 或完整 issue/work_items URL 归一为纯编号 '494'，避免同单因写法不同拆成两份占用。"""
+    if raw is None:
+        return None
+    text = raw.strip().strip("`'\"")
+    if not text:
+        return None
+    m = _ISSUE_URL_OR_HASH.search(text)
+    return m.group(1) if m else text
+
+
 def holder_of(task: str, issue: str | None) -> str:
-    return f"{task}#{issue}" if issue else task
+    norm_issue = normalize_issue(issue)
+    return f"{task}#{norm_issue}" if norm_issue else task
 
 
 def normalize_account(raw: str) -> str:
@@ -61,10 +78,15 @@ def normalize_account(raw: str) -> str:
 
 
 def canonicalize_claims(raw_claims: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    """迁移占用表中历史遗留的带引号键；若同一账号出现多条记录，优先保留未收尾且最早占用的记录。"""
+    """迁移占用表中历史遗留的带引号键与 URL 形式的 issue；同一账号多条记录时优先保留未收尾且最早的记录。"""
     cleaned: dict[str, dict[str, Any]] = {}
-    for raw_key, entry in raw_claims.items():
+    for raw_key, raw_entry in raw_claims.items():
         acc = normalize_account(raw_key)
+        entry = dict(raw_entry)
+        norm_issue = normalize_issue(entry.get("issue"))
+        if "task" in entry:
+            entry["issue"] = norm_issue
+            entry["holder"] = holder_of(entry["task"], norm_issue)
         if acc not in cleaned:
             cleaned[acc] = entry
             continue
@@ -97,10 +119,8 @@ def claims_locked() -> Iterator[dict[str, dict[str, Any]]]:
 
 
 def task_closed(repo: str, task: str) -> bool:
-    for row in _FS.read_index(repo):
-        if row.task == task:
-            return not row.open
-    return False
+    matched = [row for row in _FS.read_index(repo) if row.task == task]
+    return bool(matched) and not matched[-1].open
 
 
 def drop_finished(claims: dict[str, dict[str, Any]]) -> list[str]:
@@ -111,7 +131,8 @@ def drop_finished(claims: dict[str, dict[str, Any]]) -> list[str]:
 
 
 def claim(repo: str, task: str, issue: str | None, candidates: Sequence[str]) -> str | None:
-    holder = holder_of(task, issue)
+    norm_issue = normalize_issue(issue)
+    holder = holder_of(task, norm_issue)
     normalized = list(dict.fromkeys(normalize_account(c) for c in candidates))
     with claims_locked() as claims:
         for acc in drop_finished(claims):
@@ -121,18 +142,43 @@ def claim(repo: str, task: str, issue: str | None, candidates: Sequence[str]) ->
                 return acc
         for acc in normalized:
             if acc not in claims:
-                claims[acc] = {"holder": holder, "task": task, "issue": issue,
+                others = [a for a, c in claims.items() if c.get("holder") == holder]
+                claims[acc] = {"holder": holder, "task": task, "issue": norm_issue,
                                "repo": str(Path(repo).resolve()), "at": int(time.time())}
+                if others:
+                    print(
+                        f"提示：{holder} 同时还持有 {', '.join(others)}；已不再并行使用的账号请立即运行 "
+                        f"test-account.py release --task {task}"
+                        + (f" --issue {norm_issue}" if norm_issue else "")
+                        + " --account <账号> 归还",
+                        file=sys.stderr,
+                    )
                 return acc
         for acc in normalized:
             print(f"{acc} 被占用：{claims[acc]['holder']}", file=sys.stderr)
         return None
 
 
-def release(task: str, issue: str | None) -> list[str]:
+def release(task: str, issue: str | None, accounts: Sequence[str] | None = None) -> list[str]:
+    norm_issue = normalize_issue(issue)
+    targets = list(dict.fromkeys(normalize_account(a) for a in accounts)) if accounts else None
     with claims_locked() as claims:
-        freed = [acc for acc, c in claims.items()
-                 if c.get("task") == task and (issue is None or c.get("issue") == issue)]
+        if targets is not None:
+            conflicts = [
+                f"{acc}（当前归属 {claims[acc]['holder']}）"
+                for acc in targets
+                if acc in claims
+                and (
+                    claims[acc].get("task") != task
+                    or (norm_issue is not None and claims[acc].get("issue") != norm_issue)
+                )
+            ]
+            if conflicts:
+                raise RuntimeError(f"不能释放非本任务持有的账号：{', '.join(conflicts)}")
+            freed = [acc for acc in targets if acc in claims]
+        else:
+            freed = [acc for acc, c in claims.items()
+                     if c.get("task") == task and (norm_issue is None or c.get("issue") == norm_issue)]
         for acc in freed:
             del claims[acc]
     return freed
@@ -149,6 +195,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     p_release = sub.add_parser("release")
     p_release.add_argument("--task", required=True)
     p_release.add_argument("--issue")
+    p_release.add_argument(
+        "--account", "--accounts", dest="accounts", action="extend", nargs="+",
+        help="只释放指定闲置账号，保留本任务仍在用的其他账号",
+    )
     sub.add_parser("list")
     opts = parser.parse_args(argv)
     try:
@@ -159,10 +209,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return EXIT_ALL_BUSY
             print(account)
         elif opts.cmd == "release":
-            freed = release(opts.task, opts.issue)
+            freed = release(opts.task, opts.issue, opts.accounts)
             print(json.dumps({"released": freed}, ensure_ascii=False))
         else:
             with claims_locked() as claims:
+                drop_finished(claims)
                 print(json.dumps(claims, ensure_ascii=False, indent=2))
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)

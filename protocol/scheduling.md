@@ -92,8 +92,8 @@
 - 一个调度者同一时间只负责一个交付，入口只复用无未收尾任务且无未关闭发起 issue 的空闲调度者。误投时用 `task-record.py index-add --queued` 登记新需求（调度者列空），来源 issue 说明，不抢占当前交付。
 - INDEX 只改本任务行，转交由新调度者追加自己的行，最后一行代表负责人；收尾状态前缀为 done/delivered/closed/cancelled。主工作树仅放 `.hwf/tmp` 记录，代码在独立 worktree。共同文件/IndexedDB 库升级冲突由后到任务在 issue @用户说明。
 - 按 Blocked by 推进；并行前落盘各分支/worktree/唯一写入范围/合并顺序。同一 worktree 或同一文件同时一名写者，共享文件归一个任务或串行，不靠并行跳依赖；各评审测试对应各自已审版本。
-- 测试独占服务见 [review-testing.md](review-testing.md) §8。派 test/冒烟前用 `scripts/test-account.py claim --repo <主仓库> --task <任务> --issue <编号> --candidates <账号…>` 统一领取账号，候选按项目账号文件的国内/国际顺序；写入派活与 STATE，test 不自行换号。相同 issue 复测沿用。
-- 退出码 3 表示全被占：排队、不借用抢占，继续其他工作；成员回报或至多 30 分钟后再领取，STATE 写等待原因。测试与冒烟全部结束且 issue 关闭/登记不上线时按 issue release，交付收尾前按 task release 全部；已收尾任务漏释放由下次领取回收。被挤下线先暂停回报，用 list 查占用，不抢回账号。
+- 测试独占服务见 [review-testing.md](review-testing.md) §8。派 test/冒烟前用 `scripts/test-account.py claim --repo <主仓库> --task <任务> --issue <编号> --candidates <账号…>` 统一领取账号，候选按项目账号文件的国内/国际顺序；写入派活与 STATE，test 不自行换号。相同 issue 默认只占 1 个账号复测沿用；只有当前步骤确需双席位协作/权限对照时才临时加领第 2 个，且双席位步骤结束、换号或用户指定停用某账号时，必须当场用 `test-account.py release --task <任务> --issue <编号> --account <账号…>` 单独归还闲置账号，不得一直锁到整单结束。
+- 退出码 3 表示全被占：排队、不借用抢占，继续其他工作；成员回报或至多 30 分钟后再领取，STATE 写等待原因。其他任务来协调闲置账号时，核对本任务当前实际在用账号后立即用 `--account` 释放未在用的账号。测试与冒烟全部结束且 issue 关闭/登记不上线时按 issue release，交付收尾前按 task release 全部；已收尾任务漏释放由下次 list/claim 自动回收。被挤下线先暂停回报，用 list 查占用，不抢回账号。
 
 ### 前后端并行开发
 

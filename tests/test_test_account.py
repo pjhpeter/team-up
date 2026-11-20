@@ -97,6 +97,51 @@ class AccountTest(unittest.TestCase):
         self.assertEqual(list(saved.keys()), ["bootingai-180c870"])
         self.assertEqual(saved["bootingai-180c870"]["holder"], "t1#1")
 
+    def test_release_single_account_keeps_active_account_and_rejects_foreign_holder(self) -> None:
+        # 同一任务领了两个账号后，可只归还闲置的 b，保留正在用的 a；误传他人持有的账号时报错不误放。
+        self.assertEqual(self.claim("t1", "1", candidates=("a",)), "a")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.claim("t1", "1", candidates=("b",)), "b")
+        self.assertIn("同时还持有 a", err.getvalue())
+        self.assertEqual(self.claim("t2", "2", candidates=("c",)), "c")
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = TA.main(["release", "--task", "t1", "--issue", "1", "--account", "`b`"])
+        self.assertEqual(code, TA.EXIT_OK)
+        self.assertEqual(json.loads(out.getvalue()), {"released": ["b"]})
+        saved = json.loads(TA.CLAIMS_PATH.read_text())
+        self.assertEqual(saved["a"]["holder"], "t1#1")
+        self.assertNotIn("b", saved)
+
+        err2 = io.StringIO()
+        with contextlib.redirect_stderr(err2):
+            bad = TA.main(["release", "--task", "t1", "--issue", "1", "--account", "c"])
+        self.assertEqual(bad, TA.EXIT_ERROR)
+        self.assertIn("t2#2", err2.getvalue())
+        self.assertEqual(json.loads(TA.CLAIMS_PATH.read_text())["c"]["holder"], "t2#2")
+
+    def test_list_cleans_finished_and_uses_last_index_row_on_handover(self) -> None:
+        self.assertEqual(self.claim("t1", "1", candidates=("a",)), "a")
+        self.assertEqual(self.claim("t2", "2", candidates=("b",)), "b")
+        # t1 旧行 cancelled、新行接续 in-progress：以最后一行负责人状态为准，不能当已收尾误释放；t2 已 done 则在 list 时自动释放。
+        self.write_index([("t1", "cancelled"), ("t1", "in-progress"), ("t2", "done")])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(TA.main(["list"]), TA.EXIT_OK)
+        listed = json.loads(out.getvalue())
+        self.assertEqual(list(listed.keys()), ["a"])
+
+    def test_issue_url_and_hash_normalize_to_same_holder(self) -> None:
+        # 调度者有时传 --issue 494、有时传完整 issue URL 或 #494，必须归一为同一 holder。
+        self.assertEqual(
+            self.claim("t1", "https://git.bootingai.net/frontend/web-v1/-/issues/494", candidates=("a", "b")),
+            "a",
+        )
+        self.assertEqual(self.claim("t1", "#494", candidates=("a", "b")), "a")
+        self.assertEqual(TA.release("t1", "494", ["a"]), ["a"])
+
 
 if __name__ == "__main__":
     unittest.main()

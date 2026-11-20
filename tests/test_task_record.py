@@ -278,6 +278,10 @@ class CardCheckTests(unittest.TestCase):
     def test_complete_card_passes(self) -> None:
         self.assertEqual(TR.card_check(CARD), [])
 
+    def test_minimal_path_card_passes(self) -> None:
+        minimal = CARD.replace("复杂度判定：直达路径", "复杂度判定：极简路径\n先出方案：不要\n防风险：不要")
+        self.assertEqual(TR.card_check(minimal), [])
+
     def test_acceptance_without_evidence_is_reported_by_number(self) -> None:
         problems = TR.card_check(CARD.replace(" ｜ 证据：该宽度下的页面截图", ""))
         self.assertEqual(len(problems), 1)

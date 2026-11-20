@@ -6,15 +6,19 @@
 
 ## debug 模式
 
-仅用户在本次需求、发起 issue 描述或评论明确要求「debug 模式」「修bug」「改bug」「极简模式」，或 `/go debug`、`/go 修bug`、`/go 改bug`、`/go 极简`、`/go minimal` 时启用（bug 前后空格不影响识别）。用户原话与来源（会话或 note 链接）记 STATE、INDEX。scheduler、成员和收件箱不得因任务简单自行启用；arch 判两个开关都不要不等于 debug。
+启用条件仅限以下两类：
+1. **用户明确指定**：用户在本次需求、发起 issue 描述或评论明确要求「debug 模式」「修bug」「改bug」「极简模式」，或 `/go debug`、`/go 修bug`、`/go 改bug`、`/go 极简`、`/go minimal`（bug 前后空格不影响识别），直接跳过 `planning.md` §0 进入本节；
+2. **源码核对命中极简路径**：用户已授权开工（或在途交付收到用户明确追加的局部小改动），经 `planning.md` §0 核对满足「极简路径」全部客观条件（纯本组件/页面展示、文案、显隐或样式微调，改动生产文件 ≤3 个，`先出方案 = 不要`、`防风险 = 不要`，无歧义，具备测试分支与默认 `smoke` 地址）。
 
-交付顺序：本地单元测试先行与实现前核验 → dev 实现 → MR 合 develop 并等待部署 → test 在测试环境真实自动化验收 → 创建指向 `release-<根编号>` 的 MR 交用户。只取消本地端到端验收，不取消单测与实现前核验。
+触发来源（用户原话链接，或 §0 `极简路径` 判定文件与 `card-check` 记录）记入 STATE、INDEX。未经用户明确指定、也未经 §0 源码核对命中极简条件时，scheduler、成员和收件箱不得仅凭字面“看起来简单”自行启用；一般业务逻辑改动即使两个开关都为「不要」，超过极简条件仍走直达路径。
 
-1. scheduler 读 issue/需求，按 `delivery.md`「根 issue 汇总分支」创建或复用 release，从它切干净开发分支、建独立 worktree、明确可写范围；按 `scheduling.md`「初始化」与 `worktrees.md`「创建与登记」执行。不派 arch、不判复杂度。先读取项目 `docs/agents/herdr-project.yaml` 的 `branches.test` 与 `smoke`；缺测试分支或可用地址即明确阻塞，不猜地址、不以本地验收代替。
+交付顺序：本地单元测试先行与实现前核验 → dev 实现 → MR 合 develop 并等待部署 → test 在默认测试环境真实自动化验收 → 创建指向 `release-<根编号>` 的 MR 交用户（在途正常交付的追加极简小改动在验收通过后按 `delivery.md` 汇入既有 `release-<根编号>` 并跑 `release-check`）。只取消本地端到端验收、独立用例阶段与 §7 整项评审，不取消单测与实现前核验。
+
+1. scheduler 读 issue/需求（§0 转入时一并附理解卡与验收条件），按 `delivery.md`「根 issue 汇总分支」创建或复用 release，从它切干净开发分支、建独立 worktree、明确可写范围；按 `scheduling.md`「初始化」与 `worktrees.md`「创建与登记」执行。用户明确指定时不派 arch、不判复杂度。先读取项目 `docs/agents/herdr-project.yaml` 的 `branches.test` 与默认 `smoke` 地址（`default` 不为 `false`）；缺测试分支或可用默认地址即明确阻塞，不猜地址、不以本地验收代替。
 2. 按普通流程的仓库职责领取新会话开发者：只改前端用 `dev-fe`，只改后端用 `dev-be`，不分端仓库用 `dev`；两端都改分别领取，模型与普通流程一致。仍按 §6 先写并运行定向单测，独立 code-review 完成实现前窄范围核验后才实现；跑相关单测、lint、type-check，不跑全量，不启动本地 Web 服务或开发版 Electron 做端到端验收。提交、push 干净开发分支。
 3. scheduler 创建开发分支 → develop（项目 `branches.test`）的 MR，核对源 SHA、diff、无冲突及合并检查实际通过后即时合并；本模式启动授权包含此次测试环境 MR 合并，不含 release/main 合并，不设置自动合并。等待对应流水线部署作业成功，记录 MR、源 SHA、部署 SHA、作业链接；前后端都改须相关部署全部成功。
-4. test 新会话按 `review-testing.md` §8「debug：部署后验收」到项目 `smoke` 地址逐条执行 issue 验收并留真实截图；涉及桌面原生能力另用包含本次改动、连接 develop 的测试客户端验证。不从本地启动开发服务验收。测试失败交 dev，受影响切片重做 §6 相关单测、实现前核验和修复，再合 develop、等待新部署、派 test 复测；不增加整项代码评审或 arch 终审。
-5. 全部验收通过后，scheduler 用 `glab mr create` 创建干净开发分支 → `release-<根编号>` 的 MR。中文描述写关联 issue、改动、本地单测及核验、develop MR/成功部署/逐条验收证据、未验证项，注明「debug 模式：未经整项代码评审；已完成 develop 部署后自动化验收」。回读目标、源 SHA、diff，确认本需求代码与测试版本一致；只创建，不合 release/main、不关 issue。
+4. test 新会话按 `review-testing.md` §8「debug：部署后验收」到项目默认 `smoke` 地址（`default: false` 的站点在用户未点名且未改其独有逻辑时不测）逐条执行验收并留真实截图；涉及桌面原生能力另用包含本次改动、连接 develop 的测试客户端验证。不从本地启动开发服务验收。测试失败交 dev，受影响切片重做 §6 相关单测、实现前核验和修复，再合 develop、等待新部署、派 test 复测；不增加整项代码评审或 arch 终审。
+5. 全部验收通过后：独立根任务由 scheduler 用 `glab mr create` 创建干净开发分支 → `release-<根编号>` 的 MR，中文描述写关联 issue、改动、本地单测及核验、develop MR/成功部署/逐条验收证据、未验证项，注明「debug/极简模式：未经整项代码评审；已完成 develop 部署后自动化验收」，回读目标、源 SHA、diff，只创建，不合 release/main、不关 issue；在途正常交付中的追加极简小改动则按 `delivery.md`「合并顺序与版本一致性」合入既有 `release-<根编号>` 并用 `release-check` 核对同源与 `develop` 文件一致，仍不自行合 main。
 6. 有发起 issue 则评论 release MR 链接；评论、会话回复和 ntfy 第一行均放该 MR 链接，附测试环境证据。按 `delivery.md` §9「集中收尾与回执」仅清理本任务本机进程，保留待用户合并的代码与证据，由收尾脚本将 INDEX 记为 `done（debug 模式：develop 验收通过，release MR 待用户处理）`；通知按 `communication.md`，不执行 §9.1。
 
 develop 冲突时按 `delivery.md`「测试分支冲突与指定目标」从最新测试分支建独立集成分支，只集成本需求提交；debug 不要求整项代码评审或 arch 放行。集成分支只供测试，绝不回流干净开发分支或 release/main。核对本需求文件与干净开发分支一致；冲突处理中必要的功能改动必须回干净开发分支，重做相关单测与核验后重新集成、部署、复测，不能只修集成副本再交旧代码。

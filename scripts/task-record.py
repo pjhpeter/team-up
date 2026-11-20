@@ -27,7 +27,7 @@ todo（要用户处理或授权）必须用 --will 写明用户同意后本账�
 
 退出码：0 成功；1 失败；2 参数错误；3 按规则没发（免打扰拦下、重复、自查不通过）。
 
-card-check：按 ~/.hwf/protocol/planning.md §0 核对 arch 判定里的「需求理解卡」（现状带 file:line、历史与坑不为空、验收条件每条写了证据）。
+card-check：按 ~/.hwf/protocol/planning.md §0 核对 arch 判定里的「需求理解卡」（现状带 file:line、历史与坑不为空、验收条件每条写了证据、验收前提不为空）。
 2026-11-15 用户同意：编码前对项目了解不够、验收太粗；只写进协议的要求聊几句就忘，所以由脚本拦。缺项时退出码 3。
 
 progress：根 issue 描述顶部的「进度」维护区只由它写。2026-11-19 #484：进度区手写了 7 小时没更新，代码还没进
@@ -263,7 +263,7 @@ def preflight(wills: Sequence[str]) -> list[tuple[str, str]]:
 # ---------- 需求理解卡 ----------
 
 CARD_FIELDS = ("复杂度判定", "先出方案", "防风险", "理由", "依据", "现状", "历史与坑", "验收条件",
-               "关键决定", "接口约定", "待澄清问题")
+               "验收前提", "关键决定", "接口约定", "待澄清问题")
 FIELD_LINE = re.compile(rf"^[#>*\s]*({'|'.join(CARD_FIELDS)})\**\s*(?:[:：]\s*\**\s*(.*))?$")
 FILE_LINE = re.compile(r"[\w./-]+\.\w+:\d+")
 ITEM = re.compile(r"^(?:[-*]|\d+[.、)])\s+")
@@ -305,6 +305,8 @@ def card_check(text: str) -> list[str]:
     for number, item in enumerate(items, 1):
         if not EVIDENCE.search(item):
             problems.append(f"验收条件第 {number} 条没写「证据：<怎么证明>」：{item.splitlines()[0][:60]}")
+    if not sections.get("验收前提"):
+        problems.append("「验收前提」缺失或是空的（都不需要也要写「无特殊前提」）")
     return problems
 
 
@@ -484,7 +486,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if problems:
                 return EXIT_HELD
             print("需求理解卡齐全，验收条件：")
-            print(card_sections(Path(opts.file).read_text(encoding="utf-8"))["验收条件"])
+            sections = card_sections(Path(opts.file).read_text(encoding="utf-8"))
+            print(sections["验收条件"])
+            print("验收前提：")
+            print(sections["验收前提"])
         else:
             results = preflight(opts.will)
             for verdict, text in results:

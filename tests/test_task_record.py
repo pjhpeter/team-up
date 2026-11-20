@@ -268,6 +268,8 @@ CARD = """## 给用户的摘要
 2. 保存失败时出现重试按钮
    ｜ **证据：** 断网后点击保存的截图
 
+验收前提：无特殊前提
+
 关键决定：无
 """
 
@@ -283,7 +285,12 @@ class CardCheckTests(unittest.TestCase):
 
     def test_old_style_verdict_without_card_is_held(self) -> None:
         old = "复杂度判定：直达路径\n理由：小改动\n依据：src/a.ts:3\n关键决定：无\n"
-        self.assertEqual(len(TR.card_check(old)), 3)
+        self.assertEqual(len(TR.card_check(old)), 4)
+
+    def test_acceptance_prerequisites_must_be_written(self) -> None:
+        problems = TR.card_check(CARD.replace("验收前提：无特殊前提\n", ""))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("验收前提", problems[0])
 
     def test_status_quo_needs_file_line(self) -> None:
         problems = TR.card_check(CARD.replace("src/views/Foo.vue:12", "Foo 页面").replace("（src/composables/useBar.ts:40）", ""))

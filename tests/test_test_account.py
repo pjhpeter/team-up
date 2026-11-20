@@ -83,6 +83,20 @@ class AccountTest(unittest.TestCase):
         self.assertEqual(code, TA.EXIT_ERROR)
         self.assertEqual(TA.CLAIMS_PATH.read_text(), "{broken")
 
+    def test_backtick_or_quoted_candidates_share_same_lock_and_migrate_legacy(self) -> None:
+        # 2026-11-19 #484/#494：Markdown 反引号带入候选参数导致 "`bootingai-180c870`" 绕过互斥锁。
+        self.assertEqual(self.claim("t1", "1", candidates=("`bootingai-180c870`",)), "bootingai-180c870")
+        self.assertIsNone(self.claim("t2", "2", candidates=("bootingai-180c870", "'bootingai-180c870'")))
+        # 历史文件中同时存在裸键和反引号键时，读取时合并并保留更早的在途占用方。
+        TA.CLAIMS_PATH.write_text(json.dumps({
+            "bootingai-180c870": {"holder": "t1#1", "task": "t1", "issue": "1", "repo": str(self.repo), "at": 100},
+            "`bootingai-180c870`": {"holder": "t2#2", "task": "t2", "issue": "2", "repo": str(self.repo), "at": 200},
+        }), encoding="utf-8")
+        self.assertEqual(self.claim("t1", "1", candidates=("`bootingai-180c870`",)), "bootingai-180c870")
+        saved = json.loads(TA.CLAIMS_PATH.read_text())
+        self.assertEqual(list(saved.keys()), ["bootingai-180c870"])
+        self.assertEqual(saved["bootingai-180c870"]["holder"], "t1#1")
+
 
 if __name__ == "__main__":
     unittest.main()

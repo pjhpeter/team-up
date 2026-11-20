@@ -331,23 +331,54 @@ def list_worktrees(repo: str) -> list[tuple[str, str, Optional[str], bool]]:
     return found
 
 
-def task_worktrees(task: str) -> list[Worktree]:
-    """统一位置 <worktree 根>/<仓库>/<任务标识>-<用途>/，加上嵌在里面的（例如存证用的基线 worktree）。
+def _belongs_to_repo_tree(wt_repo: str, main_repo: Optional[str]) -> bool:
+    if not main_repo:
+        return False
+    real_wt = os.path.realpath(wt_repo)
+    real_main = os.path.realpath(main_repo)
+    return real_wt == real_main or real_wt.startswith(real_main + os.sep)
 
-    按目录找，不要求调用方列出仓库：一个交付可能同时改前端和后端两个仓库。
+
+def task_worktrees(task: str, main_repo: Optional[str] = None, iid: Optional[str] = None) -> list[Worktree]:
+    """查找本任务的工作树：
+    1. `<worktree 根>/<仓库>/<任务标识>` 及 `<任务标识>-<用途>`（精确边界，不误匹配 proj-470）；
+    2. 归属主仓库或其子目录后端仓库的 `issue-<编号>` / `issue-<编号>-<用途>`；
+    3. 嵌套在上述目录内的子 worktree（如基线存证目录）。
     """
-    tops = sorted(os.path.realpath(p) for p in worktree_root().glob(f"*/{task}-*") if p.is_dir())
-    found: dict[str, Worktree] = {}
-    for top in tops:
+    root = worktree_root()
+    task_candidates: list[tuple[str, bool]] = []
+    if root.is_dir():
+        for repo_dir in sorted(root.iterdir()):
+            if not repo_dir.is_dir():
+                continue
+            for sub in sorted(repo_dir.iterdir()):
+                if not sub.is_dir():
+                    continue
+                name = sub.name
+                if name == task or name.startswith(f"{task}-"):
+                    task_candidates.append((os.path.realpath(sub), False))
+                elif iid and (name == f"issue-{iid}" or name.startswith(f"issue-{iid}-")):
+                    task_candidates.append((os.path.realpath(sub), True))
+
+    accepted_tops: list[str] = []
+    entries_by_top: list[tuple[str, str, list[tuple[str, str, Optional[str], bool]]]] = []
+    for top, require_repo_match in task_candidates:
         try:
             entries = list_worktrees(top)
         except WrapupError as error:
             print(f"跳过不是 git worktree 的目录 {top}：{error}")
             continue
-        repo = entries[0][0]  # git worktree list 第一项总是主工作树
+        wt_repo = entries[0][0]  # git worktree list 第一项总是主工作树
+        if require_repo_match and not _belongs_to_repo_tree(wt_repo, main_repo):
+            continue
+        accepted_tops.append(top)
+        entries_by_top.append((top, wt_repo, entries))
+
+    found: dict[str, Worktree] = {}
+    for _, wt_repo, entries in entries_by_top:
         for path, head, branch, bare in entries:
-            if path not in found and any(path == t or path.startswith(t + os.sep) for t in tops):
-                found[path] = Worktree(repo, path, branch, head, bare=bare)
+            if path not in found and any(path == t or path.startswith(t + os.sep) for t in accepted_tops):
+                found[path] = Worktree(wt_repo, path, branch, head, bare=bare)
     picked = list(found.values())
     # 先删里层：外层 worktree remove 会连带删掉目录，里层的 git 登记就成了悬空记录
     picked.sort(key=lambda w: w.path.count(os.sep), reverse=True)
@@ -546,7 +577,7 @@ def wrapup(opts: argparse.Namespace) -> int:
     problems: list[str] = []
     requester = check_close_request(issue, opts.close_request) if opts.close_request else ""
 
-    worktrees = task_worktrees(opts.task)
+    worktrees = task_worktrees(opts.task, repo, issue.iid)
     paths = [wt.path for wt in worktrees if not wt.bare]
     print(f"{tag}本任务 worktree：{', '.join(paths) or '无'}")
 
@@ -562,14 +593,20 @@ def wrapup(opts: argparse.Namespace) -> int:
     skip |= {str(a.get("pane_id")) for a in agents if a.get("name") == scheduler}
     registry = _MS.read_registry()
     selection_problems: list[str] = []
+    initial_panes = herdr("pane", "list")["result"]["panes"]
     picked = pick_members(scheduler, issue.iid, bool(siblings), agents, registry, skip,
-                          herdr("pane", "list")["result"]["panes"], selection_problems)
+                          initial_panes, selection_problems)
     members = close_members(picked, opts.dry_run)
     members.problems.extend(selection_problems)
     if not opts.dry_run:
+        post_agents = herdr("agent", "list")["result"]["agents"]
+        post_panes = herdr("pane", "list")["result"]["panes"]
+        alive_ids = {str(p.get("pane_id")) for p in post_panes} | {str(a.get("pane_id")) for a in post_agents}
+        dead_registered = [pid for pid in _MS.read_registry() if pid not in alive_ids]
+        forget(dead_registered)
         remaining = pick_members(scheduler, issue.iid, bool(siblings),
-                                 herdr("agent", "list")["result"]["agents"], _MS.read_registry(), skip,
-                                 herdr("pane", "list")["result"]["panes"], members.problems)
+                                 post_agents, _MS.read_registry(), skip,
+                                 post_panes, members.problems)
         for member in remaining:
             if not any(member["pane_id"] in kept for kept in members.kept):
                 members.problems.append(f"{member['pane_id']}：团队登记复核发现残留成员")

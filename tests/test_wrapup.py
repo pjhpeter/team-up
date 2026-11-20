@@ -423,6 +423,30 @@ class WrapupTest(Case):
         self.assertIn("回读内容不一致", out)
         self.assertEqual(self.index_status(), "in-progress（开发中）")
 
+    def test_matches_exact_task_dir_and_scoped_issue_dir_and_cleans_dead_registry(self) -> None:
+        self.registry({"w1:pGONE": SCHED, "w1:pE": "delivery-scheduler-w1-px"})
+        exact = self.git.add(f"{self.wt}/{TASK}", branch="fix/47", **{"in": {"origin/main"}})
+        issue_wt = self.git.add(f"{self.wt}/issue-47-be", branch="fix/47-be", **{"in": {"origin/main"}})
+        not_this_issue = self.git.add(f"{self.wt}/issue-470-be", branch="fix/470", **{"in": {"origin/main"}})
+        # 另一个独立仓库下的同名 issue-47-* 不得被误删。
+        other_repo = str(Path(self.repo).parent / "unrelated-repo")
+        other_git = FakeGit(other_repo)
+        foreign_wt = other_git.add(f"{Path(self.wt).parent}/unrelated-repo/issue-47-other", **{"in": {"origin/main"}})
+
+        def mux_git(path: str, *args: str) -> subprocess.CompletedProcess[str]:
+            if path.startswith(other_repo) or "unrelated-repo" in path:
+                return other_git(path, *args)
+            return self.git(path, *args)
+
+        herdr = FakeHerdr([agent(SCHED, "w1:pS"), agent("i48-dev", "w1:pE")])
+        with patch.object(WR, "git", mux_git):
+            code, out = self.run_wrapup(herdr)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(self.git.removed), sorted([exact, issue_wt]))
+        self.assertIn(not_this_issue, self.git.trees)
+        self.assertIn(foreign_wt, other_git.trees)
+        self.assertEqual(set(json.loads((self.state / "members.json").read_text())), {"w1:pE"})
+
 
 if __name__ == "__main__":
     unittest.main()

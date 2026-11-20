@@ -1,11 +1,11 @@
 // Herdr 交付调度者「派活必挂等待」守卫（~/.hwf/PROTOCOL.md「派活、等待与结果收取」的机制兜底）。
 //
-// 问题：调度者派活（herdr agent prompt）后常常忘了挂后台 herdr agent wait 就结束回合，
+// 问题：调度者派活（herdr agent prompt）后常常忘了挂后台 member-wait.py 就结束回合，
 // 或成员 blocked 通知用户后不再等待；成员干完/用户处理完都没人知道，要用户来催。
 // 做法：在 omp 准备结束回合（session_stop）时，从会话日志算出「本会话派过活的成员」与
-// 「仍在运行的后台等待」，再用 herdr agent list 查成员实时状态；
-// 有成员 working/blocked 却没有后台等待覆盖时，拦下结束并要求先补挂等待。
-// 只对登记名以 delivery-scheduler- 开头的 pane 生效；同一组未覆盖成员最多拦 MAX_BLOCKS 次，防止死循环。
+// 「仍在运行的后台等待」，再用 herdr agent list 与 state/members.json 查成员实时状态与归属；
+// 有属于本调度者的成员 working/blocked 却没有后台等待覆盖时，拦下结束并要求先补挂等待。
+// 只对登记名以 delivery-scheduler- 开头的 pane 生效；其他调度者与登记在别的调度者名下的成员一律跳过。
 // @ts-nocheck
 
 import { execFile } from "node:child_process";
@@ -14,7 +14,9 @@ import os from "node:os";
 import path from "node:path";
 
 const MAX_BLOCKS = 2;
-const LOG_FILE = path.join(os.homedir(), ".hwf", "state", "watch-guard.log");
+const STATE_DIR = process.env.HWF_STATE_DIR || path.join(os.homedir(), ".hwf", "state");
+const LOG_FILE = path.join(STATE_DIR, "watch-guard.log");
+const MEMBERS_FILE = path.join(STATE_DIR, "members.json");
 const SCHEDULER_PREFIX = "delivery-scheduler-";
 
 // 去掉 shell 引号；变量形式（$NAME）无法静态解析，返回 null。
@@ -54,7 +56,9 @@ export function analyzeSession(jsonl) {
         const command = bashCommand(part);
         for (const m of command.matchAll(/herdr agent prompt\s+((?:--?\S+\s+)*)(\S+)/g)) {
           const target = cleanTarget(m[2]);
-          if (target && target !== "--help") prompted.add(target);
+          if (target && target !== "--help" && !target.startsWith(SCHEDULER_PREFIX)) {
+            prompted.add(target);
+          }
         }
         // 2026-11-19 #484 起只用 member-wait.py 等成员；旧的 herdr agent wait 仍算覆盖，记录守卫会另行拦下。
         const waits = [...command.matchAll(/(?:herdr agent wait|member-wait\.py)\s+([^\s;|&)]+)/g)]
@@ -75,15 +79,23 @@ export function analyzeSession(jsonl) {
   return { prompted, watched };
 }
 
-// 结合实时状态，找出 working/blocked 但没有后台等待覆盖的成员。
-export function findUnwatched({ prompted, watched }, agents, selfPane) {
+// 结合实时状态与成员登记簿，找出属于本调度者且 working/blocked 但没有后台等待覆盖的成员。
+export function findUnwatched({ prompted, watched }, agents, selfPane, registry = {}, selfScheduler = "") {
   if (watched.has("*")) return [];
+  const selfName = selfScheduler || agents.find((a) => a.pane_id === selfPane)?.name || "";
+  const seenPanes = new Set();
   const result = [];
   for (const target of prompted) {
+    if (String(target).startsWith(SCHEDULER_PREFIX)) continue;
     const agent = agents.find((a) => a.name === target || a.pane_id === target);
-    if (!agent || agent.pane_id === selfPane) continue;
+    if (!agent || agent.pane_id === selfPane || seenPanes.has(agent.pane_id)) continue;
+    // 调度者之间互相同步消息时不挂 member-wait，避免两个并行调度者互相拦截。
+    if (String(agent.name ?? "").startsWith(SCHEDULER_PREFIX)) continue;
+    const owner = registry?.[agent.pane_id]?.scheduler;
+    if (owner && selfName && owner !== selfName) continue;
     if (agent.agent_status !== "working" && agent.agent_status !== "blocked") continue;
     if (watched.has(target) || watched.has(agent.name) || watched.has(agent.pane_id)) continue;
+    seenPanes.add(agent.pane_id);
     result.push({ name: agent.name ?? target, pane: agent.pane_id, status: agent.agent_status });
   }
   return result;
@@ -107,6 +119,15 @@ function log(line) {
   try {
     appendFileSync(LOG_FILE, `${new Date().toISOString()} ${line}\n`);
   } catch {}
+}
+
+function readRegistry() {
+  try {
+    const parsed = JSON.parse(readFileSync(MEMBERS_FILE, "utf8"));
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 function listAgents() {
@@ -143,7 +164,7 @@ export default function (pi) {
     } catch {
       return;
     }
-    const unwatched = findUnwatched(analyzeSession(jsonl), agents, selfPane);
+    const unwatched = findUnwatched(analyzeSession(jsonl), agents, selfPane, readRegistry(), self.name);
     if (unwatched.length === 0) {
       lastSignature = "";
       blocksForSignature = 0;
@@ -154,10 +175,10 @@ export default function (pi) {
     blocksForSignature = signature === lastSignature ? blocksForSignature + 1 : 1;
     lastSignature = signature;
     if (blocksForSignature > MAX_BLOCKS) {
-      log(`${self.name} 放行（同一组已拦 ${MAX_BLOCKS} 次）: ${signature}`);
+      log(`${self.name} allow session_stop after ${MAX_BLOCKS} blocks: ${signature}`);
       return;
     }
-    log(`${self.name} 拦下结束回合 #${blocksForSignature}: ${signature}`);
+    log(`${self.name} block session_stop #${blocksForSignature}: ${signature}`);
     return { decision: "block", reason: buildReason(unwatched) };
   });
 }

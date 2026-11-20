@@ -76,6 +76,12 @@ class FakeHerdr:
             return {"result": {"agent": next(a for a in self.agents if a["name"] == args[2])}}
         if cmd == ("pane", "get"):
             return {"result": {"pane": {"pane_id": args[2], "cwd": self.cwd.get(args[2], self.default_cwd)}}}
+        if cmd == ("pane", "list"):
+            return {"result": {"panes": [{"pane_id": a["pane_id"], "workspace_id": a.get("workspace_id", "w1")}
+                                         for a in self.agents]}}
+        if cmd == ("pane", "close"):
+            self.agents = [a for a in self.agents if a["pane_id"] != args[2]]
+            return {}
         if cmd == ("pane", "process-info"):
             argv = self.argv.get(args[3], ["claude", "--model", "jc-gpt/gpt-6.1-sol"])
             return {"result": {"process_info": {"foreground_processes": [{"argv": argv}]}}}
@@ -260,6 +266,25 @@ class ClaimTest(Case):
         fake = FakeHerdr([agent("delivery-dev-w1-ps", "w1:pS", kind="omp")])
         with self.assertRaisesRegex(MS.ClaimError, "调度者"):
             self.run_claim(fake)
+
+    def test_prunes_extra_unexcluded_idle_duplicates_and_dead_registry_panes(self) -> None:
+        # 2026-11-20 #494：未及时 member-release 导致 i494-dev-fe..12 堆积；下次领取同角色时自动回收多余空闲副本。
+        MS.record({"pane_id": "w1:pDEAD", "tab_id": "w1:t1"}, SCHED["name"], "dev")
+        MS.record({"pane_id": "w1:pD2", "tab_id": "w1:t1"}, SCHED["name"], "dev")
+        MS.record({"pane_id": "w1:pD3", "tab_id": "w1:t1"}, SCHED["name"], "dev")
+        fake = FakeHerdr([
+            SCHED,
+            agent("i453-dev-3", "w1:pD3", kind="omp", status="done"),
+            agent("i453-dev", "w1:pD1", kind="omp", status="idle"),
+            agent("i453-dev-2", "w1:pD2", kind="omp", status="done"),
+            agent("i453-dev-4", "w1:pD4", kind="omp", status="idle"),
+        ])
+        out = self.run_claim(fake, "dev", exclude=["i453-dev-4"])
+        self.assertEqual((out["action"], out["name"], out["pane_id"]), ("restarted", "i453-dev", "w1:pD1"))
+        self.assertEqual(out["pruned_idle"], ["i453-dev-2", "i453-dev-3"])
+        self.assertEqual(out["other_same_role"], ["i453-dev-4"])
+        reg = MS.read_registry()
+        self.assertEqual(set(reg.keys()), {"w1:pD1"})
 
 
 if __name__ == "__main__":

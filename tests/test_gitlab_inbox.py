@@ -1244,3 +1244,28 @@ class LoadConfigTest(unittest.TestCase):
     def test_missing_shared_config_returns_none(self) -> None:
         self.assertIsNone(INBOX.load_config(self.dir / "nope.json", self.local))
 
+
+class HotReloadTest(unittest.TestCase):
+    def test_detects_valid_script_change_and_skips_syntax_errors(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hwf-inbox-reload-") as tmp:
+            root = Path(tmp)
+            s1 = root / "gitlab-inbox.py"
+            s2 = root / "find-scheduler.py"
+            s1.write_text("x = 1\n", encoding="utf-8")
+            s2.write_text("y = 2\n", encoding="utf-8")
+            paths = (s1, s2)
+            base = INBOX.snapshot_mtimes(paths)
+            self.assertEqual(INBOX.reloadable_changes(base, paths), [])
+
+            # 语法错误的中间态不触发重载，避免常驻进程重启后直接崩溃。
+            s1.write_text("def broken(:\n", encoding="utf-8")
+            os_utime_ns = base[s1] + 1_000_000
+            import os
+            os.utime(s1, ns=(os_utime_ns, os_utime_ns))
+            self.assertEqual(INBOX.reloadable_changes(base, paths), [])
+
+            # 写入合法代码后触发重载。
+            s1.write_text("x = 3\n", encoding="utf-8")
+            os.utime(s1, ns=(os_utime_ns + 2_000_000, os_utime_ns + 2_000_000))
+            self.assertEqual(INBOX.reloadable_changes(base, paths), [s1])
+

@@ -306,5 +306,118 @@ class CardCheckTests(unittest.TestCase):
             self.assertEqual(TR.main(["card-check", "--file", str(path)]), TR.EXIT_HELD)
 
 
+class ReleaseCheckTests(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        self.remote = str(root / "origin.git")
+        self.repo = str(root / "work")
+        self._git(str(root), "init", "--bare", self.remote)
+        self._git(str(root), "clone", self.remote, self.repo)
+        self._git(self.repo, "config", "user.email", "test@example.com")
+        self._git(self.repo, "config", "user.name", "Tester")
+        self._git(self.repo, "config", "commit.gpgsign", "false")
+        self._git(self.repo, "config", "core.hooksPath", "/dev/null")
+        self._git(self.repo, "checkout", "-b", "main")
+        self._write("app.ts", "export const v = 1;\n")
+        self._write("shared.ts", "export const s = 'base';\n")
+        self._commit("init main")
+        self._git(self.repo, "push", "-u", "origin", "main")
+        self._git(self.repo, "push", "origin", "main:develop")
+        self._git(self.repo, "push", "origin", "main:release-47")
+
+    def _git(self, cwd: str, *args: str) -> str:
+        res = TR._WR.git(cwd, *args)
+        if res.returncode != 0:
+            raise AssertionError(f"git {' '.join(args)} failed: {res.stderr}\n{res.stdout}")
+        return res.stdout.strip()
+
+    def _write(self, rel: str, content: str) -> None:
+        target = Path(self.repo) / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    def _commit(self, msg: str) -> str:
+        self._git(self.repo, "add", ".")
+        self._git(self.repo, "commit", "-m", msg)
+        return self._git(self.repo, "rev-parse", "HEAD")
+
+    def test_clean_single_branch_matches_release_tree_and_develop(self) -> None:
+        self._git(self.repo, "checkout", "-b", "feat/issue-47", "origin/release-47")
+        self._write("app.ts", "export const v = 2;\n")
+        feat_sha = self._commit("feat: update v")
+        # 模拟 develop 另有无关文件改动，再合入本需求分支。
+        self._git(self.repo, "checkout", "-b", "dev-local", "origin/develop")
+        self._write("other.ts", "export const other = true;\n")
+        self._commit("feat: unrelated develop work")
+        self._git(self.repo, "merge", "--no-ff", feat_sha, "-m", "merge feat into develop")
+        self._git(self.repo, "push", "origin", "dev-local:develop")
+        # 合入 release-47。
+        self._git(self.repo, "checkout", "-b", "rel-local", "origin/release-47")
+        self._git(self.repo, "merge", "--no-ff", feat_sha, "-m", "merge feat into release-47")
+        self._git(self.repo, "push", "origin", "rel-local:release-47")
+
+        code = TR.main([
+            "release-check", "--repo", self.repo, "--release", "release-47",
+            "--base", "origin/main", "--develop", "origin/develop", "--commit", feat_sha,
+        ])
+        self.assertEqual(code, TR.EXIT_OK)
+        report = TR.release_check(self.repo, "release-47", "origin/main", [feat_sha], "origin/develop")
+        self.assertTrue(report["same_tree_as_single_commit"])
+        self.assertEqual(report["changed_files"], ["app.ts"])
+        self.assertEqual(report["problems"], [])
+
+    def test_foreign_commit_on_release_is_held(self) -> None:
+        self._git(self.repo, "checkout", "-b", "feat/issue-47", "origin/release-47")
+        self._write("app.ts", "export const v = 2;\n")
+        feat_sha = self._commit("feat: update v")
+        self._git(self.repo, "checkout", "-b", "rel-local", "origin/release-47")
+        self._git(self.repo, "merge", "--no-ff", feat_sha, "-m", "merge feat")
+        self._write("rogue.ts", "export const bad = 1;\n")
+        self._commit("chore: accidental extra commit")
+        self._git(self.repo, "push", "origin", "rel-local:release-47")
+
+        report = TR.release_check(self.repo, "release-47", "origin/main", [feat_sha])
+        self.assertFalse(report["same_tree_as_single_commit"])
+        self.assertTrue(any("非本需求提交" in p for p in report["problems"]))
+        self.assertEqual(
+            TR.main(["release-check", "--repo", self.repo, "--release", "release-47", "--commit", feat_sha]),
+            TR.EXIT_HELD,
+        )
+
+    def test_unauthorized_develop_merge_into_feature_branch_is_held(self) -> None:
+        self._git(self.repo, "checkout", "-b", "dev-local", "origin/develop")
+        self._write("dev_only.ts", "export const devOnly = 1;\n")
+        self._commit("feat: develop only wiring")
+        self._git(self.repo, "push", "origin", "dev-local:develop")
+
+        self._git(self.repo, "checkout", "-b", "feat/issue-47", "origin/release-47")
+        self._write("app.ts", "export const v = 2;\n")
+        self._commit("feat: update v")
+        self._git(self.repo, "merge", "--no-ff", "origin/develop", "-m", "bad: merge develop into feature")
+        polluted_sha = self._git(self.repo, "rev-parse", "HEAD")
+        self._git(self.repo, "push", "origin", f"{polluted_sha}:refs/heads/release-47")
+
+        report = TR.release_check(self.repo, "release-47", "origin/main", [polluted_sha], "origin/develop")
+        self.assertTrue(any("未批准合并提交" in p for p in report["problems"]))
+
+    def test_shared_file_diff_with_develop_returns_held_for_review(self) -> None:
+        self._git(self.repo, "checkout", "-b", "feat/issue-47", "origin/release-47")
+        self._write("shared.ts", "export const s = 'issue-47';\n")
+        feat_sha = self._commit("feat: touch shared")
+        self._git(self.repo, "push", "origin", f"{feat_sha}:refs/heads/release-47")
+        # develop 上同一文件另有其他需求的后续改动。
+        self._git(self.repo, "checkout", "-b", "dev-local", "origin/develop")
+        self._git(self.repo, "merge", "--no-ff", feat_sha, "-m", "merge 47")
+        self._write("shared.ts", "export const s = 'issue-47 + other';\n")
+        self._commit("feat: other task also touched shared.ts")
+        self._git(self.repo, "push", "origin", "dev-local:develop")
+
+        report = TR.release_check(self.repo, "release-47", "origin/main", [feat_sha], "origin/develop")
+        self.assertEqual(report["develop_diff_files"], ["shared.ts"])
+        self.assertTrue(any("shared.ts" in p for p in report["problems"]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -54,7 +54,7 @@ steps:
         debug/修bug/改bug/极简模式及对应 /go 指令仅由用户明确要求触发；按 ~/.hwf/protocol/implementation.md「debug 模式」执行，用普通 dev/dev-fe/dev-be，单测与实现前核验后实现，合 develop 等部署，再由 test 在项目 smoke 地址及必要的测试客户端真实验收，通过后只创建 release MR 交用户。不得启动本地 Web/开发版 Electron 验收，也不引入整项代码评审、arch 终审或 release/main 合并；角色模型取 ~/.hwf/herdr/config.yaml，不能自行选择 debug。
         非 debug 先派 arch 按 ~/.hwf/protocol/planning.md §0 判定，§0.1 用户确认后才走对应路径；方案确认、spec、拆分和 issue 标签均按该主题相应章节执行。
         派测试准备或开发前读 ~/.hwf/protocol/implementation.md §4–6；所有开发含 debug 先过 §6「实现前检查点」：高风险切片与 debug 经独立 code-review 核准后才派生产代码修改，其余切片 dev 自核有效失败后直接实现；同一轮评审或测试意见按 §6「回改打包」一次交接。正常流程进入代码评审或自动化验收前读 ~/.hwf/protocol/review-testing.md §7–8；debug 部署后验收读 §8「debug：部署后验收」，不带入本地服务要求。创建或清理工作树前读 ~/.hwf/protocol/worktrees.md。
-        发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；正常流程按 §9.1 完成 arch 最终验收，debug 只核 implementation 的有限出口。核验剩余工作再决定继续、澄清或收尾，不把阶段通过当作交付完成。
+        发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；正常流程按 §9.1 完成最终验收（或满足同版本低风险直达条件时复用 §7 结论），debug 只核 implementation 的有限出口。核验剩余工作再决定继续、澄清或收尾，不把阶段通过当作交付完成。
     when:
       - '{{steps.custom.stdout}} == ""'
       - "{{steps.scheduler.stdout}}"
@@ -69,7 +69,7 @@ steps:
       debug/修bug/改bug/极简模式及对应 /go 指令仅由用户明确要求触发；按 ~/.hwf/protocol/implementation.md「debug 模式」执行，用普通 dev/dev-fe/dev-be，单测与实现前核验后实现，合 develop 等部署，再由 test 在项目 smoke 地址及必要的测试客户端真实验收，通过后只创建 release MR 交用户。不得启动本地 Web/开发版 Electron 验收，也不引入整项代码评审、arch 终审或 release/main 合并；角色模型取 ~/.hwf/herdr/config.yaml，不能自行选择 debug。
       非 debug 先派 arch 按 ~/.hwf/protocol/planning.md §0 判定，§0.1 用户确认后才走对应路径；方案确认、spec、拆分和 issue 标签均按该主题相应章节执行。
       派测试准备或开发前读 ~/.hwf/protocol/implementation.md §4–6；所有开发含 debug 先过 §6「实现前检查点」：高风险切片与 debug 经独立 code-review 核准后才派生产代码修改，其余切片 dev 自核有效失败后直接实现；同一轮评审或测试意见按 §6「回改打包」一次交接。正常流程进入代码评审或自动化验收前读 ~/.hwf/protocol/review-testing.md §7–8；debug 部署后验收读 §8「debug：部署后验收」，不带入本地服务要求。创建或清理工作树前读 ~/.hwf/protocol/worktrees.md。
-      发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；正常流程按 §9.1 完成 arch 最终验收，debug 只核 implementation 的有限出口。核验剩余工作再决定继续、澄清或收尾，不把阶段通过当作交付完成。
+      发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；正常流程按 §9.1 完成最终验收（或满足同版本低风险直达条件时复用 §7 结论），debug 只核 implementation 的有限出口。核验剩余工作再决定继续、澄清或收尾，不把阶段通过当作交付完成。
     using: scheduler
     # 每个调度者独占新 tab，不在入口或收件箱旁创建成员；
     # 它的成员按协议在这个 tab 里分屏，多个交付互不挤占。

@@ -27,7 +27,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `herdr/droid-arch.json` | 架构师（droid）的模型与思考档；交互式 droid 只能用 `--settings` 文件指定 |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
+| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `omp-extensions/` | omp 扩展：调度者手改 INDEX 或直接用 glab 发 issue 评论时拦下，要求改用 `task-record.py`（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
@@ -36,7 +36,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 不入库（每台电脑自己的）：`state/`（运行状态）、`gitlab-inbox.local.json`（每个项目在本机的仓库路径，也可覆盖共用配置里的其他值，比如换成你自己的白名单账号）。
 
-收件箱要常驻在一个 Herdr 窗格里：`python3 ~/.hwf/scripts/gitlab-inbox.py`；改了配置或脚本后，在那个窗格按 Ctrl+C 再重新运行。
+收件箱要常驻在一个 Herdr 窗格里：`python3 ~/.hwf/scripts/gitlab-inbox.py`；相关脚本更新后空闲时会自动热重载，改了配置则在那个窗格按 Ctrl+C 再重新运行。
 
 ## 从飞书提需求（可选）
 
@@ -61,7 +61,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 群里给机器人下指令时，每句话（包括话题里的回复）都要 @机器人；私聊不用。白名单外的人找机器人，它从 10 句俏皮话里随机回一句（如「给钱我主人，我帮你干活」），什么都不做。
 
-图片或文件可以和文字一起发送，也可以先发附件再说明要做什么；自然语言和显式命令都能带附件。识别服务失败会明确提示「处理失败」，保留原请求供回复「重试」，不会让用户反复补已经给出的编号，也不会擅自转给引用中的另一张任务。真正缺少目标或内容时才追问。改了飞书桥脚本后，需要在原来的窗格按 Ctrl+C，再运行 `python3 ~/.hwf/scripts/feishu-bridge.py` 才会生效；之前已回复过的消息不会自动重试。
+图片或文件可以和文字一起发送，也可以先发附件再说明要做什么；自然语言和显式命令都能带附件。识别服务失败会明确提示「处理失败」，保留原请求供回复「重试」，不会让用户反复补已经给出的编号，也不会擅自转给引用中的另一张任务。真正缺少目标或内容时才追问。飞书桥相关脚本更新后会在队列空闲时自动热重载；改了本机配置则需要在原来的窗格按 Ctrl+C，再运行 `python3 ~/.hwf/scripts/feishu-bridge.py` 才会生效；之前已回复过的消息不会自动重试。
 
 从一个需求拆出独立 issue 时，各自使用独立飞书话题：原话题只留新话题链接，结果、截图和确认各归各。调度者按 `protocol/communication.md`「独立需求与飞书话题」登记并核对建立结果；原话题不会因提到别的编号而切换绑定。`/status` 读取对应 GitLab issue 的当前状态；普通「已收到」回执只代表已转交，不代表执行或交付完成。
 
@@ -104,4 +104,4 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 2. 按 `PROTOCOL.md`「规则维护方式」修改对应条款，不追加事故流水账；workflow 用 loader 校验，脚本只跑直接相关的测试文件或用例。
 3. 推送并开 MR，合并后其他电脑 `git -C ~/.hwf pull` 即生效（改了 `herdr/config.yaml` 且不是本人电脑的，再跑一次 `install.sh`）。
 
-协议入口、主题和 skill 在本机更新后，下次读取时生效；收件箱监听 `PROTOCOL.md`、`protocol/` 与 `skills/` 的提交变化并提醒在途调度者。新增 skill 后要再跑一次 `install.sh` 才会链接到各 Agent。常驻 Python 脚本改动需在原窗格重启相应进程后生效，不因文件已更新就假定正在运行的进程已重载。
+协议入口、主题和 skill 在本机更新后，下次读取时生效；收件箱监听 `PROTOCOL.md`、`protocol/` 与 `skills/` 的提交变化并提醒在途调度者。新增 skill 后要再跑一次 `install.sh` 才会链接到各 Agent。常驻的 `gitlab-inbox.py` 与 `feishu-bridge.py` 检测到自身及依赖模块变化且语法检查通过后，会在空闲时自动重新加载（窗格打印 `hot-reloading ...`）；修改本机 JSON 配置仍需在原窗格重启相应进程。

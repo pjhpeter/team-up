@@ -125,6 +125,46 @@ class WaitTests(Case):
         self.assertEqual(code, MW.EXIT_TIMEOUT)
         self.assertLessEqual(self.clock.now - 1_000_000.0, MW.MAX_WAIT_S + MW.POLL_S)
 
+    def test_reads_visible_source_while_working_to_avoid_agent_not_idle(self) -> None:
+        seen_sources: list[str] = []
+
+        def strict_herdr(*args: str) -> str:
+            if args[:2] == ("agent", "get"):
+                if seen_sources:
+                    return json.dumps({"result": {"agent": {"name": "i494-dev-fe", "pane_id": "w18:pAJ",
+                                                            "agent_status": "done"}}})
+                return json.dumps({"result": {"agent": {"name": "i494-dev-fe", "pane_id": "w18:pAJ",
+                                                        "agent_status": "working"}}})
+            source = args[args.index("--source") + 1]
+            seen_sources.append(source)
+            if source == "recent-unwrapped":
+                raise MW.WaitError('herdr agent read 失败：{"error":{"code":"agent_not_idle"}}')
+            return "\n".join(["• Editing file.vue"] + FOOTER)
+
+        with patch.object(MW, "herdr", strict_herdr):
+            code, text = MW.wait("i494-dev-fe", {"idle", "done", "blocked"}, None, None, self.clock, self.clock.sleep)
+        self.assertEqual((code, text), (MW.EXIT_OK, "i494-dev-fe 已到 done"))
+        self.assertEqual(seen_sources, ["visible"])
+
+    def test_missing_agent_cleans_state_and_returns_clean_error(self) -> None:
+        calls = 0
+
+        def vanishing_herdr(*args: str) -> str:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return json.dumps({"result": {"agent": {"name": "i494-test", "pane_id": "w18:pB2",
+                                                        "agent_status": "working"}}})
+            if calls == 2:
+                return "\n".join(["• Running browser"] + FOOTER)
+            raise MW.WaitError('herdr agent get 失败：{"error":{"code":"agent_not_found"}}')
+
+        with patch.object(MW, "herdr", vanishing_herdr):
+            code, text = MW.wait("i494-test", {"idle", "done"}, None, None, self.clock, self.clock.sleep)
+        self.assertEqual(code, MW.EXIT_ERROR)
+        self.assertIn("已不存在", text)
+        self.assertFalse(MW.state_file("w18:pB2").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

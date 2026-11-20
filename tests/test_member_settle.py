@@ -131,6 +131,17 @@ class CommentBodyTest(unittest.TestCase):
         summary = "\n".join(f"第 {i} 行" for i in range(16))
         self.assertIsNone(SETTLE.comment_body(f"## 给用户的摘要\n{summary}\n## 完整内容\n全文")[0])
 
+    def test_heading_level_and_bold_variants_are_accepted(self) -> None:
+        full_lines = "\n".join(f"详情 {i}" for i in range(20))
+        for summary_head, full_head in (
+            ("### 给用户的摘要：", "### 完整内容"),
+            ("**用户摘要**：", "**完整内容：**"),
+            ("#### 给用户摘要", "## 完整内容："),
+        ):
+            body, why = SETTLE.comment_body(f"{summary_head}\n\n简短结论。\n\n{full_head}\n\n{full_lines}\n")
+            self.assertIsNotNone(body, msg=f"failed on {summary_head} / {full_head}: {why}")
+            self.assertTrue(body.startswith("简短结论。\n\n<details><summary>完整内容</summary>"))
+
 
 class MainTest(SessionCase):
     def settle(self, session: object, screen: str) -> tuple[str, Path]:
@@ -168,6 +179,34 @@ class MainTest(SessionCase):
         printed, out = self.settle({"agent": "omp", "kind": "path", "value": str(path)}, "新一轮的屏幕\n")
         self.assertEqual(out.read_text(encoding="utf-8"), "新一轮的屏幕\n")
         self.assertIn("format: screen", printed)
+
+    def test_working_to_idle_transition_rechecks_once_and_finishes(self) -> None:
+        path = self.write("s.jsonl", claude("最终结论\n\n通过"))
+        session = {"agent": "omp", "kind": "path", "value": str(path)}
+        statuses = iter(["working", "idle", "idle"])
+        current_status = "working"
+        sleeps: list[int] = []
+
+        def fake_run(*args: str) -> str:
+            nonlocal current_status
+            if args[1] == "get":
+                current_status = next(statuses)
+                return json.dumps({"result": {"agent": {"agent_status": current_status, "agent_session": session}}})
+            if current_status == "working" and "recent-unwrapped" in args:
+                raise RuntimeError("herdr agent read failed: agent_not_idle")
+            if current_status == "working":
+                return "正在输出...\n\n\n\n状态栏\n"
+            return "⏺ 最终结论\n通过\n\n\n\n状态栏\n"
+
+        out = self.dir / "reviews" / "transition.md"
+        with patch.object(SETTLE, "run", fake_run), patch.object(SETTLE.time, "sleep", sleeps.append), \
+                patch.object(sys, "argv", ["member-settle", "arch", str(out)]), \
+                patch("builtins.print") as printed:
+            self.assertEqual(SETTLE.main(), 0)
+        output = "\n".join(str(c.args[0]) for c in printed.call_args_list)
+        self.assertEqual(sleeps, [15, 15])
+        self.assertIn("status: idle -> idle | screen stable: yes | finished: yes", output)
+        self.assertIn("verdict line: 通过", output)
 
 
 if __name__ == "__main__":

@@ -1335,8 +1335,8 @@ def load_config() -> dict[str, Any]:
 CHILDREN: list[subprocess.Popen] = []
 
 
-def stop_children(*_: Any) -> None:
-    """桥退出时温和关掉 lark-cli（SIGTERM，让它清理服务端订阅），避免留下孤儿进程。"""
+def terminate_children() -> None:
+    """温和关掉 lark-cli（SIGTERM，让它清理服务端订阅），供退出信号和热重载复用。"""
     for p in CHILDREN:
         if p.poll() is None:
             p.terminate()
@@ -1345,7 +1345,38 @@ def stop_children(*_: Any) -> None:
             p.wait(timeout=10)
         except subprocess.TimeoutExpired:
             p.kill()
+
+
+def stop_children(*_: Any) -> None:
+    terminate_children()
     sys.exit(0)
+
+
+def watched_scripts(base_dir: Optional[Path] = None) -> tuple[Path, ...]:
+    root = base_dir or Path(__file__).resolve().parent
+    return tuple(root / name for name in (
+        "feishu-bridge.py", "secretary.py", "task_intent.py", "feishu_topics.py", "proactive.py"
+    ))
+
+
+def snapshot_mtimes(paths: tuple[Path, ...]) -> dict[Path, int]:
+    return {p: p.stat().st_mtime_ns for p in paths if p.exists()}
+
+
+def reloadable_changes(baseline: dict[Path, int], paths: tuple[Path, ...]) -> list[Path]:
+    """检测桥及其依赖模块是否有落盘更新；遇到语法错误暂缓重载，避免重启即崩。"""
+    current = snapshot_mtimes(paths)
+    changed = [p for p in paths if baseline.get(p) != current.get(p)]
+    if not changed:
+        return []
+    for p in paths:
+        if p.exists():
+            try:
+                compile(p.read_bytes(), str(p), "exec")
+            except (OSError, SyntaxError) as error:
+                log(f"skip hot-reload due to invalid syntax in {p.name}: {error}")
+                return []
+    return changed
 
 
 def read_event_status(lines: Any, history_requested: threading.Event) -> None:
@@ -1437,6 +1468,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     except BridgeError as e:
         log(f"catch-up failed: {e}")
     save_json(STATE_PATH, state)
+    watched = watched_scripts()
+    baseline = snapshot_mtimes(watched)
     poll = int(cfg.get("poll_seconds", 15))
     next_poll = 0.0
     while True:
@@ -1466,6 +1499,15 @@ def main(argv: Optional[list[str]] = None) -> int:
             except Exception as err:  # 秘书出错不能拖垮桥本身
                 log(f"secretary failed: {err!r}")
             save_json(STATE_PATH, state)
+            if events.empty():
+                changed = reloadable_changes(baseline, watched)
+                if changed:
+                    names = ", ".join(p.name for p in changed)
+                    log(f"reloading feishu-bridge after code update: {names}")
+                    terminate_children()
+                    if consumer_lock is not None:
+                        consumer_lock.close()
+                    os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
 
 
 if __name__ == "__main__":

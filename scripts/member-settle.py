@@ -30,6 +30,9 @@ HERDR = os.environ.get("HERDR_BIN", "herdr")
 VERDICT = re.compile(r"^\s*(通过|需修改|常规评审通过|预审完成|待澄清)\s*$")
 SUMMARY_HEAD = "## 给用户的摘要"
 FULL_HEAD = "## 完整内容"
+# 兼容成员使用三四级标题、加粗标题、末尾冒号或省略「给/的」，避免仅因标题样式微差漏生成评论稿。
+SUMMARY_LINE = re.compile(r"^\s*(?:#{1,4}\s+|\*\*\s*)给?用户的?摘要\s*(?:[:：]\s*)?\**\s*(?:[:：]\s*)?$")
+FULL_LINE = re.compile(r"^\s*(?:#{1,4}\s+|\*\*\s*)完整内容\s*(?:[:：]\s*)?\**\s*(?:[:：]\s*)?$")
 SUMMARY_MAX_LINES = 15
 
 
@@ -46,6 +49,16 @@ def agent_info(target: str) -> dict:
 
 def status(info: dict) -> str:
     return str(info.get("agent_status", "unknown"))
+
+
+def read_screen(target: str, lines: int) -> str:
+    """优先读未折行历史；成员刚在收尾仍报 agent_not_idle 时退回可视屏幕，避免第一次读屏直接报错退出。"""
+    try:
+        return run("agent", "read", target, "--lines", str(lines), "--source", "recent-unwrapped")
+    except RuntimeError as error:
+        if "agent_not_idle" not in str(error):
+            raise
+        return run("agent", "read", target, "--lines", str(lines), "--source", "visible")
 
 
 def body(screen: str) -> str:
@@ -156,8 +169,8 @@ def text_lines(text: str) -> int:
 def comment_body(reply: str) -> tuple[str | None, str]:
     """把成员回复变成给用户的评论：摘要在前，完整内容折叠。返回 (评论正文, 说明)，不合要求时正文为 None。"""
     lines = reply.strip().split("\n")
-    heads = [i for i, line in enumerate(lines) if line.strip() == SUMMARY_HEAD]
-    fulls = [i for i, line in enumerate(lines) if line.strip() == FULL_HEAD]
+    heads = [i for i, line in enumerate(lines) if SUMMARY_LINE.match(line)]
+    fulls = [i for i, line in enumerate(lines) if FULL_LINE.match(line)]
     if heads and fulls and heads[0] < fulls[0]:
         summary = "\n".join(lines[heads[0] + 1:fulls[0]]).strip()
         full = "\n".join(lines[fulls[0] + 1:]).strip()
@@ -180,12 +193,22 @@ def main() -> int:
     parser.add_argument("--interval", type=int, default=15)
     opts = parser.parse_args()
 
+    sleep_s = max(opts.interval, 15)
+    settled = {"idle", "done"}
     first_status = status(agent_info(opts.target))
-    first_screen = run("agent", "read", opts.target, "--lines", str(opts.lines), "--source", "recent-unwrapped")
-    time.sleep(max(opts.interval, 15))
+    first_screen = read_screen(opts.target, opts.lines)
+    time.sleep(sleep_s)
     info = agent_info(opts.target)
     second_status = status(info)
-    screen = run("agent", "read", opts.target, "--lines", str(opts.lines), "--source", "recent-unwrapped")
+    screen = read_screen(opts.target, opts.lines)
+    # 第一次读还在收尾或刚滚屏、第二次已进入 idle/done 时，补等一轮确认连续两次稳定，省掉调度者额外空转一轮。
+    if second_status in settled and not (first_status in settled and body(first_screen) == body(screen)):
+        time.sleep(sleep_s)
+        third_info = agent_info(opts.target)
+        first_status, first_screen = second_status, screen
+        info = third_info
+        second_status = status(info)
+        screen = read_screen(opts.target, opts.lines)
 
     reply, source = read_reply(info, screen)
     result = reply if reply is not None else screen
@@ -197,7 +220,6 @@ def main() -> int:
     with open(f"{opts.outfile}.screen", "w", encoding="utf-8") as handle:
         handle.write(screen)
 
-    settled = {"idle", "done"}
     stable = body(first_screen) == body(screen)
     verdicts = [line.strip() for line in result.split("\n") if VERDICT.match(line)]
     finished = first_status in settled and second_status in settled and stable

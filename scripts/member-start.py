@@ -170,8 +170,17 @@ def read_registry() -> dict[str, Any]:
         return {}
 
 
-def record(pane: dict[str, str], scheduler: str, profile: str) -> None:
+def record(pane: dict[str, str], scheduler: str, profile: str,
+           drop_panes: Sequence[str] = (), live_panes: Optional[set[str]] = None) -> None:
     data = read_registry()
+    gone = set(drop_panes)
+    if live_panes is not None:
+        # 顺手清理登记簿里早已不存在的死窗格，避免 members.json 无限膨胀。
+        keep_alive = live_panes | {pane["pane_id"]}
+        data = {pid: entry for pid, entry in data.items() if pid in keep_alive and pid not in gone}
+    else:
+        for pid in gone:
+            data.pop(pid, None)
     data[pane["pane_id"]] = {"scheduler": scheduler, "profile": profile, "tab_id": pane["tab_id"],
                              "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
     path = registry_path()
@@ -256,11 +265,52 @@ def reusable(member: dict[str, Any], tag: str, cwd: str) -> bool:
     return same_dir(pane.get("cwd"), cwd)
 
 
-def pick_idle(members: Sequence[dict[str, Any]], exclude: Sequence[str], tag: str, cwd: str) -> Optional[dict[str, Any]]:
+def _idle_sort_key(member: dict[str, Any], tag: str) -> tuple[bool, int, str]:
+    name = str(member.get("name") or "")
+    suffix = re.search(r"-(\d+)$", name)
+    return (not name.startswith(f"{tag}-"), int(suffix.group(1)) if suffix else 1, name)
+
+
+def eligible_idle(members: Sequence[dict[str, Any]], exclude: Sequence[str], tag: str,
+                  cwd: str) -> list[dict[str, Any]]:
     idle = [m for m in members if m.get("agent_status") in ("idle", "done") and m.get("name") not in exclude
             and reusable(m, tag, cwd)]
-    idle.sort(key=lambda m: not str(m.get("name") or "").startswith(f"{tag}-"))  # 同一 issue 的优先
+    idle.sort(key=lambda m: _idle_sort_key(m, tag))  # 优先复用同 issue 且编号最小的窗格
+    return idle
+
+
+def pick_idle(members: Sequence[dict[str, Any]], exclude: Sequence[str], tag: str, cwd: str) -> Optional[dict[str, Any]]:
+    idle = eligible_idle(members, exclude, tag, cwd)
     return idle[0] if idle else None
+
+
+def prune_duplicate_idle(extras: Sequence[dict[str, Any]], base: str, kept_pane: str, scheduler_pane: str,
+                         panes: Sequence[dict[str, Any]]) -> tuple[list[str], list[str]]:
+    """回收同 issue、同角色、同工作目录且未被 exclude 的多余空闲副本，保留每个 workspace 至少一个窗格。"""
+    left: dict[str, int] = {}
+    for p in panes:
+        ws = str(p.get("workspace_id") or "")
+        left[ws] = left.get(ws, 0) + 1
+    closed_panes: list[str] = []
+    closed_names: list[str] = []
+    for extra in extras:
+        name = str(extra.get("name") or "")
+        pid = str(extra.get("pane_id") or "")
+        ws = str(extra.get("workspace_id") or "")
+        if not pid or pid in (kept_pane, scheduler_pane):
+            continue
+        if not re.fullmatch(rf"{re.escape(base)}-\d+", name):
+            continue
+        if left.get(ws, 0) <= 1:
+            continue
+        try:
+            herdr("pane", "close", pid)
+            left[ws] -= 1
+            closed_panes.append(pid)
+            closed_names.append(name)
+        except RuntimeError:
+            continue
+    return closed_panes, closed_names
 
 
 # ---------- 启动与重启 ----------
@@ -341,7 +391,8 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
     registry = read_registry()
     tag, issue = member_tag(scheduler)
     members = same_role(all_agents, profile_name, scheduler, registry)
-    member = pick_idle(members, exclude, tag, cwd)
+    idle_candidates = eligible_idle(members, exclude, tag, cwd)
+    member = idle_candidates[0] if idle_candidates else None
     base = f"{tag}-{profile_name}"
     label = pane_label(profile_name, profile["args"], task)
 
@@ -373,11 +424,25 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
             subprocess.run([_START.HERDR, "pane", "close", pane["pane_id"]], capture_output=True, timeout=10,
                            check=False)
             raise
-    record(pane, scheduler["name"], profile_name)
-    busy = [m["name"] for m in members if m is not member]
+
+    pruned_panes: list[str] = []
+    pruned_names: list[str] = []
+    live_panes: Optional[set[str]] = None
+    if len(idle_candidates) > 1 or registry:
+        panes_snapshot = herdr("pane", "list")["result"]["panes"]
+        if len(idle_candidates) > 1 and member is not None:
+            pruned_panes, pruned_names = prune_duplicate_idle(
+                idle_candidates[1:], base, pane["pane_id"], scheduler["pane_id"], panes_snapshot
+            )
+        live_panes = {str(p.get("pane_id")) for p in panes_snapshot if p.get("pane_id")} - set(pruned_panes)
+
+    record(pane, scheduler["name"], profile_name, drop_panes=pruned_panes, live_panes=live_panes)
+    pruned_set = set(pruned_panes)
+    busy = [m["name"] for m in members if m is not member and m.get("pane_id") not in pruned_set]
     return {"action": action, "name": name, "pane_id": pane["pane_id"], "tab_id": pane["tab_id"],
             "session": (agent.get("agent_session") or {}).get("value"), "kind": profile["kind"],
             "args": profile["args"], "label": label, "created_by": scheduler["name"], "other_same_role": busy,
+            "pruned_idle": pruned_names,
             "model_override": {"model": model_override, "authorized_by": authorized_by} if model_override else None}
 
 

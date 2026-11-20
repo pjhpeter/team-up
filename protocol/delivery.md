@@ -17,7 +17,7 @@
 
 ### 合并顺序与版本一致性
 
-正常流程通过 `review-testing.md` §7（含 arch 放行）和 §8 后执行以下顺序。debug 的独立顺序与有限出口只按 `implementation.md`「debug 模式」：开发及实现前核验后可合 develop、等待部署并验收，通过后只创建 release MR，不要求 §7/arch 放行，不合 release/main、不关闭 issue，也不进入汇总完整性评审和 §9.1。
+正常流程一般通过 `review-testing.md` §7（含 arch 放行）和 §8 本地验收后执行以下顺序；满足 `review-testing.md` §8「单分支低风险直达合并冒烟」条件时，通过 §7 后直接执行第 1 步，在 `smoke` 一次性完成已评审用例验收与冒烟。debug 的独立顺序与有限出口只按 `implementation.md`「debug 模式」：开发及实现前核验后可合 develop、等待部署并验收，通过后只创建 release MR，不要求 §7/arch 放行，不合 release/main、不关闭 issue，也不进入汇总完整性评审和 §9.1。
 
 1. scheduler 提开发分支 → develop 的 MR，可立即合并；等对应流水线部署作业成功，按 §9「测试环境冒烟」验证。
 2. 冒烟通过，再提同一开发分支 → 汇总分支的 MR，无需逐次确认。回读目标分支、源 SHA、diff，确认源 SHA 与 develop 合入并冒烟的相同，diff 只含本 issue 改动，再立即合并并回读汇总分支已包含该 SHA。
@@ -37,9 +37,17 @@
 
 - 被替代、作废、仅 develop 实验等不上线情况，必须写根 issue 并获用户确认，不能默认只进 develop。
 - 子 issue 关闭前代码已在汇总分支或登记不上线。完成评论记录 develop MR、冒烟结果、汇总 MR/SHA，并更新「上线清单」。步骤不是 issue：根评论标题用「步骤 <序号> 完成：<名称>」，记录相同内容，再把汇总后的提交写进步骤 JSON、用 `task-record.py progress --steps-file` 重跑，由脚本核对后打勾。
-- 全部步骤完成、子 issue 关闭或登记不上线后，scheduler 派 precheck 取证、code-review 核对：
+- 全部步骤完成、子 issue 关闭或登记不上线后，scheduler 先运行：
+
+  ```bash
+  python3 ~/.hwf/scripts/task-record.py release-check --repo <仓库路径> --release release-<根编号> \
+    --base origin/main --develop origin/<测试分支> --commit <各步骤源SHA>...
+  ```
+
+- **单步同树直通**：单仓库单步骤交付中，若 `release-check` 退出码 `0` 且输出 `same_tree_as_single_commit: yes`（即 `origin/release-<根编号>` 代码树与 `§6/§7` 已跑过相关 lint、type-check、测试并经评审放行的源提交完全一致，`origin/main..origin/release-<根编号>` 无额外提交，且本需求改动文件与 `develop` 完全一致），scheduler 直接把 `release-check` 输出与 `§6/§7` 验证记录写入根评论与 `STATE.md`，无需另派 `precheck` 与 `code-review` 重跑同一提交。
+- **多步汇总、解冲突或存在差异**：多步骤/多分支汇总、汇总过程做过冲突处理、`same_tree_as_single_commit: no`，或 `release-check` 退出码 `3` 时，scheduler 派 precheck 取证、code-review 逐项核对：
   1. 完成评论源 SHA 都是汇总分支祖先（`git merge-base --is-ancestor`）。
-  2. 各 issue 改过的每个文件与 develop 内容一致；差异逐个解释，其他需求差异可接受，本需求缺失不行。
+  2. 各 issue 改过的每个文件与 develop 内容一致；差异逐个解释，其他需求差异可接受，本需求缺失或夹带未审改动不行。
   3. `git log origin/main..origin/release-<根编号>` 无不属于本需求的提交。
   4. 在汇总分支跑相关 lint、type-check 与本需求测试。
 - 通过/缺失清单、核对 SHA、证据写根评论；有缺失先补齐再核对，未通过不得建 main MR、不得标交付完成。
@@ -64,7 +72,7 @@ scheduler 回收实际输出，核对：
 - `implementation.md` §6 的单元测试先行证据和用例更正审批（若有）齐全。
 - UI 走查结论和截图齐全，浏览器截图满足 `review-testing.md` §8 截图交付门禁。
 - 正常流程根需求已评审用例 snippet 已上传、回填 issue、可访问，测试执行版本与 snippet SHA 一致；步骤/子 issue 引用同一 snippet，不重复上传。debug 不要求 snippet，核对 issue 验收条目、部署版本和逐条证据。
-- 测试服务、后台进程已按 `review-testing.md` §8 清理，所有使用端口回读空闲。正常流程发现复用他人或先前 issue 服务，本轮不放行，须新启动独立服务重跑；发现残留先清理，不得报完成或关单。debug 仅清理本任务本机浏览器、测试客户端和辅助进程，回读使用的本地端口，不启动本地验收服务、不关闭远端服务。
+- 测试服务、后台进程已按 `review-testing.md` §8 清理，所有使用端口回读空闲。本地验收轮次发现复用他人或先前 issue 服务，本轮不放行，须新启动独立服务重跑；发现残留先清理，不得报完成或关单。直接测已部署环境的轮次（单分支低风险直达合并冒烟、测试环境冒烟、debug）仅清理本任务本机浏览器、测试客户端和辅助进程，回读使用的本地端口，不启动本地验收服务、不关闭远端服务。
 
 开发自报、成员 idle、命令无报错、未执行用例不能替代证据。
 
@@ -140,7 +148,8 @@ python3 ~/.hwf/scripts/wrapup.py --repo <主仓库> --task <任务标识> --issu
 
 风险终审判断代码风险，最终验收判断交付是不是原来要的结果。每根交付一次：全部步骤/子 issue 已汇总、完整性核对通过后，main MR 与完成/请验收评论之前；直达单 issue 同样在冒烟并汇总后执行。debug 模式不派 arch、不做此阶段。
 
-- 新短会话，不带历史聊天；默认 15 分钟 / 25 次工具调用。
+- **单 issue 低风险直达同版本复用**：直达路径（`防风险 = 不要`、单仓库单分支）中，若 `origin/release-<根编号>` 代码树与 `§7` 经 `arch` 风险终审通过的提交完全一致（`§7` 后零代码回改、零解冲突改写）、`release-check` 退出码 `0`、且已批准用例与 `smoke` 真机截图证据全部通过，scheduler 完成 §9「交付证据核验」后在根评论与 `STATE.md` 记录 `§9.1 复用 §7 arch 已审同版本（<SHA>），真实验收与完整性核对全绿`，不重复启动第二次 `arch` 会话审同一提交。
+- 方案路径、`防风险 = 要`、多仓库/多步骤，或 `§7` 后发生过任何代码回改/解冲突改写时，派 `arch` 新短会话执行最终验收（不带历史聊天；默认 15 分钟 / 25 次工具调用）：
 - scheduler 准备交接包，缺任一项不派：① `planning.md` §0 判定及关键决定原文，方案路径另附已确认最终方案 snippet；② 用户过程裁定/改判 note；③ 验收条目；④ 各 issue 测试报告、截图评论、UI 走查、冒烟结果（develop MR、成功部署作业、测试环境逐条截图，或用户同意跳过 note；仅本地复核算缺项）；⑤ 汇总 SHA 及 `origin/main..release-<根编号>` diff；⑥ 待定清单；⑦ 测试后每次回改 SHA 与 code-review「是否碰到关键决定」结论行。
 - arch 逐条对照关键决定/最终方案与验收点，用最终代码、测试证据写「达到 / 没达到 / 偏离」及截图链接、file:line；不重做代码评审、lint、测试，不启动服务。证据不足算没达到并列缺证；核对回改是否改变关键决定。无 develop 冒烟且无用户跳过 note，只能 `需修改`，写明「缺 develop 冒烟」。
 - 最后一行独立写 `通过` 或 `需修改`；后者逐条列没达到/偏离项及改法。scheduler 原文写根评论与 STATE。

@@ -64,12 +64,22 @@ def agent(target: str) -> dict[str, Any]:
     return json.loads(herdr("agent", "get", target)).get("result", {}).get("agent", {})
 
 
+def is_missing_agent(error: Exception) -> bool:
+    text = str(error)
+    return "agent_not_found" in text or "pane_not_found" in text
+
+
 def screen_tail(target: str) -> str:
-    """屏幕末尾的正文：去掉随费用/计时刷新的状态栏与转圈计时，只留能判断有没有进展的文字。"""
-    lines = herdr("agent", "read", target, "--lines", "60", "--source", "recent-unwrapped").rstrip("\n").split("\n")
-    lines = [re.sub(r"\(\d+[hms][\d hms]*•[^)]*\)|\d+h \d+m \d+s|\d+m \d+s|\d+s\b|[\u2800-\u28ff]", "", line)
-             for line in lines[:-4]]
-    return "\n".join(line for line in lines if line.strip())
+    """屏幕末尾的正文：去掉随费用/计时刷新的状态栏与转圈计时，只留能判断有没有进展的文字。
+
+    注意：成员处于 working 时，herdr 对 recent-unwrapped 会报 agent_not_idle；
+    固定用 --source visible 可在运行态稳定读取屏幕，且跨轮次保持同一折行口径。
+    """
+    lines = herdr("agent", "read", target, "--lines", "60", "--source", "visible").rstrip("\n").split("\n")
+    body = lines[:-4] if len(lines) > 4 else lines
+    cleaned = [re.sub(r"\(\d+[hms][\d hms]*•[^)]*\)|\d+h \d+m \d+s|\d+m \d+s|\d+s\b|[\u2800-\u28ff]", "", line)
+               for line in body]
+    return "\n".join(line for line in cleaned if line.strip())
 
 
 def diagnose(tail: str) -> tuple[str, str]:
@@ -148,16 +158,24 @@ def ntfy(title: str, body: str) -> bool:
 def wait(target: str, until: set[str], repo: Optional[str], task: Optional[str],
          clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep) -> tuple[int, str]:
     start = clock()
+    last_pane = target
     while True:
-        info = agent(target)
-        status = str(info.get("agent_status") or "unknown")
-        name = str(info.get("name") or target)
-        pane = str(info.get("pane_id") or target)
-        if status in until:
-            state_file(pane).unlink(missing_ok=True)
-            return EXIT_OK, f"{name} 已到 {status}"
-        now = clock()
-        tail = screen_tail(target)
+        try:
+            info = agent(target)
+            status = str(info.get("agent_status") or "unknown")
+            name = str(info.get("name") or target)
+            pane = str(info.get("pane_id") or target)
+            last_pane = pane
+            if status in until:
+                state_file(pane).unlink(missing_ok=True)
+                return EXIT_OK, f"{name} 已到 {status}"
+            now = clock()
+            tail = screen_tail(target)
+        except WaitError as error:
+            if is_missing_agent(error):
+                state_file(last_pane).unlink(missing_ok=True)
+                return EXIT_ERROR, f"{target} 已不存在（会话已退出或窗格已关闭），请用 STATE/herdr pane list 核对产物后处理"
+            raise
         kind, reason = diagnose(tail)
         quiet = now - remember(pane, hashlib.sha256(tail.encode()).hexdigest(), now)
         # 报错字样要停留 5 分钟（画面不再变化）才算卡住：短暂断网成员自己会重连成功。

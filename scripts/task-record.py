@@ -7,6 +7,7 @@
     task-record.py note      --repo <主仓库> --task <任务标识> --issue <issue URL> --kind <类别> --body-file <文件> [--will …]
     task-record.py preflight --will <动作>...
     task-record.py card-check --file <arch 判定落盘文件>
+    task-record.py release-check --repo <仓库路径> --release <release-根编号> [--base origin/main] [--develop origin/develop] --commit <步骤源SHA>... [--no-fetch]
     task-record.py progress  --repo <主仓库> --task <任务标识> [--issue <根 issue URL> --steps-file <步骤 JSON>]
 
 为什么有它：
@@ -310,6 +311,135 @@ def card_check(text: str) -> list[str]:
     return problems
 
 
+# ---------- 汇总分支完整性核对 ----------
+
+def _rev_parse(repo: str, ref: str, kind: str = "commit") -> str:
+    res = _WR.git(repo, "rev-parse", "--verify", f"{ref}^{{{kind}}}")
+    if res.returncode != 0:
+        raise RecordError(f"找不到 Git 引用 {ref}：{res.stderr.strip() or res.stdout.strip()}")
+    return res.stdout.strip()
+
+
+def _resolve_release_ref(repo: str, release: str) -> str:
+    if release.startswith(("origin/", "refs/")):
+        return release
+    if _WR.git(repo, "rev-parse", "--verify", f"origin/{release}^{{commit}}").returncode == 0:
+        return f"origin/{release}"
+    return release
+
+
+def release_check(repo: str, release: str, base: str, commits: Sequence[str],
+                  develop: Optional[str] = None, fetch: bool = True) -> dict[str, Any]:
+    """对照基准分支（origin/main）、已批准步骤提交与测试分支，核对汇总分支完整性。"""
+    if not commits:
+        raise RecordError("release-check 至少要给一个 --commit")
+    if fetch:
+        fetched = _WR.git(repo, "fetch", "--quiet", "origin")
+        if fetched.returncode != 0:
+            raise RecordError(f"git fetch origin 失败：{fetched.stderr.strip() or fetched.stdout.strip()}")
+    release_ref = _resolve_release_ref(repo, release)
+    base_sha = _rev_parse(repo, base)
+    release_sha = _rev_parse(repo, release_ref)
+    approved = [_rev_parse(repo, item) for item in commits]
+    approved_set = set(approved)
+
+    missing = [
+        raw for raw, sha in zip(commits, approved)
+        if _WR.git(repo, "merge-base", "--is-ancestor", sha, release_sha).returncode != 0
+    ]
+    rev_res = _WR.git(repo, "rev-list", "--no-merges", f"{base_sha}..{release_sha}", *(f"^{sha}" for sha in approved))
+    if rev_res.returncode != 0:
+        raise RecordError(f"git rev-list 失败：{rev_res.stderr.strip()}")
+    foreign_commits = [line.strip() for line in rev_res.stdout.splitlines() if line.strip()]
+
+    log_res = _WR.git(repo, "log", "--format=%H\t%P\t%s", f"{base_sha}..{release_sha}")
+    if log_res.returncode != 0:
+        raise RecordError(f"git log 失败：{log_res.stderr.strip()}")
+    commits_in_release: list[str] = []
+    foreign_merges: list[str] = []
+    for raw_line in log_res.stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        parts = raw_line.split("\t", 2)
+        sha = parts[0]
+        parents = parts[1].split() if len(parts) > 1 and parts[1] else []
+        subject = parts[2] if len(parts) > 2 else ""
+        commits_in_release.append(f"{sha[:12]} {subject}".strip())
+        # 拦截将 develop 或其他未批准分支合入开发分支/汇总分支的合并提交。
+        for extra_parent in parents[1:]:
+            if extra_parent not in approved_set and \
+                    _WR.git(repo, "merge-base", "--is-ancestor", extra_parent, base_sha).returncode != 0:
+                foreign_merges.append(f"{sha[:12]}<-{extra_parent[:12]} ({subject})")
+
+    unique_approved = list(dict.fromkeys(approved))
+    release_tree = _rev_parse(repo, release_sha, "tree")
+    same_tree = len(unique_approved) == 1 and _rev_parse(repo, unique_approved[0], "tree") == release_tree
+
+    diff_base = _WR.git(repo, "diff", "--name-only", f"{base_sha}..{release_sha}")
+    if diff_base.returncode != 0:
+        raise RecordError(f"git diff 失败：{diff_base.stderr.strip()}")
+    changed_files = [line.strip() for line in diff_base.stdout.splitlines() if line.strip()]
+
+    develop_sha: Optional[str] = None
+    develop_diff_files: list[str] = []
+    if develop:
+        develop_sha = _rev_parse(repo, develop)
+        if changed_files:
+            diff_dev = _WR.git(repo, "diff", "--name-only", release_sha, develop_sha, "--", *changed_files)
+            if diff_dev.returncode != 0:
+                raise RecordError(f"git diff {develop} 失败：{diff_dev.stderr.strip()}")
+            develop_diff_files = [line.strip() for line in diff_dev.stdout.splitlines() if line.strip()]
+
+    problems: list[str] = []
+    if missing:
+        problems.append("未进入汇总分支的步骤提交：" + ", ".join(missing))
+    if foreign_commits:
+        problems.append("汇总分支含非本需求提交：" + ", ".join(s[:12] for s in foreign_commits))
+    if foreign_merges:
+        problems.append("汇总分支含未批准合并提交：" + "; ".join(foreign_merges))
+    if not changed_files:
+        problems.append(f"{release_ref} 相对 {base} 没有任何文件改动")
+    if develop_diff_files:
+        problems.append(f"改动文件与 {develop} 内容不同（需 code-review 逐个核对）：" + ", ".join(develop_diff_files))
+
+    return {
+        "release_ref": release_ref,
+        "release_sha": release_sha,
+        "base_ref": base,
+        "base_sha": base_sha,
+        "approved_commits": unique_approved,
+        "commits_in_release": commits_in_release,
+        "same_tree_as_single_commit": same_tree,
+        "changed_files": changed_files,
+        "develop_ref": develop,
+        "develop_sha": develop_sha,
+        "develop_diff_files": develop_diff_files,
+        "problems": problems,
+    }
+
+
+def format_release_check(report: dict[str, Any]) -> str:
+    lines = [
+        f"release: {report['release_ref']} ({report['release_sha']})",
+        f"base: {report['base_ref']} ({report['base_sha']})",
+        f"approved_commits: {', '.join(report['approved_commits'])}",
+        f"commits_in_release ({len(report['commits_in_release'])}): "
+        + ("; ".join(report["commits_in_release"]) if report["commits_in_release"] else "none"),
+        f"same_tree_as_single_commit: {'yes' if report['same_tree_as_single_commit'] else 'no'}",
+        f"changed_files ({len(report['changed_files'])}): "
+        + (", ".join(report["changed_files"]) if report["changed_files"] else "none"),
+    ]
+    if report["develop_ref"]:
+        dev_status = "matched" if not report["develop_diff_files"] else "diff: " + ", ".join(report["develop_diff_files"])
+        lines.append(f"develop: {report['develop_ref']} ({report['develop_sha']}) | {dev_status}")
+    if report["problems"]:
+        lines.append("status: held")
+        lines.extend(f"- {item}" for item in report["problems"])
+    else:
+        lines.append("status: ok")
+    return "\n".join(lines)
+
+
 # ---------- 根 issue 进度区 ----------
 
 def progress_path(repo: str, task: str) -> Path:
@@ -458,6 +588,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     pre.add_argument("--will", action="append", required=True)
     card = sub.add_parser("card-check")
     card.add_argument("--file", required=True, help="arch §0 判定的落盘文件")
+    rel = sub.add_parser("release-check")
+    rel.add_argument("--repo", required=True, help="仓库或工作树路径")
+    rel.add_argument("--release", required=True, help="汇总分支名或引用，如 release-47")
+    rel.add_argument("--base", default="origin/main", help="上线基准引用，默认 origin/main")
+    rel.add_argument("--develop", help="测试分支引用，如 origin/develop")
+    rel.add_argument("--commit", action="append", required=True, help="已批准的步骤源 SHA（可多次传入）")
+    rel.add_argument("--no-fetch", action="store_true", help="跳过 git fetch origin")
     prog = sub.add_parser("progress", parents=[common])
     prog.add_argument("--issue", help="根 issue URL；第一次必填")
     prog.add_argument("--steps-file", help="步骤 JSON；第一次或步骤变化时给")
@@ -490,6 +627,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(sections["验收条件"])
             print("验收前提：")
             print(sections["验收前提"])
+        elif opts.command == "release-check":
+            report = release_check(opts.repo, opts.release, opts.base, opts.commit,
+                                   develop=opts.develop, fetch=not opts.no_fetch)
+            print(format_release_check(report))
+            return EXIT_HELD if report["problems"] else EXIT_OK
         else:
             results = preflight(opts.will)
             for verdict, text in results:

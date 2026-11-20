@@ -833,6 +833,27 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.w.writes, [])
         self.assertIn("已关闭", self.w.replies[-1]["text"])
 
+    def test_hot_reload_detects_dependency_update_and_rejects_broken_syntax(self):
+        import os
+        with tempfile.TemporaryDirectory(prefix="hwf-fb-reload-") as tmp:
+            root = Path(tmp)
+            fb_py = root / "feishu-bridge.py"
+            sec_py = root / "secretary.py"
+            fb_py.write_text("a = 1\n", encoding="utf-8")
+            sec_py.write_text("b = 2\n", encoding="utf-8")
+            paths = (fb_py, sec_py)
+            base = FB.snapshot_mtimes(paths)
+            self.assertEqual(FB.reloadable_changes(base, paths), [])
+
+            sec_py.write_text("def bad(:\n", encoding="utf-8")
+            t1 = base[sec_py] + 1_000_000
+            os.utime(sec_py, ns=(t1, t1))
+            self.assertEqual(FB.reloadable_changes(base, paths), [])
+
+            sec_py.write_text("b = 3\n", encoding="utf-8")
+            os.utime(sec_py, ns=(t1 + 2_000_000, t1 + 2_000_000))
+            self.assertEqual(FB.reloadable_changes(base, paths), [sec_py])
+
 
 if __name__ == "__main__":
     unittest.main()

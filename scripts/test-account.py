@@ -52,6 +52,32 @@ def holder_of(task: str, issue: str | None) -> str:
     return f"{task}#{issue}" if issue else task
 
 
+def normalize_account(raw: str) -> str:
+    """去掉从 Markdown 表格或命令行复制时带入的反引号、引号和首尾空白，防止同名账号绕过互斥锁。"""
+    acc = raw.strip().strip("`'\"“”‘’").strip()
+    if not acc:
+        raise RuntimeError(f"无效的测试账号标识：{raw!r}")
+    return acc
+
+
+def canonicalize_claims(raw_claims: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """迁移占用表中历史遗留的带引号键；若同一账号出现多条记录，优先保留未收尾且最早占用的记录。"""
+    cleaned: dict[str, dict[str, Any]] = {}
+    for raw_key, entry in raw_claims.items():
+        acc = normalize_account(raw_key)
+        if acc not in cleaned:
+            cleaned[acc] = entry
+            continue
+        prev = cleaned[acc]
+        prev_closed = bool(prev.get("repo") and task_closed(prev["repo"], prev["task"]))
+        curr_closed = bool(entry.get("repo") and task_closed(entry["repo"], entry["task"]))
+        if prev_closed and not curr_closed:
+            cleaned[acc] = entry
+        elif prev_closed == curr_closed and int(entry.get("at", 0)) < int(prev.get("at", 0)):
+            cleaned[acc] = entry
+    return cleaned
+
+
 @contextmanager
 def claims_locked() -> Iterator[dict[str, dict[str, Any]]]:
     """独占读写占用表（账号 → 占用信息），退出时原子写回。"""
@@ -59,10 +85,11 @@ def claims_locked() -> Iterator[dict[str, dict[str, Any]]]:
     with open(CLAIMS_PATH.with_suffix(".lock"), "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
-            claims = json.loads(CLAIMS_PATH.read_text()) if CLAIMS_PATH.exists() else {}
+            loaded = json.loads(CLAIMS_PATH.read_text()) if CLAIMS_PATH.exists() else {}
         except ValueError:
             # 读不懂就停下，不当成空表：当成空表会把在用账号重新分出去。
             raise RuntimeError(f"占用表无法解析，请人工检查：{CLAIMS_PATH}")
+        claims = canonicalize_claims(loaded)
         yield claims
         tmp = CLAIMS_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(claims, ensure_ascii=False, indent=2))
@@ -85,18 +112,19 @@ def drop_finished(claims: dict[str, dict[str, Any]]) -> list[str]:
 
 def claim(repo: str, task: str, issue: str | None, candidates: Sequence[str]) -> str | None:
     holder = holder_of(task, issue)
+    normalized = list(dict.fromkeys(normalize_account(c) for c in candidates))
     with claims_locked() as claims:
         for acc in drop_finished(claims):
             print(f"已收尾任务的账号自动释放：{acc}", file=sys.stderr)
-        for acc in candidates:
+        for acc in normalized:
             if claims.get(acc, {}).get("holder") == holder:
                 return acc
-        for acc in candidates:
+        for acc in normalized:
             if acc not in claims:
                 claims[acc] = {"holder": holder, "task": task, "issue": issue,
                                "repo": str(Path(repo).resolve()), "at": int(time.time())}
                 return acc
-        for acc in candidates:
+        for acc in normalized:
             print(f"{acc} 被占用：{claims[acc]['holder']}", file=sys.stderr)
         return None
 

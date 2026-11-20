@@ -912,6 +912,36 @@ def save_state(state: Mapping[str, Any]) -> None:
     tmp.replace(STATE_PATH)  # 原子替换，避免中途退出留下半截状态。
 
 
+def watched_scripts(base_dir: Path | None = None) -> tuple[Path, ...]:
+    root = base_dir or Path(__file__).resolve().parent
+    return tuple(root / name for name in ("gitlab-inbox.py", "find-scheduler.py", "proactive.py"))
+
+
+def snapshot_mtimes(paths: Sequence[Path]) -> dict[Path, int]:
+    return {p: p.stat().st_mtime_ns for p in paths if p.exists()}
+
+
+def reloadable_changes(baseline: Mapping[Path, int], paths: Sequence[Path]) -> list[Path]:
+    """检测常驻进程依赖的本地脚本是否已更新；存在语法错误或半截写入时暂缓重载。"""
+    current = snapshot_mtimes(paths)
+    changed = [p for p in paths if baseline.get(p) != current.get(p)]
+    if not changed:
+        return []
+    for p in paths:
+        if p.exists():
+            try:
+                compile(p.read_bytes(), str(p), "exec")
+            except (OSError, SyntaxError) as error:
+                log(f"skip hot-reload due to invalid syntax in {p.name}: {error}")
+                return []
+    return changed
+
+
+def scout_busy(scout: Any) -> bool:
+    thread = getattr(scout, "_thread", None)
+    return bool(thread is not None and thread.is_alive())
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--once", action="store_true", help="run a single polling round")
@@ -919,6 +949,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if os.environ.get("HERDR_ENV") != "1":
         print("gitlab-inbox must run inside a Herdr-managed pane", file=sys.stderr)
         return 1
+    watched = watched_scripts()
+    baseline = snapshot_mtimes(watched)
     config = load_config()
     if config is None:
         print(f"missing config {CONFIG_PATH}", file=sys.stderr)
@@ -935,6 +967,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
         if args.once:
             return 0
+        if not scout_busy(scout):
+            changed = reloadable_changes(baseline, watched)
+            if changed:
+                names = ", ".join(p.name for p in changed)
+                log(f"reloading gitlab-inbox after code update: {names}")
+                os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
         if scout is not None:
             scout.tick_in_background()  # 主动接活（observe 档）在后台线程跑，出错只记日志
         time.sleep(int(config.get("interval_seconds", 60)))

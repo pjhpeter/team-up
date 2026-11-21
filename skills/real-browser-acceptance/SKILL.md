@@ -39,6 +39,10 @@ description: 在真实浏览器里按验收点做端到端自动化验收并交�
 
 **自己解决的问题**：浏览器目录、登录、遮罩和弹窗、端口占用、找页面入口、造测试数据。先查 howto 里的已知做法，再换办法；同一问题最多换 2 种办法，仍失败才标阻塞，并报告每种办法和现场。
 
+- **Ego Lite 测试站点单站切换账号**：在默认浏览器资料新建本轮 `TaskSpace` 打开非生产测试站点（本地专属端口或 `smoke` 测试域名，如 `develop.bootingai.net`、`app.develop.lookai.app`）时，若自动带入非本轮分配账号的登录态，不向用户索要空白浏览器资料或 `profileId`，按两步自行切换：
+  1. **核对同站点并发**：本地专属端口按 `origin` 天然隔离可直接切换；共享测试域名先查 `listTaskSpaces()` 中其他活跃空间的标签页 URL（团队任务同时查 `python3 ~/.hwf/scripts/test-account.py list` 是否有其他在途任务正持有同站点账号），确认没有其他任务正在使用同一测试域名。若同一测试域名正被其他在途任务使用，报并发占用等待，不清对方会话。
+  2. **仅清当前测试站点登录态**：在该测试页执行 `localStorage.clear(); sessionStorage.clear()`，调用 `Storage.clearDataForOrigin`（`origin` 仅传当前测试站，`storageTypes: "cookies,local_storage"`），并用 `Network.getAllCookies` 过滤出 `domain`（去前导点后）等于当前测试站 hostname 或其专属测试子域（如 `develop.bootingai.net`、`app.develop.lookai.app`、`develop.lookai.app`）的 Cookie 逐条 `Network.deleteCookies`，刷新后登录本轮账号。**严禁**调用 `Network.clearBrowserCookies`、`Network.clearBrowserCache` 或无 `browserContextId` 的 `Storage.clearCookies`，严禁删除一级根域、生产域名（如 `look-ai.cn`、`lookfashion.ai`）或其他子域（如 `git.bootingai.net`、`admin.lookai.cc`）的 Cookie。
+
 **直接停下回报的问题**：代码缺陷；账号、积分、权限不足；后端未部署或接口报未部署；测试工具本身不可用。
 
 预检第 1–3 项处理后仍不成立，或所有验收点都造不出条件：不跑验收点，按第 6 步清理，以「阻塞」结尾，附对应预检项、报错原文、现场截图、已试过的办法。只有部分验收点造不出条件，就逐点标阻塞，其余继续；正式测试中某点造条件连续失败 2 次，同样跳到下一点。预检失败不等于免测，截图门禁仍未满足。

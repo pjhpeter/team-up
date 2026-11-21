@@ -14,6 +14,7 @@
 - 2026-11-15 #483：调度者手写 INDEX 行没加反引号，收件箱找不到负责人，用户的回复晚到约 7 分钟。
 - 同一天 #483：免打扰模式下仍单独发了 4 条阶段进度评论，每条都转成一条飞书消息。
 - 同一天 #483：先问用户「同意合并吗」，用户同意后才发现本账号没有 main 的合并权限，白跑一轮。
+- 2026-11-21 #484：前端 main MR 标题写成 `fix: #484 …` 命中 GitLab 自动关单规则，用户点合并瞬间把仍有后续步骤的发起 issue 误关了。
 
 INDEX：index-add 追加本调度者的一行（接手别人的任务也是追加，最后一行是现在的负责人）；--queued 追加调度者列留空的
 排队行。index-set 只改本调度者自己那行的状态；收尾状态（done/delivered/closed/cancelled）只能由 wrapup.py 写。
@@ -215,8 +216,40 @@ def allowed(level: int, rules: Sequence[dict[str, Any]]) -> bool:
     return any(0 < int(rule.get("access_level") or 0) <= level for rule in rules)
 
 
+def mr_closing_issues(host: str, project: str, iid: str) -> list[str]:
+    """查询该 MR 合并进默认分支后会被 GitLab 自动关闭的未关 issue 列表。"""
+    items = api_get(host, f"projects/{quote(project, safe='')}/merge_requests/{iid}/closes_issues") or []
+    return [f"#{item['iid']}" for item in items if item.get("iid") is not None and item.get("state", "opened") != "closed"]
+
+
+def autoclose_message(target: str, closing: Sequence[str]) -> str:
+    return (f"{target} 合并后会自动关闭 {', '.join(closing)}（标题、描述或提交含 fix: #N / closes #N 等自动关单关键词）；"
+            "请先用 glab mr update 改掉标题/描述（如写成「fix: 说明（关联 #N）」）并确认 closes_issues 为空后再发")
+
+
+def body_autoclose_problems(body: str, checked_urls: set[str]) -> list[str]:
+    """扫描评论正文里贴出的打开态 MR，拦截夹带自动关单毒丸的合并链接（含 --will none 与完成汇报）。"""
+    seen = set(checked_urls)
+    problems: list[str] = []
+    for match in MR_URL.finditer(body):
+        url = match.group(0)
+        if url in seen:
+            continue
+        seen.add(url)
+        try:
+            mr = api_get(match["host"], f"projects/{quote(match['project'], safe='')}/merge_requests/{match['iid']}")
+            if mr.get("state") != "opened":
+                continue
+            closing = mr_closing_issues(match["host"], match["project"], match["iid"])
+        except _WR.WrapupError:
+            continue
+        if closing:
+            problems.append(autoclose_message(url, closing))
+    return problems
+
+
 def check(will: str) -> tuple[str, str]:
-    """返回（ok / no / unknown，给人看的一句话）。"""
+    """返回（ok / no / autoclose / unknown，给人看的一句话）。"""
     action, _, target = will.partition("=")
     if action == "merge":
         match = MR_URL.match(target)
@@ -225,6 +258,9 @@ def check(will: str) -> tuple[str, str]:
         mr = api_get(match["host"], f"projects/{quote(match['project'], safe='')}/merge_requests/{match['iid']}")
         if mr.get("state") != "opened":
             return "no", f"{target} 现在是 {mr.get('state')}，不用再合并"
+        closing = mr_closing_issues(match["host"], match["project"], match["iid"])
+        if closing:
+            return "autoclose", autoclose_message(target, closing)
         if mr.get("has_conflicts"):
             return "no", f"{target} 有冲突，合并不了"
         if not (mr.get("user") or {}).get("can_merge"):
@@ -540,6 +576,11 @@ def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequ
     if kind == "todo" and not wills:
         raise RecordError("todo 必须带 --will：写明用户同意后你要做的动作，只需要用户自己做就写 --will none")
     results = preflight(wills)
+    checked_mrs = {w.partition("=")[2] for w in wills if w.startswith("merge=")}
+    body_problems = [] if kind == "record" else body_autoclose_problems(body, checked_mrs)
+    autoclose = [text for verdict, text in results if verdict == "autoclose"] + body_problems
+    if autoclose:
+        return EXIT_HELD, "没发：发现 MR 夹带自动关单关键词，点合并会擅自关掉 issue：\n- " + "\n- ".join(autoclose)
     blocked = [text for verdict, text in results if verdict == "no"]
     if blocked:
         return EXIT_HELD, "没发：下面的动作本账号做不了，不要请用户同意，改成请用户来做（--will none）：\n- " + "\n- ".join(blocked)
@@ -634,8 +675,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return EXIT_HELD if report["problems"] else EXIT_OK
         else:
             results = preflight(opts.will)
+            labels = {"ok": "能做", "no": "做不了", "autoclose": "禁止（会自动关单）", "unknown": "无法确认"}
             for verdict, text in results:
-                print(f"{ {'ok': '能做', 'no': '做不了', 'unknown': '无法确认'}[verdict] }：{text}")
+                print(f"{labels[verdict]}：{text}")
             return EXIT_HELD if any(verdict != "ok" for verdict, _ in results) else EXIT_OK
     except (RecordError, _WR.WrapupError, OSError, ValueError, KeyError) as error:
         print(f"task-record failed: {error}", file=sys.stderr)

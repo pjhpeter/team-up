@@ -34,6 +34,7 @@ class FakeGlab:
     def __init__(self) -> None:
         self.mr: dict[str, Any] = {"state": "opened", "has_conflicts": False, "target_branch": "main",
                                    "user": {"can_merge": True}}
+        self.closes_issues: list[dict[str, Any]] = []
         self.level = 30
         self.protected_tags: Any = []
         self.posted: list[str] = []
@@ -44,6 +45,8 @@ class FakeGlab:
             return {"id": 900 + len(self.posted)}
         if "/notes/" in path:
             return {"body": self.posted[int(path.rsplit("/", 1)[1]) - 901]}
+        if path.endswith("/closes_issues"):
+            return self.closes_issues
         if "/merge_requests/" in path:
             return self.mr
         if path.endswith("/protected_tags?per_page=100"):
@@ -152,6 +155,29 @@ class NoteTests(Case):
 
     def test_mergeable_request_is_sent(self) -> None:
         self.assertEqual(self.note("todo", "同意的话我来合并", f"merge={MR}")[0], TR.EXIT_OK)
+
+    def test_mr_that_autoclose_open_issue_is_blocked_even_with_will_none(self) -> None:
+        # 2026-11-21 #484：前端 main MR 标题写了 fix: #484，调度者用 --will none 请用户点合并，一点就把 #484 自动关了。
+        self.glab.closes_issues = [{"iid": 484, "state": "opened"}]
+        code1, text1 = self.note("todo", "同意的话我来合并", f"merge={MR}")
+        self.assertEqual((code1, self.glab.posted), (TR.EXIT_HELD, []))
+        self.assertIn("自动关闭 #484", text1)
+        self.assertNotIn("--will none", text1)
+
+        code2, text2 = self.note("todo", f"请点击合并：{MR}", "none")
+        self.assertEqual((code2, self.glab.posted), (TR.EXIT_HELD, []))
+        self.assertIn("自动关闭 #484", text2)
+
+        code3, _ = self.note("delivery-done", f"交付完成，上线 MR：{MR}")
+        self.assertEqual((code3, self.glab.posted), (TR.EXIT_HELD, []))
+
+        # 登记池存档（record）、已关闭的子 issue 或已合并的历史 MR 不误拦。
+        self.assertEqual(self.note("record", f"登记池备忘：{MR}")[0], TR.EXIT_OK)
+        self.glab.closes_issues = [{"iid": 485, "state": "closed"}]
+        self.assertEqual(self.note("todo", f"请点击合并：{MR}", "none")[0], TR.EXIT_OK)
+        self.glab.closes_issues = [{"iid": 484, "state": "opened"}]
+        self.glab.mr["state"] = "merged"
+        self.assertEqual(self.note("step-done", f"步骤 1 已合并测试分支：{MR}")[0], TR.EXIT_OK)
 
     def test_protected_tag_blocks_and_unreadable_rule_is_disclosed(self) -> None:
         will = "tag=https://git.example.com/group/proj@2.7.20"

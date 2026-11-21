@@ -1,6 +1,6 @@
 {
   "sessionDefaultSettings": {
     "model": "gemini-4-carbon",
-    "reasoningEffort": "medium"
+    "reasoningEffort": "high"
   }
 }

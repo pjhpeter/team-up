@@ -14,7 +14,7 @@
 | precheck | 机械取证、候选问题和严重度建议；交证据表，不给通过结论 |
 | code-review | 用例终审、完整代码评审、常规回改复核、实现前核验；独立于作者 |
 | test-writer | 按确认的验收条件编写/回改用例、提前准备脚本、补步骤的定向断言 |
-| test | 正常流程评审放行后、debug 在 develop 部署后的真实自动化、UI 走查、报告与截图 |
+| test | 正常流程评审放行后、debug 在 develop 部署后的真实自动化、UI 走查、报告与录屏/截图证据 |
 | dev-fe / dev-be / dev | 分别只写前端、后端或不分端的仓库，按已批准验收与用例实现、修复 |
 
 - 成员执行体、模型、thinking、YOLO 启动参数取 hwf 合并配置：全局插件配置（`herdr plugin config-dir herdr-workflows`）→ 仓库 `.hwf/config.yaml` → `.hwf/config.local.yaml`，后者按整条命名 entry 覆盖。同机同角色仅维护全局配置，不在仓库重复定义；全局版本化配置为 `herdr/config.yaml`。

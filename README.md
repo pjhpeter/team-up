@@ -21,13 +21,13 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | --- | --- |
 | `PROTOCOL.md` | 短入口：共同边界、阶段路由、按需阅读与规则维护方式 |
 | `protocol/` | 七个主题：调度、沟通、规划、实现、评审测试、交付、工作树；进入对应阶段时再读 |
-| `skills/` | 成员干活的具体做法（install.sh 链接到 `~/.agents/skills/` 和 `~/.claude/skills/`，不走团队流程时也能用）：`acceptance-test-cases` 写和评测试用例，`test-first-evidence` 测试先行留证与实现前核验，`scoped-code-review` 限定范围的代码评审与回改核验，`real-browser-acceptance` 真实浏览器验收与清理。协议管何时做、谁做、出口，skill 管怎么做 |
+| `skills/` | 成员干活的具体做法（install.sh 链接到 `~/.agents/skills/` 和 `~/.claude/skills/`，不走团队流程时也能用）：`acceptance-test-cases` 写和评测试用例，`test-first-evidence` 测试先行留证与实现前核验，`scoped-code-review` 限定范围的代码评审与回改核验，`real-browser-acceptance` 真实浏览器或桌面验收、过程录屏与附件上传、服务清理。协议管何时做、谁做、出口，skill 管怎么做 |
 | `workflows/team-up.yaml` | Herdr 启动团队的入口 |
 | `herdr/config.yaml` | 各角色用什么工具、什么模型（install.sh 把 Herdr 插件配置链接到这里） |
 | `herdr/droid-arch.json` | 架构师（droid）的模型与思考档；交互式 droid 只能用 `--settings` 文件指定 |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
+| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件并回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `omp-extensions/` | omp 扩展：调度者手改 INDEX 或直接用 glab 发 issue 评论时拦下，要求改用 `task-record.py`（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
@@ -63,7 +63,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 图片或文件可以和文字一起发送，也可以先发附件再说明要做什么；自然语言和显式命令都能带附件。识别服务失败会明确提示「处理失败」，保留原请求供回复「重试」，不会让用户反复补已经给出的编号，也不会擅自转给引用中的另一张任务。真正缺少目标或内容时才追问。飞书桥相关脚本更新后会在队列空闲时自动热重载；改了本机配置则需要在原来的窗格按 Ctrl+C，再运行 `python3 ~/.hwf/scripts/feishu-bridge.py` 才会生效；之前已回复过的消息不会自动重试。
 
-从一个需求拆出独立 issue 时，各自使用独立飞书话题：原话题只留新话题链接，结果、截图和确认各归各。调度者按 `protocol/communication.md`「独立需求与飞书话题」登记并核对建立结果；原话题不会因提到别的编号而切换绑定。`/status` 读取对应 GitLab issue 的当前状态；普通「已收到」回执只代表已转交，不代表执行或交付完成。
+从一个需求拆出独立 issue 时，各自使用独立飞书话题：原话题只留新话题链接，结果、录屏/截图和确认各归各。调度者按 `protocol/communication.md`「独立需求与飞书话题」登记并核对建立结果；原话题不会因提到别的编号而切换绑定。`/status` 读取对应 GitLab issue 的当前状态；普通「已收到」回执只代表已转交，不代表执行或交付完成。
 
 ### 私聊即秘书：多个需求统一跟进
 

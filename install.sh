@@ -66,7 +66,7 @@ done
 
 # 5. 依赖检查
 python3 -c 'import yaml' 2>/dev/null && echo "[已有]   python3 + PyYAML（只有测试用到）" || echo "[注意]   测试需要 PyYAML：python3 -m pip install pyyaml"
-for c in herdr glab omp claude codex droid; do
+for c in herdr glab swiftc omp claude codex droid; do
   command -v "$c" >/dev/null 2>&1 && echo "[已有]   $c" || echo "[注意]   没装 $c（角色配置里用到）"
 done
 echo "装好了。每个要接入的仓库跑一次：python3 $HWF/scripts/init-project.py <仓库路径> --apply"

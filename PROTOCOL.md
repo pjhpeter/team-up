@@ -97,7 +97,7 @@
 这是“hwf入口＋有状态调度者协议”，不是YAML自动强制的业务状态机。loader通过仅证明入口可加载，不证明交付阶段执行过。
 
 - workflow变更用 `hwf workflow validate ~/.hwf/workflows/team-up.yaml`。
-- 脚本变更只跑直接相关测试文件/用例，不全量兜底；规则提醒监听本入口、`protocol/` 及 `skills/`。
+- 脚本变更只跑直接相关测试文件/用例，不全量兜底；规则提醒监听本入口、`protocol/`、`skills/` 及 `herdr/`。
 - 发现脚本探测用 `HERDR_DISCOVERY_BIN` 覆盖路径，不全局导出会影响profile加载器的 `HERDR_BIN_PATH`。
 - 整项业务交付仍须实际需求、版本和运行证据；改协议不自动启动业务服务或代替验收。
 

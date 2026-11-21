@@ -199,6 +199,9 @@ class ClaimTest(Case):
         self.assertFalse(fake.starts())
         fake = FakeHerdr([SCHED, agent("i453-arch", "w1:pT")])  # 跑的是 sol：必须重启
         self.assertEqual(self.run_claim(fake, keep_session=True)["action"], "restarted")
+        wrong_kind = FakeHerdr([SCHED, agent("i453-arch", "w1:pT", kind="codex")])  # kind 变了也必须重启
+        wrong_kind.argv["w1:pT"] = ["codex", "--model", "claude-opus-5-5", "--effort", "medium"]
+        self.assertEqual(self.run_claim(wrong_kind, keep_session=True)["action"], "restarted")
 
     def test_crowded_tab_opens_new_tab(self) -> None:
         fake = FakeHerdr([SCHED], width=100, height=20)

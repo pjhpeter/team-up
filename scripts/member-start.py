@@ -404,7 +404,7 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
         if not NAME_RE.fullmatch(name):
             raise ClaimError(f"登记名过长或不合法：{name}（协议规定不截断，报阻塞）")
         herdr("pane", "rename", pane["pane_id"], label)
-        if keep_session and running_args_match(pane["pane_id"], profile["args"]):
+        if keep_session and member.get("agent") == profile["kind"] and running_args_match(pane["pane_id"], profile["args"]):
             if name != old:
                 herdr("agent", "rename", pane["pane_id"], name)
             action, agent = "kept", member

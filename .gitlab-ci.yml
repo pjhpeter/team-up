@@ -2,8 +2,8 @@
 test:
   image: python:3.11-slim
   before_script:
-    # 留证测试使用真实临时仓库，不能用 mock 掩盖 Git 行为。
-    - apt-get update -qq && apt-get install -y --no-install-recommends git
+    # 留证测试使用真实临时仓库，omp 扩展测试调用 node，均不用 mock 掩盖运行时行为。
+    - apt-get update -qq && apt-get install -y --no-install-recommends git nodejs
   script:
     - pip install -q pyyaml
     - python3 -m unittest discover -s tests -p 'test_*.py'

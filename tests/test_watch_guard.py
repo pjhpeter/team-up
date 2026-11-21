@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import subprocess
+import tempfile
 import unittest
 
 EXT = Path(__file__).resolve().parents[1] / "omp-extensions/hwf-scheduler-watch-guard.ts"
@@ -11,8 +13,12 @@ EXT = Path(__file__).resolve().parents[1] / "omp-extensions/hwf-scheduler-watch-
 
 class WatchGuardTest(unittest.TestCase):
     def test_ignores_peer_schedulers_and_other_schedulers_members(self) -> None:
-        script = f"""
-import {{ analyzeSession, findUnwatched }} from {json.dumps(EXT.as_uri())};
+        # CI 镜像自带的 Node 20 不支持直接 import .ts 后缀；扩展源码本身是纯 ESM JS，拷为临时 .mjs 兼容各版本 Node。
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = Path(tmp) / "hwf-scheduler-watch-guard.mjs"
+            shutil.copyfile(EXT, mod)
+            script = f"""
+import {{ analyzeSession, findUnwatched }} from {json.dumps(mod.as_uri())};
 
 const lines = [
   JSON.stringify({{
@@ -52,7 +58,7 @@ const registry = {{
 const unwatched = findUnwatched(parsed, agents, "w18:p6Z", registry, "delivery-scheduler-w18-p6z");
 console.log(JSON.stringify(unwatched));
 """
-        res = subprocess.run(["node", "--input-type=module", "-e", script], capture_output=True, text=True, check=False)
+            res = subprocess.run(["node", "--input-type=module", "-e", script], capture_output=True, text=True, check=False)
         self.assertEqual(res.returncode, 0, res.stderr)
         unwatched = json.loads(res.stdout.strip())
         self.assertEqual(unwatched, [{"name": "i484-dev-fe", "pane": "w18:pAN", "status": "working"}])

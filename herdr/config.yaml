@@ -75,7 +75,7 @@ profiles:
     kind: codex
     args: ["-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=low", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]
   # 双层评审的辅审（precheck）：承担机械阅读、取证、候选问题清单，不输出通过结论。
-  # 不计入 5/3/6 评审轮次；最终结论由阶段终审人签发（方案 arch、用例 code-review、代码 arch）。
+  # 不计入 5/3/3 评审轮次；最终结论由阶段终审人签发（方案 arch、用例 code-review、代码 arch）。
   # 使用 codex + gpt-6.2-astra，思考强度 low。
   # 不输出通过结论。
   precheck:

@@ -69,10 +69,10 @@ LAUNCH_COOLDOWN_S = 600
 RESET_COMMANDS = frozenset({"/new", "/clear"})
 STATUS_COMMANDS = frozenset({"/status"})
 GO_COMMANDS = frozenset({"/go"})
-# 通知模式（见 protocol/communication.md「通知模式」）：免打扰 = 只在大步骤完成和需要用户处理时发评论；详尽 = 每个小阶段都发。
+# 通知模式（见 protocol/communication.md「通知模式」）：免打扰 = 飞书私聊只推要用户决定、实质答复和整项交卷（步骤汇总留 GitLab）；详尽 = 每个小阶段都发。
 QUIET, VERBOSE = "quiet", "verbose"
 NOTIFY_COMMANDS = {"/免打扰": QUIET, "/quiet": QUIET, "/详尽": VERBOSE, "/verbose": VERBOSE}
-NOTIFY_LABELS = {QUIET: ("免打扰", "之后只在每个步骤完成、整项交付完成和需要你处理时发消息"),
+NOTIFY_LABELS = {QUIET: ("免打扰", "之后私聊只在需要你决定、答复你问题和整项交付完成时发消息（步骤与过程记录留 GitLab）"),
                  VERBOSE: ("详尽", "之后每个小阶段都会发消息")}
 # `/go` 后的模式词或整条独立模式指令进入 debug 流程，见 protocol/implementation.md「debug 模式」。
 # 兼容两个词之间的空格，例如「debug 模式」「改 bug」「修 bug」「极简 模式」；普通正文交调度者判断。

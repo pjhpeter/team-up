@@ -125,12 +125,28 @@ class StateTests(Case):
 
 
 class NoteTests(Case):
-    def test_quiet_mode_holds_stage_progress_but_sends_step_summary(self) -> None:
+    def test_quiet_mode_holds_stage_archives_step_and_only_tracks_user_facing_notice(self) -> None:
         self.assertEqual(self.note("stage")[0], TR.EXIT_HELD)
         self.assertEqual(self.glab.posted, [])
-        code, link = self.note("step-done", "步骤 1 完成")
-        self.assertEqual((code, self.glab.posted), (TR.EXIT_OK, ["步骤 1 完成"]))
-        self.assertIn(link, TR.read_top(self.state())["最近用户通知"])
+        todo_code, todo_link = self.note("todo", "需要你决定：选 A 还是 B", "none")
+        self.assertEqual(todo_code, TR.EXIT_OK)
+        self.assertEqual(self.glab.posted[-1], "需要你决定：选 A 还是 B\n\n<!-- hwf-kind:todo -->")
+        self.assertIn(todo_link, TR.read_top(self.state())["最近用户通知"])
+
+        # 免打扰下 step-done 与 record 照常写 GitLab 备查，但带对应 hwf-kind 且不覆盖「最近用户通知」。
+        step_code, _ = self.note("step-done", "步骤 1 完成")
+        rec_code, _ = self.note("record", "已评审用例存档")
+        self.assertEqual((step_code, rec_code), (TR.EXIT_OK, TR.EXIT_OK))
+        self.assertEqual(self.glab.posted[-2:], [
+            "步骤 1 完成\n\n<!-- hwf-kind:step-done -->",
+            "已评审用例存档\n\n<!-- hwf-kind:record -->",
+        ])
+        self.assertIn(todo_link, TR.read_top(self.state())["最近用户通知"])
+
+        done_code, done_link = self.note("delivery-done", "整项交付完成")
+        self.assertEqual(done_code, TR.EXIT_OK)
+        self.assertTrue(self.glab.posted[-1].endswith("<!-- hwf-kind:delivery-done -->"))
+        self.assertIn(done_link, TR.read_top(self.state())["最近用户通知"])
 
     def test_verbose_mode_sends_stage_progress(self) -> None:
         TR.state_set(self.repo, TASK, "通知模式", "详尽（用户 note_3）")

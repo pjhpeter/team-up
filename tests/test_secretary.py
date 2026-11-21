@@ -231,9 +231,10 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("交付完成", self.w.sent[-1]["text"])
         self.assertEqual(len(self.w.replies), replies)
 
-    def test_forwards_agent_notes_but_not_receipts_user_or_system(self) -> None:
+    def test_forwards_agent_notes_but_not_receipts_process_notes_user_or_system(self) -> None:
         self.waiting()
-        self.w.agent_note(7, "步骤 1 完成：列表改版\n\n<details>全文</details>")
+        self.w.agent_note(7, "需要你决定：是否保留旧入口\n\n<details>全文</details>\n\n<!-- hwf-kind:todo -->")
+        self.w.agent_note(7, "步骤 1 完成：列表改版\n\n<details>全文</details>\n\n<!-- hwf-kind:step-done -->")
         self.w.agent_note(7, f"已收到，已转交目标 issue {URL7} 的消息，等待调度者回复。")
         self.w.agent_note(7, f"@pengjh 已收到目标 issue {URL7} 的消息。目前没有在线负责人，已转交调度入口，等待接手后回复。")
         self.w.gitlab_comment(7, "我自己说的话")
@@ -243,8 +244,10 @@ class SecretaryTest(unittest.TestCase):
         sent = self.forwarded()[0]
         self.assertEqual(sent["chat"], "oc_1")
         self.assertIn("#7", sent["text"])
-        self.assertIn("步骤 1 完成", sent["text"])
+        self.assertIn("需要你决定：是否保留旧入口", sent["text"])
+        self.assertNotIn("步骤 1 完成", sent["text"])
         self.assertNotIn("全文", sent["text"])
+        self.assertNotIn("hwf-kind", sent["text"])
         self.sec.poll()  # 水位已推进，不重复
         self.assertEqual(len(self.forwarded()), 1)
 
@@ -327,28 +330,37 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("你已回复，等调度者接着处理", line)
         self.assertNotIn("⚠️", line)
 
-    def test_every_agent_note_forwards_immediately_and_patrol_is_overview_only(self) -> None:
-        self.w.agent_note(7, "**国内冒烟首轮未通过**：站点可用，验收点未执行")  # 开发中、没 @ 用户也马上转
+    def test_quiet_mode_filters_process_notes_and_receipts_and_patrol_is_overview_only(self) -> None:
+        # 免打扰下：过程存档、步骤完成、中途冒烟播报、无残留收尾回执只留 GitLab，不刷私聊；异常残留与最终交卷仍马上推。
+        self.w.agent_note(7, "484 测试用例（已评审）：https://git.example.com/-/snippets/1\n\n<!-- hwf-kind:record -->")
+        self.w.agent_note(7, "步骤 1 完成：接口接入\n\n<!-- hwf-kind:step-done -->")
+        self.w.agent_note(7, "**国内冒烟首轮未通过**：站点可用，验收点未执行")
         self.w.agent_note(7, "**国内冒烟第2轮**：仍未进入验收")
+        self.w.agent_note(7, "## 待定清单\n- 低风险文案优化")
+        self.w.agent_note(7, "**收尾回执**（wrapup.py 生成）\n- worktree 已清理")
+        self.w.agent_note(7, "**收尾回执**（wrapup.py 生成）\n- **残留**：端口 3001 未释放")
+        self.w.agent_note(7, "@pengjh 整项交付完成，上线 MR：https://git.example.com/frontend/web-v1/-/merge_requests/9\n\n<!-- hwf-kind:delivery-done -->")
         self.sec.poll()
         texts = [s["text"] for s in self.forwarded()]
         self.assertEqual(len(texts), 2)
-        self.assertIn("首轮未通过", texts[0])
-        self.assertIn("第2轮", texts[1])
+        self.assertIn("**残留**", texts[0])
+        self.assertIn("整项交付完成", texts[1])
+        self.assertTrue(all("hwf-kind" not in item for item in texts))
         self.assertEqual(self.state["secretary"]["held"], {})
         self.now += 3600
         text = self.sec.patrol()
         self.assertIn("每小时巡检", text)
         self.assertNotIn("这一小时的进展", text)
 
-    def test_substantive_reply_starting_with_received_is_forwarded(self) -> None:
+    def test_substantive_reply_starting_with_received_is_forwarded_while_command_acks_stay_quiet(self) -> None:
         self.w.agent_note(7, "已收到 note_25884 的重试要求，正在重新领取后台开发成员。")
         self.w.agent_note(7, f"@pengjh 开始跑交付流程。已收到，已转交目标 issue {URL7} 的消息，等待调度者回复。")
+        self.w.agent_note(7, f"@pengjh 已切到免打扰模式，之后私聊只在需要你决定时发消息。已收到，已转交目标 issue {URL7} 的消息，等待调度者回复。")
+        self.w.agent_note(7, "@pengjh 已清空调度者上下文（新会话 `sess-1`），它会按任务记录接着做。")
         self.sec.poll()
         texts = [s["text"] for s in self.forwarded()]
-        self.assertEqual(len(texts), 2)
+        self.assertEqual(len(texts), 1)
         self.assertIn("重新领取后台开发成员", texts[0])
-        self.assertIn("开始跑交付流程", texts[1])
 
     def test_note_mentioning_user_forwards_without_waiting_for_patrol(self) -> None:
         self.w.agent_note(7, "@pengjh test 的采集结果：共 231 条")
@@ -439,8 +451,20 @@ class SecretaryTest(unittest.TestCase):
         (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {URL7: {
             "project": "frontend/web-v1", "iid": 7, "repo": str(self.home / "repo"), "notify": "verbose"}}}))
         self.w.agent_note(7, "代码评审通过")
+        self.w.agent_note(7, "步骤 1 完成：列表改版\n\n<!-- hwf-kind:step-done -->")
+        self.sec.poll()
+        texts = [s["text"] for s in self.forwarded()]
+        self.assertEqual(len(texts), 2)
+        self.assertTrue(all("hwf-kind" not in item for item in texts))
+
+    def test_local_state_verbose_header_also_forwards_process_notes(self) -> None:
+        state_file = self.home / "repo/.hwf/tmp/frontend-web-v1-7/STATE.md"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text("# 调度记录\n\n<!-- hwf:top -->\n- 通知模式：详尽（会话切换）\n<!-- /hwf:top -->\n", encoding="utf-8")
+        self.w.agent_note(7, "步骤 1 完成：列表改版\n\n<!-- hwf-kind:step-done -->")
         self.sec.poll()
         self.assertEqual(len(self.forwarded()), 1)
+        self.assertIn("步骤 1 完成", self.forwarded()[0]["text"])
 
     def test_patrol_flags_exited_scheduler_and_silence(self) -> None:
         self.w.owner = {"task": "frontend-web-v1-7", "live_pane": None, "status": "in-progress"}

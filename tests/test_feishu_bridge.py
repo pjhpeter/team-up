@@ -182,12 +182,13 @@ class BridgeTest(unittest.TestCase):
         return f"![{path.name}](/uploads/x/{path.name})"
 
     def test_folded_full_text_becomes_link_in_feishu(self) -> None:
-        body = "能做，选 A。\n\n<details><summary>完整内容</summary>\n\n很长的全文\n\n</details>\n"
+        body = "能做，选 A。\n\n<details><summary>完整内容</summary>\n\n很长的全文\n\n</details>\n\n<!-- hwf-kind:todo -->\n"
         text = self.b.render_note({"project": "frontend/web-v1", "iid": 7},
                                   {"id": 9, "body": body, "author": {"name": "agent"}})
         self.assertIn("能做，选 A。", text)
         self.assertNotIn("很长的全文", text)
         self.assertNotIn("<details>", text)
+        self.assertNotIn("hwf-kind", text)
         self.assertIn("[查看完整内容](", text)
         self.assertIn("#note_9", text)
 

@@ -10,7 +10,7 @@
 
 ### 创建与开发基线
 
-- scheduler 第一次派 dev 前基于 `origin/main` 创建：`git push origin origin/main:refs/heads/release-<编号>`，用 `git ls-remote origin release-<编号>` 回读，根 issue 评论与 STATE 记录分支和基线 SHA。已存在则复用，不重建、改名或 force push。
+- scheduler 第一次派 dev 前基于 `origin/main` 创建：`git push origin origin/main:refs/heads/release-<编号>`，用 `git ls-remote origin release-<编号>` 回读，在 STATE 与根描述「上线清单」记录分支和基线 SHA（无需为建分支单独发评论；确需留档时只用 `task-record.py note --kind record` 且不 `@用户`）。已存在则复用，不重建、改名或 force push。
 - 同时按 `planning.md`「issue 数量与进度标签」在根描述顶部建「进度」「上线清单」维护区，不另建上线清单 issue。
 - 根 issue 及步骤/子 issue 的开发分支从汇总分支最新提交切出，命名 `feat|fix/issue-<本 issue 编号>-<简述>`，不得从 develop 切出。缺依赖时 dev 停下报 scheduler，由 arch 判断纳入依赖 issue 还是请用户确认（debug 直接请用户确认，不派 arch），不私自整段合 develop。
 - 用户指定其他基线/目标（如 `release-x.y.z`）时，替代默认汇总分支，其余步骤不变，develop 冒烟仍必做。

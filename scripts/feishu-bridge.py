@@ -74,6 +74,7 @@ CONTEXT_TEXT_CAP = 6000  # 建单时带上的话题前文总字数上限，超�
 # 秘书或话题同步搬到飞书的 GitLab 评论，首行带该评论链接。
 RELAYED_NOTE_HEAD = re.compile(r"^[^\n]*?\((https?://[^\s()]+/-/(?:issues|work_items)/\d+#note_\d+)\)")
 FOLDED = re.compile(r"<details>.*?</details>", re.S)  # 评论里折叠的全文
+KIND_TAG = re.compile(r"\s*<!--\s*hwf-kind:([a-z-]+)\s*-->\s*")  # task-record 附的类别注释，飞书会原样显示故渲染前剥离
 CREATE_RE = re.compile(r"^\s*(?:/需求|/issue|需求\s*[:：])\s*", re.I)
 # lark-cli 把消息里的附件渲染成这些标记（见 lark-im 文档 messages-resources-download）：
 #   图片：实时事件「[Image: img_xxx]」，历史记录「![Image](img_xxx)」→ 下载用 --type image
@@ -1146,7 +1147,7 @@ class Bridge:
         return True
 
     def render_note(self, t: dict[str, Any], n: dict[str, Any]) -> str:
-        body = (n.get("body") or "").strip()
+        body = KIND_TAG.sub("", (n.get("body") or "")).strip()
         url = f"{self.issue_url(t['project'], t['iid'])}#note_{n['id']}"
         # 飞书不认折叠标签，会把全文连同标签一起显示；这里只留摘要，全文给链接
         body = FOLDED.sub(f"[查看完整内容]({url})", body)

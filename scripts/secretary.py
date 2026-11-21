@@ -1,7 +1,7 @@
 """秘书：和机器人的私聊窗口就是秘书，统一转达各交付的消息、每小时巡检、回答提问、转发用户的快速回复。
 
-问题：每个交付各有一张 issue 和一个飞书话题，同时跑的交付一多，用户要在好几个话题之间来回看。
-办法：私聊窗口同时当秘书：调度者的每条评论都马上发到私聊主窗口，巡检有变化或异常才汇报。
+问题：每个交付各有一张 issue 和一个飞书话题，同时跑的交付一多，过程存档全刷到私聊会把真正要拍板的消息淹没。
+办法：私聊窗口同时当秘书：免打扰模式下只把需要用户决定、实质答复和整项交卷马上发到私聊主窗口（过程存档与步骤汇总留 GitLab，发 /详尽 则每条都转），巡检有变化或异常才汇报。
 自然消息由一次模型决策识别新需求、已有任务转达、问答或追问，代码核验目标来源后由桥执行，避免背景被误作授权。
 私聊绑定的 issue 只在秘书主窗口通知，原话题仍可回复；群聊绑定保留群内回复，秘书同时私聊转达。
 
@@ -13,7 +13,7 @@
     结构或目标校验失败返回 None，由桥告知用户尚未执行，不回退旧语义入口。
   明确的斜杠指令和帮助入口由桥处理；模型 runner 与消息转达继续共用秘书现有实现。
 看哪些 issue：收件箱登记的发起 issue（state/gitlab-inbox.json 的 origins）加上飞书桥里还没关闭的话题。
-默认转 Agent 评论；私聊绑定的 issue 也保留原话题可见的其他人评论。固定转交回执不转，实质答复不按相似度过滤。
+免打扰下 Agent 评论按 hwf-kind 标记与已知过程回执过滤，只推待办/风险/实质答复/整项交付完成；私聊绑定的 issue 也保留其他人评论。详尽模式除固定转交回执外全转。
 巡检只读：GitLab GET、find-scheduler --owner-of、herdr agent get、本机 INDEX/STATE 修改时间。
 """
 from __future__ import annotations
@@ -39,6 +39,31 @@ SUMMARY_CAP = 600  # 转达只放开头一段，全文给链接
 # 只认 gitlab-inbox.py deliver() 的两种整条回执；调度者以「已收到」开头的实质答复（#483 note_25889）照常转
 RECEIPT = re.compile(r"^(@\S+\s+)?已收到(，已转交目标 issue \S+ 的消息，等待调度者回复。"
                      r"|目标 issue \S+ 的消息。目前没有在线负责人，已转交调度入口，等待接手后回复。)$")
+# task-record.py note 附在评论末尾的类别标签；飞书不隐藏 HTML 注释，转发和拼摘要前必须剥掉。
+KIND_TAG = re.compile(r"\s*<!--\s*hwf-kind:([a-z-]+)\s*-->\s*")
+QUIET_FORWARD_KINDS = frozenset({"todo", "risk", "answer", "delivery-done"})
+# 免打扰下无 hwf-kind 标签时的已知非待办噪音（收件箱纯命令确认回执、正常 wrapup 收尾回执、步骤汇总/存档备案/中途阶段播报）。
+INBOX_ACK = re.compile(
+    r"^(@\S+\s+)?(?:"
+    r"开始跑交付流程[^\n]*?。已收到(?:，已转交目标 issue \S+|目标 issue \S+)[^\n]*"
+    r"|已切到(?:免打扰|详尽)模式，[^\n]*"
+    r"|已清空调度者上下文（新会话\s+`[^`]+`），它会按任务记录接着做。"
+    r")$"
+)
+QUIET_ARCHIVE_NOTE = re.compile(
+    r"^(?:#+\s*|\*\*)?(?:"
+    r"步骤\s*\d+[a-zA-Z]?\s*完成(?:[:：\s*]|$)"
+    r"|待定清单(?:\s|$)"
+    r"|\d{4}-\d{2}-\d{2}\s*·\s*来自\s*#\d+"
+    r"|(?:已评审(?:验收|测试)?用例|测试用例（已评审）|\d+\s*最终技术方案[^\n]*（已确认）)"
+    r"|(?:根\s*issue\s*)?汇总分支(?:基线|创建|记录)"
+    r"|本轮[^\n]{1,40}通过，整项需求尚未完成"
+    r"|(?:代码|方案|用例)评审通过(?:\s|$|[：:，。*])"
+    r"|(?:国内|国际|海外|测试环境)?冒烟(?:首轮|第\s*[0-9一二三四五六七八九十]+\s*轮)"
+    r")"
+)
+USER_ACTION_HINT = re.compile(r"需要你决定|等你确认|待你确认|请确认|请回复|请授权|请合并|请测试|请处理|选一个")
+STATE_VERBOSE_RE = re.compile(r"^- 通知模式：详尽", re.M)
 FOLDED = re.compile(r"<details>.*?</details>", re.S)
 BARE_ISSUE = re.compile(r"(?<![\[\w/&])#(\d+)(?!\d)")  # 已在链接里的「[#12]」、网址里的不算
 WAITING_LABEL = "状态:等你处理"
@@ -54,12 +79,18 @@ DEFAULT_MODEL = {"model": "jc-gpt/gpt-6-luna", "thinking": "medium", "timeout_s"
 
 INTRO = (
     "以后我也是你的秘书，所有在跑的需求都在这个窗口跟进：\n"
-    "1. 各需求调度者发的每条消息，我都马上转到这里\n"
+    "1. 需要你拍板、答复你的问题和整项交卷的消息，我马上转到这里（默认免打扰，步骤汇总与过程存档留 GitLab；发 /详尽 则每条都转）\n"
     "2. 每小时看一遍总览，有变化或卡住了才汇报\n"
     "3. 对某条转达点「回复」，我把你的话转给那个需求；也可以发「#编号 内容」\n"
     "4. 想问某个需求的调度者，直接说「帮我问 481 的调度…」，我替你问，回复会转到这里\n"
     "5. 发「进度」看总览，发「帮助」看用法，其他话直接问我"
 )
+
+
+def strip_kind_tag(text: str) -> tuple[str, Optional[str]]:
+    """剥离评论里的 hwf-kind HTML 注释标记，避免飞书原样渲染出原始注释标签。"""
+    match = KIND_TAG.search(text)
+    return KIND_TAG.sub("", text).strip(), (match.group(1) if match else None)
 
 
 def _load(name: str, file: str) -> Any:
@@ -215,7 +246,7 @@ class Secretary:
 
     # ---------- 转达 ----------
     def poll(self, forward: bool = True) -> None:
-        """Agent 的每条发言都马上转到私聊（2026-11-13 用户要求：攒到巡检里只剩一行摘要，等于漏了）。"""
+        """需要用户处理的 Agent 发言马上转到私聊；免打扰下过程存档只留 GitLab，详尽模式下全部转达。"""
         if not self.chat:
             return
         issues, held = self.state["issues"], self.state["held"]
@@ -251,6 +282,9 @@ class Secretary:
             known = {"project": thread["project"], "iid": thread["iid"], "title": info.get("title", ""),
                      "last_note": thread.get("last_note", 0), "last_agent_at": self.bridge.now()}
             self.state["issues"][url] = known
+        # 同步收件箱记录的通知模式与仓库路径，避免 poll_gitlab 先于 secretary.poll 运行时漏认 /详尽。
+        if url in (watched := self.watched()):
+            known.update(watched[url])
         # 原话题会转达其他人从 GitLab 发来的评论；合并出口不能丢掉这些内容。
         known["private_thread"] = True
         pending = self.state["held"].get(url, []) + self.fresh_entries(url, known, notes, True)
@@ -283,30 +317,66 @@ class Secretary:
         pid = quote(w["project"], safe="")
         return self.bridge.api(f"projects/{pid}/issues/{w['iid']}/notes?sort=desc&order_by=created_at&per_page=50")
 
+    def is_verbose(self, issue: Mapping[str, Any]) -> bool:
+        """优先看收件箱登记的 notify；未显式写 quiet 时兜底读本机 STATE.md，兼容用户在终端里直接切详尽模式。"""
+        notify = str(issue.get("notify") or "").strip().lower()
+        if notify == "verbose":
+            return True
+        if notify == "quiet":
+            return False
+        repo, project, iid = issue.get("repo") or "", issue.get("project") or "", issue.get("iid")
+        if repo and project and iid:
+            state_file = Path(str(repo)) / ".hwf" / "tmp" / f"{str(project).replace('/', '-')}-{iid}" / "STATE.md"
+            try:
+                return bool(STATE_VERBOSE_RE.search(state_file.read_text(encoding="utf-8")))
+            except OSError:
+                return False
+        return False
+
     def fresh_entries(self, url: str, known: dict[str, Any], notes: list[dict[str, Any]], forward: bool) -> list[dict[str, Any]]:
-        """水位之后要转的 Agent 发言，同时推进水位。"""
+        """水位之后要转的发言，同时推进水位；免打扰被拦下的过程评论仍刷新活跃时间，避免误报静默超时。"""
         if "last_note" not in known:
             # 只登记了身份、还没有水位：按第一次看到处理，不回放旧评论。
             known["last_note"] = max([n["id"] for n in notes] or [0])
             return []
         fresh = []
+        verbose = self.is_verbose(known)
         for n in sorted((n for n in notes if n["id"] > known["last_note"]), key=lambda n: n["id"]):
-            if forward and self.should_forward(n, include_users=known.get("private_thread", False)):
+            clean_body, _ = strip_kind_tag(n.get("body") or "")
+            if not n.get("system") and (n.get("author") or {}).get("username") == self.bridge.agent and not RECEIPT.match(clean_body):
                 known["last_agent_at"] = self.bridge.now()
+            if forward and self.should_forward(n, include_users=known.get("private_thread", False), verbose=verbose):
                 fresh.append(n)
             known["last_note"] = n["id"]
         return [self.held_entry(url, known, n) for n in fresh]
 
     def held_entry(self, url: str, issue: Mapping[str, Any], n: Mapping[str, Any]) -> dict[str, Any]:
-        body = FOLDED.sub("", (n.get("body") or "").strip()).strip()
+        clean_body, _ = strip_kind_tag(n.get("body") or "")
+        body = FOLDED.sub("", clean_body).strip()
         self.state["recent"] = (self.state["recent"] + [f"#{issue['iid']} {issue.get('title', '')}：{body[:200]}"])[-RECENT_CAP:]
         return {"id": n["id"], "body": body}
 
-    def should_forward(self, n: Mapping[str, Any], include_users: bool = False) -> bool:
+    def should_forward(self, n: Mapping[str, Any], include_users: bool = False, verbose: bool = False) -> bool:
+        if n.get("system") or n["id"] in self.bridge.state.get("posted_notes", []):
+            return False
         author = (n.get("author") or {}).get("username")
-        body = (n.get("body") or "").strip()
-        return (not n.get("system") and (author == self.bridge.agent or include_users)
-                and n["id"] not in self.bridge.state.get("posted_notes", []) and not RECEIPT.match(body))
+        if author != self.bridge.agent:
+            return include_users
+        body, kind = strip_kind_tag(n.get("body") or "")
+        if RECEIPT.match(body):
+            return False
+        if verbose:
+            return True
+        if kind is not None:
+            return kind in QUIET_FORWARD_KINDS
+        if INBOX_ACK.match(body):
+            return False
+        if body.startswith("**收尾回执**") and "**残留**" not in body:
+            return False
+        summary = FOLDED.sub("", body).strip()
+        if QUIET_ARCHIVE_NOTE.match(summary) and not USER_ACTION_HINT.search(summary):
+            return False
+        return True
 
     def forward(self, url: str, issue: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
         link = f"{url}#note_{entry['id']}"
@@ -503,11 +573,12 @@ class Secretary:
                 notes = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}/notes?sort=desc&order_by=created_at&per_page=10")
             except Exception:
                 continue
-            kept = [n for n in notes if not n.get("system") and not RECEIPT.match((n.get("body") or "").strip())][:NOTES_PER_ISSUE]
+            kept = [n for n in notes if not n.get("system") and not RECEIPT.match(strip_kind_tag(n.get("body") or "")[0])][:NOTES_PER_ISSUE]
             for n in reversed(kept):
                 author = (n.get("author") or {}).get("username") or (n.get("author") or {}).get("name") or ""
                 who = "Agent" if author == self.bridge.agent else "用户"
-                body = FOLDED.sub("", (n.get("body") or "").strip()).strip()[:NOTE_CAP]
+                clean_body, _ = strip_kind_tag(n.get("body") or "")
+                body = FOLDED.sub("", clean_body).strip()[:NOTE_CAP]
                 out.append(f"- #{issue['iid']} {who}（{str(n.get('created_at') or '')[:16]}）：{body}")
         return out
 

@@ -22,9 +22,9 @@ description: 在真实浏览器或 Electron 窗口按验收点做端到端自动
 ### 2. 启动专属服务（仅本地验收）
 
 - 以本 issue 的 worktree 为 cwd 新启动服务，不复用本 worktree 先前 issue、其他成员、用户或任何已在运行的服务。
-- 先查端口归属，被别人占用就按仓库规则另选空闲端口。记录端口、origin、进程标识、启动时间。无法保证 origin 隔离就报阻塞，不复用、不停止对方服务。
+- 先查端口归属，被别人占用就按仓库规则另选空闲端口（若仓库开发版 Electron 或本地网关要求固定端口如 `3001`，核实该端口空闲后直接启动，被他人占用时才报阻塞，不复用、不停止对方服务）。记录端口、origin、进程标识、启动时间。无法保证 origin 隔离就报阻塞。
 - 确需在别处启动，记录 PID，收尾按 PID 关闭。
-- 只有涉及主进程、preload、安装更新、其他原生能力或需求明确要求时才启动 Electron；网页和 Electron 都涉及时分别覆盖、分别列结果。
+- 只有涉及主进程、preload、安装更新、其他原生能力或需求明确要求时才启动 Electron；需要本地 Electron 验收时直接在本 issue worktree 运行仓库开发版 Electron 启动命令并用 `Computer Use` 操作该独立窗口，除非需求本身验收安装包/自动更新，否则不索要签名安装包，也不为启动本地服务请示用户。网页和 Electron 都涉及时分别覆盖、分别列结果。
 
 部署后验收改为：核对测试环境实际部署的版本包含本次代码（MR、源 SHA、部署 SHA、成功的部署作业）；前后端都改时分别核对。只凭「已合并」不能开测。
 
@@ -39,6 +39,7 @@ description: 在真实浏览器或 Electron 窗口按验收点做端到端自动
 
 **自己解决的问题**：浏览器目录、登录、遮罩和弹窗、端口占用、找页面入口、造测试数据。先查 howto 里的已知做法，再换办法；同一问题最多换 2 种办法，仍失败才标阻塞，并报告每种办法和现场。
 
+- **本机测试账号自动登录**：按派活分配的测试账号，从项目约定的本机测试账号凭据文件（如 `~/.agents/secrets/` 下的测试账号清单或 `howto.md` 指明的位置）读取对应密码或测试邮箱验证码，自行输入完成登录（网页表单用 `ego-browser`，Electron 独立客户端窗口用 `Computer Use`）。录屏在登录进入目标界面后再开启（验收登录页本身时只录登录窗口，绝不打开或录制凭据文件，报告和日志不打印明文密码）。测试专用账号在自动化验收中输入密码属于正常自理操作：**严禁**未经自动登录尝试就直接停在登录页叫用户手动登录，也**严禁**在测试后以“自动化输入过密码”为由要求用户轮换测试账号密码；仅当无可用测试账号、触发无法自助收码的真人专属验证/硬件鉴权，或自动登录排障后仍失败时，才报「登录窗口已就绪」交用户接手。
 - **Ego Lite 测试站点单站切换账号**：在默认浏览器资料新建本轮 `TaskSpace` 打开非生产测试站点（本地专属端口或 `smoke` 测试域名，如 `develop.bootingai.net`、`app.develop.lookai.app`）时，若自动带入非本轮分配账号的登录态，不向用户索要空白浏览器资料或 `profileId`，按两步自行切换：
   1. **核对同站点并发**：本地专属端口按 `origin` 天然隔离可直接切换；共享测试域名先查 `listTaskSpaces()` 中其他活跃空间的标签页 URL（团队任务同时查 `python3 ~/.hwf/scripts/test-account.py list` 是否有其他在途任务正持有同站点账号），确认没有其他任务正在使用同一测试域名。若同一测试域名正被其他在途任务使用，报并发占用等待，不清对方会话。
   2. **仅清当前测试站点登录态**：在该测试页执行 `localStorage.clear(); sessionStorage.clear()`，调用 `Storage.clearDataForOrigin`（`origin` 仅传当前测试站，`storageTypes: "cookies,local_storage"`），并用 `Network.getAllCookies` 过滤出 `domain`（去前导点后）等于当前测试站 hostname 或其专属测试子域（如 `develop.bootingai.net`、`app.develop.lookai.app`、`develop.lookai.app`）的 Cookie 逐条 `Network.deleteCookies`，刷新后登录本轮账号。**严禁**调用 `Network.clearBrowserCookies`、`Network.clearBrowserCache` 或无 `browserContextId` 的 `Storage.clearCookies`，严禁删除一级根域、生产域名（如 `look-ai.cn`、`lookfashion.ai`）或其他子域（如 `git.bootingai.net`、`admin.lookai.cc`）的 Cookie。

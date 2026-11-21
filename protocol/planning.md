@@ -188,7 +188,7 @@ arch 可以决定取舍，不能把客观不可执行、验收证据缺失或数
      --description "<issue URL>；确认时间 <ISO8601>；来源 <note 链接>"
    ```
 
-   再在发起 issue 评论 URL、文件名、SHA-256、确认时间；回读评论及 snippet 可访问性。
+   再用 `task-record.py note --kind record` 在发起 issue 存档 URL、文件名、SHA-256、确认时间（不 `@用户`）；回读评论及 snippet 可访问性。
 4. spec 与实现子 issue 带同一已确认链接；STATE 记 URL、ID、创建/确认时间、方案 SHA 与评论定位。
 5. 上传失败或回读不一致即阻塞，保留本地方案与恢复信息；无链接不请确认，不跳过上传进 spec。
 

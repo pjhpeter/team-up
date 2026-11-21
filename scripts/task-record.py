@@ -21,11 +21,13 @@ INDEX：index-add 追加本调度者的一行（接手别人的任务也是追�
 
 STATE 顶部：state-set 维护 STATE.md 开头 `<!-- hwf:top -->` 标记之间的固定字段（见 TOP_FIELDS），其余内容不动。
 
-评论：note 按 STATE 顶部的通知模式决定发不发。免打扰下 stage（阶段进度）不发，退出码 3，内容只写 STATE。
+评论：note 按 STATE 顶部的通知模式决定发不发，并在评论末尾附隐藏标记 `<!-- hwf-kind:<类别> -->` 供飞书秘书识别。
+免打扰下 stage（阶段进度）不发，退出码 3，内容只写 STATE；step-done（步骤汇总）与 record（登记或存档）只写 GitLab 留档备查，
+不推送飞书私聊、也不覆盖 STATE「最近用户通知」；只有 todo、risk、answer、delivery-done 会推送飞书私聊并更新「最近用户通知」（详尽模式全推）。
 todo（要用户处理或授权）必须用 --will 写明用户同意后本账号要做的动作，脚本先自查做不做得了：
     --will merge=<MR URL>   --will push=<项目 URL>@<分支>   --will tag=<项目 URL>@<tag 名>   --will none（只需要用户自己做）
 有一项做不了就不发，改成请用户来做；查不出来的在评论末尾注明。正文和已发过的完全一样时不发。
-发出后回读，并把链接写进 STATE 顶部「最近用户通知」和 <任务目录>/notes.jsonl。
+发出后回读，并把记录写进 <任务目录>/notes.jsonl。
 
 退出码：0 成功；1 失败；2 参数错误；3 按规则没发（免打扰拦下、重复、自查不通过）。
 
@@ -85,10 +87,11 @@ AREA_CLOSE = "<!-- hwf:end -->"
 AREA = re.compile(r"<!-- hwf:start[^>]*-->.*?<!-- hwf:end -->\n*", re.S)
 EMPTY_RELEASE = "## 上线清单\n| 仓库 | release 分支 | 改了什么 | 有没有数据库改动 |\n| --- | --- | --- | --- |"
 LEGACY_MODE = re.compile(r"通知模式[:：]\s*(免打扰|详尽)")
-# 免打扰下只有这几类发；stage 是阶段进度，只在详尽模式发（protocol/communication.md「通知模式」）。
-# record 是登记或存档（登记池评论、待定清单评论），不是发给用户看进度的。
+# 免打扰下 stage 只记 STATE 不发 GitLab；step-done 与 record 仅在 GitLab 留档备查，只有 QUIET_NOTIFY_KINDS 会推飞书私聊。
 KINDS = {"todo": "用户待办", "risk": "新风险", "answer": "实质答复", "step-done": "步骤完成",
          "delivery-done": "整项交付完成", "stage": "阶段进度", "record": "登记或存档"}
+QUIET_NOTIFY_KINDS = frozenset({"todo", "risk", "answer", "delivery-done"})
+KIND_TAG = re.compile(r"\s*<!--\s*hwf-kind:([a-z-]+)\s*-->\s*")
 DEVELOPER = 30
 MR_URL = re.compile(r"https?://(?P<host>[^/]+)/(?P<project>.+?)/-/merge_requests/(?P<iid>\d+)")
 PROJECT_REF = re.compile(r"https?://(?P<host>[^/]+)/(?P<project>[^@]+?)/?@(?P<ref>.+)")
@@ -566,8 +569,13 @@ def progress(repo: str, task: str, issue_url: Optional[str] = None, steps: Optio
 
 # ---------- 评论 ----------
 
+def format_kind_tag(kind: str) -> str:
+    """在 GitLab 评论末尾附隐藏类别标记，供秘书按免打扰/详尽模式精确分流；飞书渲染前会剥离该标记。"""
+    return f"<!-- hwf-kind:{kind} -->"
+
+
 def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequence[str]) -> tuple[int, str]:
-    body = body.strip()
+    body = KIND_TAG.sub("", body).strip()
     if not body:
         raise RecordError("评论正文是空的")
     mode = notify_mode(repo, task)
@@ -588,17 +596,19 @@ def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequ
     if unknown:
         body += "\n\n自查没查出来的：\n" + "\n".join(f"- {text}" for text in unknown)
     log = state_path(repo, task).with_name("notes.jsonl")
+    # 摘要仍对不含隐藏标签的正文计算，兼容历史 notes.jsonl 去重记录。
     digest = hashlib.sha256(body.encode()).hexdigest()
     sent = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
     same = next((item for item in sent if item["sha256"] == digest and item["issue"] == issue_url), None)
     if same:
         return EXIT_HELD, f"没发：同样的内容已经发过 {same['link']}"
-    link = _WR.post_note(_WR.parse_issue(issue_url), body)
+    link = _WR.post_note(_WR.parse_issue(issue_url), f"{body}\n\n{format_kind_tag(kind)}")
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps({"at": time.strftime("%Y-%m-%d %H:%M:%S"), "issue": issue_url, "kind": kind,
                                  "link": link, "sha256": digest}, ensure_ascii=False) + "\n")
-    if kind != "record":
+    # 免打扰下 step-done 与 record 仅留 GitLab 存档，不更新「最近用户通知」，以免冲掉上一条真正发给用户的待办或答复记录。
+    if kind != "record" and (mode == VERBOSE or kind in QUIET_NOTIFY_KINDS):
         state_set(repo, task, "最近用户通知", f"{link} 类别={KINDS[kind]}")
     return EXIT_OK, link
 

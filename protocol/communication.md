@@ -91,4 +91,4 @@ GitLab 发起任务的确认在发起 issue（无则根 issue）发布并 @发�
 - 有空闲者新会话后单次prompt提交，消息可排队；无则scheduler profile新tab后台提交，入口确认接收后结束，不等待整项回复。进度以pane、INDEX、STATE为准。glab认证是环境前提，缺失报告阻塞。
 - 同一任务10分钟内不重复入口；转交失败留待下轮，不丢也不重复。agent_not_ready先处理已有pane启动提示，不重跑造第二个调度者；stalled/超时按 [scheduling.md](scheduling.md) 的核对与补一次Enter条件处理。
 - 长期blocked/unknown可能另建调度者；原界面由用户处理或退出，再按INDEX接续。不得自行清除其他调度者登记名。
-- 规则变更提醒覆盖 `PROTOCOL.md` 与 `protocol/`；收到提醒后本步骤告一段落，读差异、主入口及当前阶段。已有任务记录、评审计数与授权不重置。
+- 规则变更提醒覆盖 `PROTOCOL.md`、`protocol/` 与 `skills/`；收到提醒后本步骤告一段落，读差异、主入口及当前阶段。已有任务记录、评审计数与授权不重置。

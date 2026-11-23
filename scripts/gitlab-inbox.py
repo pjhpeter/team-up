@@ -112,8 +112,30 @@ class InboxError(RuntimeError):
     pass
 
 
+_EVENT_LOG_PATH: Path | None = None
+_EVENT_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def append_event_log(path: Path | None, line: str) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > _EVENT_LOG_MAX_BYTES:
+            tail = path.read_bytes()[-(_EVENT_LOG_MAX_BYTES // 2):]
+            nl = tail.find(b"\n")
+            path.write_bytes(tail[nl + 1:] if nl != -1 else tail)
+        flat = " ".join(line.splitlines())
+        with path.open("a", encoding="utf-8") as out:
+            out.write(flat + "\n")
+    except OSError:
+        pass
+
+
 def log(message: str) -> None:
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}", flush=True)
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}"
+    print(line, flush=True)
+    append_event_log(_EVENT_LOG_PATH, line)
 
 
 class Inbox:
@@ -917,7 +939,7 @@ def save_state(state: Mapping[str, Any]) -> None:
 
 def watched_scripts(base_dir: Path | None = None) -> tuple[Path, ...]:
     root = base_dir or Path(__file__).resolve().parent
-    return tuple(root / name for name in ("gitlab-inbox.py", "find-scheduler.py", "proactive.py"))
+    return tuple(root / name for name in ("gitlab-inbox.py", "find-scheduler.py", "proactive.py", "retrospect.py"))
 
 
 def snapshot_mtimes(paths: Sequence[Path]) -> dict[Path, int]:
@@ -946,6 +968,7 @@ def scout_busy(scout: Any) -> bool:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    global _EVENT_LOG_PATH
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--once", action="store_true", help="run a single polling round")
     args = parser.parse_args(argv)
@@ -958,8 +981,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if config is None:
         print(f"missing config {CONFIG_PATH}", file=sys.stderr)
         return 1
+    if not args.once:
+        _EVENT_LOG_PATH = STATE_PATH.parent / "gitlab-inbox-events.log"
     inbox = Inbox(config, load_json(STATE_PATH, {}))
     scout = start_scout(config) if not args.once else None
+    retro = start_retrospect(config) if not args.once else None
     while True:
         try:
             inbox.poll()
@@ -970,7 +996,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 1
         if args.once:
             return 0
-        if not scout_busy(scout):
+        if not scout_busy(scout) and not scout_busy(retro):
             changed = reloadable_changes(baseline, watched)
             if changed:
                 names = ", ".join(p.name for p in changed)
@@ -978,6 +1004,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
         if scout is not None:
             scout.tick_in_background()  # 主动接活（observe 档）在后台线程跑，出错只记日志
+        if retro is not None:
+            retro.tick_in_background()  # 周期复盘（周二/周五 12:00）在后台线程跑，出错只记日志
         time.sleep(int(config.get("interval_seconds", 60)))
 
 
@@ -995,6 +1023,23 @@ def start_scout(config: Mapping[str, Any]) -> Any:
         return module.Scout(config)
     except Exception as error:  # 主动接活起不来不能影响收件箱
         log(f"proactive off: {error!r}")
+        return None
+
+
+def start_retrospect(config: Mapping[str, Any]) -> Any:
+    """加载同目录的 retrospect.py（周二/周五 12:00 周期复盘）；加载失败不影响收件箱。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("retrospect", Path(__file__).resolve().parent / "retrospect.py")
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not dict(config.get("retrospect") or {}).get("enabled", True):
+            log("retrospect off: disabled in config")
+            return None
+        return module.Retrospect(config)
+    except Exception as error:
+        log(f"retrospect off: {error!r}")
         return None
 
 

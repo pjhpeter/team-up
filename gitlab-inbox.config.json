@@ -11,5 +11,13 @@
   "proactive": {
     "model": "jc-gpt/gpt-6-luna",
     "thinking": "medium"
+  },
+  "retrospect": {
+    "enabled": true,
+    "weekdays": [1, 4],
+    "hour": 12,
+    "minute": 0,
+    "model": "gemini-4-carbon",
+    "reasoning_effort": "high"
   }
 }

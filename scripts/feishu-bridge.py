@@ -126,8 +126,30 @@ class BridgeError(Exception):
     pass
 
 
+_EVENT_LOG_PATH: Optional[Path] = None
+_EVENT_LOG_MAX_BYTES = 2 * 1024 * 1024
+
+
+def append_event_log(path: Optional[Path], line: str) -> None:
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > _EVENT_LOG_MAX_BYTES:
+            tail = path.read_bytes()[-(_EVENT_LOG_MAX_BYTES // 2):]
+            nl = tail.find(b"\n")
+            path.write_bytes(tail[nl + 1:] if nl != -1 else tail)
+        flat = " ".join(line.splitlines())
+        with path.open("a", encoding="utf-8") as out:
+            out.write(flat + "\n")
+    except OSError:
+        pass
+
+
 def log(message: str) -> None:
-    print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}", flush=True)
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {message}"
+    print(line, flush=True)
+    append_event_log(_EVENT_LOG_PATH, line)
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -1413,6 +1435,7 @@ def consume_events(out: "queue.Queue[dict]", history_requested: threading.Event)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    global _EVENT_LOG_PATH
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--check", action="store_true", help="检查配置、令牌与飞书机器人后退出")
@@ -1456,6 +1479,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if not who:
         print("没有用户 GitLab 令牌，见脚本开头说明", file=sys.stderr)
         return 1
+    _EVENT_LOG_PATH = STATE_PATH.parent / "feishu-bridge-events.log"
     signal.signal(signal.SIGTERM, stop_children)
     topic_queue = topics.Topics(bridge, directory, lambda: save_json(STATE_PATH, state))
     topic_queue.consume()

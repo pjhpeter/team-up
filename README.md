@@ -27,11 +27,11 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `herdr/droid-arch.json` | 架构师（droid）的模型与思考档；交互式 droid 只能用 `--settings` 文件指定 |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱、飞书桥、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件并回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
+| `scripts/` | 收件箱、飞书桥、周期复盘（`retrospect.py`）、主动接活（`proactive.py`）、找调度者、按角色领取成员、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件并回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删 worktree、发收尾回执、写 INDEX）、清理临时目录、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `omp-extensions/` | omp 扩展：调度者手改 INDEX 或直接用 glab 发 issue 评论时拦下，要求改用 `task-record.py`（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
-| `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔；`proactive` 段是主动接活用的模型 |
+| `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔；`proactive` 段是主动接活配置，`retrospect` 段是周二/周五中午周期复盘配置 |
 | `proactive-rules.md` | 主动接活的规则：什么情况 → 做什么，每条规则单独一档 |
 
 不入库（每台电脑自己的）：`state/`（运行状态）、`gitlab-inbox.local.json`（每个项目在本机的仓库路径，也可覆盖共用配置里的其他值，比如换成你自己的白名单账号）。
@@ -97,6 +97,21 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | 放开一条规则 | 成绩卡显示「可以考虑切 auto」后，由人把该规则的档位改掉（auto 档还没实现，现在按 observe 处理） |
 
 平时不推送；每天 18 点后当天有新的「本来会接」时发一条 ntfy，当天判不了的事件超过 5 个时也发一条。记录都在本机 `state/proactive-*`。观察群里的图片会下载到本机、判断时一起给模型看（每段对话最多 4 张；文件和视频只记名字不下载），聊天原文和图片 7 天后自动删除；图片每小时检查一次，总量超过 300MB 就从最旧的开始删。搬到 GitLab 的附件上传完立刻删，飞书桥启动时还会清空中转目录。
+
+## 周期复盘（每周二、周五 12:00）
+
+**问题**：日常一单接一单往前赶，像退群后还在空转拉消息、成员窗口和临时目录越积越多、状态记事本越写越厚这类慢性损耗，不集中翻账很难及时发现。
+**办法**：常驻收件箱在每周二、周五中午 12:00 自动汇总本周期「交付流程、飞书桥、收件箱」的过程历史数据，调用 `droid`（`gemini-4-carbon`，思考 `high`）对照最新规则和脚本只读核查，筛出真有证据支撑的可优化点。
+**为什么挂在收件箱里**：收件箱本来就常驻在 Herdr 窗格里，随仓库热重载；电脑在中午 12:00 合盖休眠时，72 小时内唤醒会自动补跑当期，不会漏期。
+
+每次跑完做三件事：往飞书秘书私聊窗口发一份按优先级排好的精简列表、在本机生成单文件图文报告 `~/.hwf/state/retrospect-latest.html`、发一条 `ntfy` 提醒。常驻收件箱与飞书桥的运行日志会滚动保存在 `state/gitlab-inbox-events.log` 与 `state/feishu-bridge-events.log`（单个文件上限 2MB），供周期复盘读取完整历史。
+
+| 要做的事 | 命令 |
+| --- | --- |
+| 打开最近一期 HTML 报告 | `open ~/.hwf/state/retrospect-latest.html` |
+| 手动跑一次近 3.5 天复盘（只出本地报告并打开，不发飞书/ntfy） | `python3 ~/.hwf/scripts/retrospect.py run --days 3.5 --no-notify --open` |
+| 手动跑一次并推送飞书私聊 + ntfy | `python3 ~/.hwf/scripts/retrospect.py run --days 3.5` |
+| 只采集本周期过程数据做检查（不调模型） | `python3 ~/.hwf/scripts/retrospect.py collect --days 3.5` |
 
 ## 怎么改
 

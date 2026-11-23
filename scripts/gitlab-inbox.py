@@ -434,8 +434,22 @@ class Inbox:
             log(f"resume stage failed for {url}: {exc}")
             return ""
         self.labels_seen[url] = [l for l in labels if l != WAITING_LABEL] + [stage]
-        log(f"{url}: {WAITING_LABEL} → {stage} after user reply")
+        log(f"{url}: {WAITING_LABEL} -> {stage} after user reply")
         return (f"\n[标签] 已改回「{stage}」；仍需要用户处理，改回「{WAITING_LABEL}」，根 issue 按实际阶段同步。")
+
+    def clear_stage_labels(self, url: str, where: Mapping[str, Any], labels: Sequence[str] | None = None) -> None:
+        """已关闭的发起 issue 若仍残留 `状态:*` 标签，自动调用 PUT 移除，防止看板与巡检误判。"""
+        stale = [label for label in (labels or []) if label.startswith(STAGE_PREFIX)]
+        if not stale:
+            return
+        base = f"projects/{where['project_id']}/issues/{where['iid']}"
+        try:
+            self.api(f"{base}?remove_labels={quote(','.join(stale))}", "PUT")
+        except InboxError as exc:
+            log(f"clear stage labels failed for {url}: {exc}")
+            return
+        self.labels_seen[url] = [label for label in (labels or []) if not label.startswith(STAGE_PREFIX)]
+        log(f"{url}: cleared stale stage labels on closed issue: {', '.join(stale)}")
     def handle_note(self, url: str, repo: str, note: Mapping[str, Any], where: Mapping[str, Any]) -> bool:
         """评论统一入口。返回 False 表示下一轮重试。
 
@@ -643,14 +657,25 @@ class Inbox:
             origin["last_note_id"] = note["id"]
             save_state(self.state)
         if issue.get("state") != "opened":
-            # 关闭是平台状态，不是交付结论；是否收尾由调度者核对证据与用户取消意图后决定。
+            self.clear_stage_labels(url, origin, issue.get("labels"))
+            # 关闭是平台状态，不是交付结论；但若仍处于只读对话模式且无在途交付产物，用户关单即视为结束咨询/取消，不追问打扰。
             _, pane = self.owner(origin["repo"], url)
             if pane:
-                self.prompt(pane, f"[GitLab 收件箱] 检测到发起 issue 已关闭 {url}。先按 ~/.hwf/protocol/delivery.md "
-                                  "§9「完成评论与关闭前核对」「发起 issue 的关闭授权」核验交付证据和剩余工作；关闭事件本身不代表验收或交付完成。"
-                                  "仍有未完成项且用户未明确取消时，在原 issue 说明缺项，请用户重开继续或明确取消，"
-                                  "INDEX 保持 blocked，保留成员与 worktree；测试服务仍按每轮规则清理。"
-                                  "只有确认交付完成或用户明确取消后，才执行 §9「成员收尾与收尾回执」。")
+                if origin.get("mode", DELIVER) == CHAT:
+                    self.prompt(
+                        pane,
+                        f"[GitLab 收件箱] 检测到发起 issue 已关闭 {url}（收件箱记录为对话模式）。先核对本任务 STATE.md、分支与 worktree："
+                        "若尚未收到开工授权、未进入交付流程且无代码改动或未合并分支，用户关闭发起 issue 即视为取消本次只读咨询，"
+                        f"直接运行 wrapup.py --status \"cancelled（对话模式未开工，用户已关闭 issue）\" --no-issue-note 静默释放成员并更新 INDEX，"
+                        "禁止在 issue 发追问评论、禁止发待办 ntfy；"
+                        "仅当 STATE.md 已切入交付流程且确有未完成交付工作时，才按 ~/.hwf/protocol/delivery.md §9 核验缺项并处理。",
+                    )
+                else:
+                    self.prompt(pane, f"[GitLab 收件箱] 检测到发起 issue 已关闭 {url}。先按 ~/.hwf/protocol/delivery.md "
+                                      "§9「完成评论与关闭前核对」「发起 issue 的关闭授权」核验交付证据和剩余工作；关闭事件本身不代表验收或交付完成。"
+                                      "仍有未完成项且用户未明确取消时，在原 issue 说明缺项，请用户重开继续或明确取消，"
+                                      "INDEX 保持 blocked，保留成员与 worktree；测试服务仍按每轮规则清理。"
+                                      "只有确认交付完成或用户明确取消后，才执行 §9「成员收尾与收尾回执」。")
             closed: dict[str, Any] = self.state["closed_origins"]
             closed[url] = self.state["origins"].pop(url)  # 保留水位：用户重开后接着处理关闭后的评论。
             for stale in list(closed)[:-CLOSED_CAP]:
@@ -962,6 +987,46 @@ def reloadable_changes(baseline: Mapping[Path, int], paths: Sequence[Path]) -> l
     return changed
 
 
+MAX_POLL_BACKOFF_S = 300
+FAILURE_HEARTBEAT_EVERY = 10
+
+
+def compute_poll_backoff(base_interval: int, consecutive_failures: int, max_backoff: int = MAX_POLL_BACKOFF_S) -> int:
+    """连续轮询失败时按指数退避放大等待间隔（如 60 -> 120 -> 240 -> 300s），成功立即恢复基础间隔。"""
+    floor = max(int(base_interval), 1)
+    if consecutive_failures <= 0:
+        return floor
+    cap = max(floor, int(max_backoff))
+    return min(floor * (2 ** min(consecutive_failures - 1, 3)), cap)
+
+
+class PollFailureTracker:
+    """抑制断网期间完全相同的错误每轮刷屏，并在网络恢复后打印汇总计数。"""
+
+    def __init__(self, heartbeat_every: int = FAILURE_HEARTBEAT_EVERY) -> None:
+        self.heartbeat_every = max(heartbeat_every, 1)
+        self.consecutive_failures = 0
+        self.last_summary = ""
+
+    def record_failure(self, error: BaseException) -> str | None:
+        summary = " ".join(str(error).split())
+        self.consecutive_failures += 1
+        if self.consecutive_failures == 1 or summary != self.last_summary:
+            self.last_summary = summary
+            return f"poll failed: {error}"
+        if self.consecutive_failures % self.heartbeat_every == 0:
+            return f"poll still failing ({self.consecutive_failures} consecutive rounds): {summary[:240]}"
+        return None
+
+    def record_success(self) -> str | None:
+        if self.consecutive_failures <= 0:
+            return None
+        count = self.consecutive_failures
+        self.consecutive_failures = 0
+        self.last_summary = ""
+        return f"poll recovered after {count} consecutive failure(s)"
+
+
 def scout_busy(scout: Any) -> bool:
     thread = getattr(scout, "_thread", None)
     return bool(thread is not None and thread.is_alive())
@@ -986,12 +1051,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     inbox = Inbox(config, load_json(STATE_PATH, {}))
     scout = start_scout(config) if not args.once else None
     retro = start_retrospect(config) if not args.once else None
+    tracker = PollFailureTracker()
+    base_interval = int(config.get("interval_seconds", 60))
     while True:
+        poll_ok = False
         try:
             inbox.poll()
+            poll_ok = True
+            recovered = tracker.record_success()
+            if recovered:
+                log(recovered)
         except (InboxError, OSError, ValueError, KeyError, subprocess.SubprocessError) as error:
             # 单轮失败（网络、glab、herdr）不退出常驻进程；--once 时如实返回失败。
-            log(f"poll failed: {error}")
+            notice = tracker.record_failure(error)
+            if notice:
+                log(notice)
             if args.once:
                 return 1
         if args.once:
@@ -1002,11 +1076,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 names = ", ".join(p.name for p in changed)
                 log(f"reloading gitlab-inbox after code update: {names}")
                 os.execv(sys.executable, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
-        if scout is not None:
-            scout.tick_in_background()  # 主动接活（observe 档）在后台线程跑，出错只记日志
-        if retro is not None:
-            retro.tick_in_background()  # 周期复盘（周二/周五 12:00）在后台线程跑，出错只记日志
-        time.sleep(int(config.get("interval_seconds", 60)))
+        if poll_ok:
+            if scout is not None:
+                scout.tick_in_background()  # 主动接活（observe 档）仅在收件箱连通轮次后台触发
+            if retro is not None:
+                retro.tick_in_background()  # 周期复盘（周二/周五 12:00）在连通轮次后台触发
+        time.sleep(compute_poll_backoff(base_interval, tracker.consecutive_failures))
 
 
 def start_scout(config: Mapping[str, Any]) -> Any:

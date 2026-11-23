@@ -122,8 +122,23 @@ Runner = Callable[..., "subprocess.CompletedProcess[str]"]
 Uploader = Callable[[str, Path], str]  # (project, 本地文件) → 可直接放进评论的 Markdown
 
 
+# 飞书 IM 机器人已被移出群聊（230002）或群已解散（230019）属于永久不可达错误，不能与普通无权限（230027）混同重试。
+RETIRED_CHAT_ERROR_RE = re.compile(
+    r"""(?ix)
+    ["']code["']\s*:\s*(?:230002|230019)\b
+    | can\s+not\s+be\s+out\s+of\s+the\s+chat
+    | chat\s+is\s+disbanded
+    | chat\s+does\s+not\s+exist
+    """
+)
+
+
 class BridgeError(Exception):
     pass
+
+
+def is_retired_chat_error(error: BaseException) -> bool:
+    return bool(RETIRED_CHAT_ERROR_RE.search(str(error)))
 
 
 _EVENT_LOG_PATH: Optional[Path] = None
@@ -1148,6 +1163,24 @@ class Bridge:
                 if not private:
                     self.reply(root, f"#{t['iid']} 已关闭，这个话题不再同步。", f"gl-closed-{t['iid']}-{root[-12:]}")
 
+    def retire_chat(self, chat: str, reason: str) -> None:
+        """机器人已被移出群聊或群已解散时，摘除补读记录并关闭关联话题，避免每分钟重复刷 230002。"""
+        cursors = self.state["history_cursors"]
+        self.state["chats"].pop(chat, None)
+        if chat in self.state["group_chats"]:
+            self.state["group_chats"] = [c for c in self.state["group_chats"] if c != chat]
+        cursors.pop(f"chat:{chat}", None)
+        self.state["history_seen"].pop(chat, None)
+        self.state["help_sent"].pop(chat, None)
+        self.state["pending_images"].pop(chat, None)
+        for root, thread in self.state["threads"].items():
+            if thread.get("chat_id") == chat:
+                thread["closed"] = True
+                cursors.pop(f"thread:{root}", None)
+        flat_reason = " ".join(reason.split())
+        log(f"retired unreachable chat {chat}: {flat_reason[:240]}")
+        self.persist()
+
     def forward_note(self, root: str, t: dict[str, Any], n: dict[str, Any]) -> bool:
         """把一条 GitLab 评论发到飞书话题；成功（或已放弃）返回 True。幂等键保证重试不会重复发。"""
         key = f"gl-{t['iid']}-{n['id']}"
@@ -1155,6 +1188,14 @@ class Bridge:
             self.reply(root, self.render_note(t, n), key)
             return True
         except BridgeError as e:
+            if is_retired_chat_error(e):
+                t["closed"] = True
+                if t.get("chat_id"):
+                    self.retire_chat(str(t["chat_id"]), str(e))
+                else:
+                    log(f"closed unreachable thread {root}: {' '.join(str(e).split())[:240]}")
+                    self.persist()
+                return True
             t["fails"] = t.get("fails", 0) + 1
             log(f"forward #{t['iid']} note {n['id']} failed ({t['fails']}/{NOTE_RETRIES}): {e}")
             if t["fails"] < NOTE_RETRIES:
@@ -1202,7 +1243,10 @@ class Bridge:
                 self.read_history(["im", "+chat-messages-list", "--chat-id", chat, "--order", "asc",
                                    "--start", start, "--end", end], chat)
             except (BridgeError, KeyError, ValueError) as e:
-                log(f"catch-up skip chat {chat}: {e}")
+                if is_retired_chat_error(e):
+                    self.retire_chat(chat, str(e))
+                else:
+                    log(f"catch-up skip chat {chat}: {e}")
                 continue
             cursors[key] = until_ms
 
@@ -1215,7 +1259,16 @@ class Bridge:
                 self.read_history(["im", "+threads-messages-list", "--thread", root, "--order", "desc"],
                                   chat, root, since_ms)
             except (BridgeError, KeyError, ValueError) as e:
-                log(f"catch-up skip thread {root}: {e}")
+                if is_retired_chat_error(e):
+                    if chat:
+                        self.retire_chat(chat, str(e))
+                    else:
+                        self.state["threads"][root]["closed"] = True
+                        cursors.pop(key, None)
+                        log(f"closed unreachable thread {root}: {' '.join(str(e).split())[:240]}")
+                        self.persist()
+                else:
+                    log(f"catch-up skip thread {root}: {e}")
                 continue
             cursors[key] = until_ms
 

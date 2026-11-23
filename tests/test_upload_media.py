@@ -39,6 +39,10 @@ class FakeGitLabMedia:
             return subprocess.CompletedProcess(argv, 0, (self.origin + "\n").encode(), b"")
         assert argv[:4] == ["glab", "api", "--hostname", "git.example.com"], argv
         method, endpoint = argv[5], argv[6]
+        if method == "GET" and endpoint == PROJECT_API:
+            return subprocess.CompletedProcess(
+                argv, 0, json.dumps({"id": 10, "path_with_namespace": "frontend/web-v1"}).encode(), b""
+            )
         if method == "POST" and endpoint == f"{PROJECT_API}/uploads":
             form_arg = next((a for a in argv[7:] if a.startswith("--form=file=@")), "")
             assert form_arg, argv
@@ -46,6 +50,7 @@ class FakeGitLabMedia:
             assert uploaded_path.is_file()
             self.uploaded_name = uploaded_path.name
             rel_url = f"/uploads/{UPLOAD_ID}/{self.uploaded_name}"
+            # 模拟旧式 /frontend/web-v1/uploads/... 返回，验证脚本自动纠偏为 /-/project/10/uploads/...
             resp = {
                 "id": 42,
                 "alt": uploaded_path.stem,
@@ -85,7 +90,7 @@ class UploadMediaTest(unittest.TestCase):
         self.assertTrue(res["ok"])
         self.assertEqual(res["sha256"], self.mp4_sha)
         self.assertEqual(res["url"], f"/uploads/{UPLOAD_ID}/A1-flow.mp4")
-        self.assertEqual(res["web_url"], f"https://git.example.com/frontend/web-v1/uploads/{UPLOAD_ID}/A1-flow.mp4")
+        self.assertEqual(res["web_url"], f"https://git.example.com/-/project/10/uploads/{UPLOAD_ID}/A1-flow.mp4")
         self.assertEqual(res["markdown"], f"![A1 登录与创建录屏](/uploads/{UPLOAD_ID}/A1-flow.mp4)")
 
     def test_rejects_raw_mov_with_actionable_hint(self) -> None:
@@ -110,13 +115,15 @@ class UploadMediaTest(unittest.TestCase):
         self.assertEqual((code, res["stage"]), (1, "readback"))
         self.assertIn("SHA-256", res["error"])
 
-    def test_check_accepts_full_web_url_and_optional_local_file(self) -> None:
+    def test_check_accepts_full_web_url_and_rewrites_project_upload_web_url(self) -> None:
         fake = FakeGitLabMedia(self.mp4_bytes)
-        full_url = f"https://git.example.com/frontend/web-v1/uploads/{UPLOAD_ID}/A1-flow.mp4"
-        code, res = self.run_cli(fake, "check", "--repo", "/repo", "--url", full_url, "--file", str(self.mp4))
+        # 无论传入旧式 /frontend/web-v1/uploads/... 还是相对路径，check 都回读成功并输出有效 /-/project/10/uploads/... 直链
+        legacy_url = f"https://git.example.com/frontend/web-v1/uploads/{UPLOAD_ID}/A1-flow.mp4"
+        code, res = self.run_cli(fake, "check", "--repo", "/repo", "--url", legacy_url, "--file", str(self.mp4))
         self.assertEqual(code, 0, res)
         self.assertEqual(res["sha256"], self.mp4_sha)
         self.assertEqual(res["url"], f"/uploads/{UPLOAD_ID}/A1-flow.mp4")
+        self.assertEqual(res["web_url"], f"https://git.example.com/-/project/10/uploads/{UPLOAD_ID}/A1-flow.mp4")
 
 
 if __name__ == "__main__":

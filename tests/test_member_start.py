@@ -42,6 +42,7 @@ class FakeHerdr:
         self.width, self.height = width, height
         self.argv: dict[str, list[str]] = {}
         self.cwd: dict[str, str] = {}  # pane → 工作目录；没写的取 run_claim 的 --cwd
+        self.stuck_cwd: set[str] = set()
         self.default_cwd = ""
 
     def __call__(self, *args: str, timeout: int = 30) -> dict:
@@ -50,7 +51,13 @@ class FakeHerdr:
         if cmd == ("agent", "list"):
             return {"result": {"agents": list(self.agents)}}
         if cmd == ("pane", "run"):
-            self.agents = [a for a in self.agents if a["pane_id"] != args[2]]
+            pane_id, command = args[2], args[3]
+            if command.startswith("cd -- "):
+                import shlex
+                if pane_id not in self.stuck_cwd:
+                    self.cwd[pane_id] = shlex.split(command)[2]
+            else:
+                self.agents = [a for a in self.agents if a["pane_id"] != pane_id]
             return {}
         if cmd == ("pane", "rename"):
             return {}
@@ -103,7 +110,7 @@ class Case(unittest.TestCase):
             patcher = patch.dict(os.environ, {key: value})
             patcher.start()
             self.addCleanup(patcher.stop)
-        for target, value in (("main_repo", lambda cwd: None), ("EXIT_WAIT_S", 2)):
+        for target, value in (("main_repo", lambda cwd: None), ("EXIT_WAIT_S", 2), ("CWD_SWITCH_WAIT_S", 0.05)):
             patcher = patch.object(MS, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -257,13 +264,36 @@ class ClaimTest(Case):
         fake = FakeHerdr([SCHED, agent("delivery-arch-w1-pt", "w1:pT")])
         self.assertEqual(self.run_claim(fake)["action"], "created")
 
-    def test_member_in_other_worktree_is_not_reused(self) -> None:
+    def test_member_in_other_worktree_switches_cwd_and_restarts(self) -> None:
         fake = FakeHerdr([SCHED, agent("i453-dev", "w1:pD", kind="omp")])
         fake.cwd["w1:pD"] = str(self.dir / "old-worktree")
-        out = self.run_claim(fake, "dev")
-        self.assertEqual((out["action"], out["name"]), ("created", "i453-dev-2"))
-        self.assertIn(("pane", "split", "w1:pS", "--direction", "right", "--cwd", str(self.dir), "--no-focus"),
-                      fake.calls)
+        fake.argv["w1:pD"] = ["omp", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low"]
+        # 跨目录时即使传 keep_session=True 也必须退出旧会话、切换 cwd 后在原窗格重启，不新建 -2 副本
+        out = self.run_claim(fake, "dev", keep_session=True)
+        self.assertEqual((out["action"], out["name"], out["pane_id"]), ("restarted", "i453-dev", "w1:pD"))
+        self.assertFalse([c for c in fake.calls if c[:2] in (("pane", "split"), ("tab", "create"))])
+        self.assertEqual(os.path.realpath(fake.cwd["w1:pD"]), os.path.realpath(self.dir))
+
+    def test_prefers_same_cwd_idle_and_prunes_cross_cwd_duplicates(self) -> None:
+        fake = FakeHerdr([
+            SCHED,
+            agent("i453-dev", "w1:pOLD", kind="omp", status="done"),
+            agent("i453-dev-2", "w1:pCUR", kind="omp", status="idle"),
+        ])
+        fake.cwd["w1:pOLD"] = str(self.dir / "old-worktree")
+        fake.cwd["w1:pCUR"] = str(self.dir)
+        fake.argv["w1:pCUR"] = ["omp", "--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low"]
+        out = self.run_claim(fake, "dev", keep_session=True)
+        self.assertEqual((out["action"], out["name"], out["pane_id"]), ("kept", "i453-dev-2", "w1:pCUR"))
+        self.assertEqual(out["pruned_idle"], ["i453-dev"])
+
+    def test_refuses_start_when_pane_cwd_switch_fails(self) -> None:
+        fake = FakeHerdr([SCHED, agent("i453-dev", "w1:pD", kind="omp")])
+        fake.cwd["w1:pD"] = str(self.dir / "old-worktree")
+        fake.stuck_cwd.add("w1:pD")
+        with self.assertRaisesRegex(MS.ClaimError, "切换工作目录"):
+            self.run_claim(fake, "dev")
+        self.assertFalse(fake.starts())
 
     def test_caller_must_be_registered_scheduler(self) -> None:
         fake = FakeHerdr([agent("delivery-dev-w1-ps", "w1:pS", kind="omp")])

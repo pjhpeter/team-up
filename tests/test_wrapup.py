@@ -126,17 +126,24 @@ class FakeGlab:
         self.authored = {50: {"author": {"username": "pengjh"}}, 51: {"author": {"username": "pjhagent"}},
                          52: {"author": {"username": "pengjh"}, "system": True}}
         self.issue_state = "opened"
+        self.issue_labels: list[str] = []
+        self.removed_labels: list[str] = []
         self.close_sticks = True
 
     def __call__(self, host: str, method: str, path: str, *fields: str) -> dict:
         if path == "user":
             return {"username": "pjhagent"}
         if method == "PUT":
+            if fields and fields[0].startswith("remove_labels="):
+                removed = fields[0].split("=", 1)[1].split(",")
+                self.removed_labels.extend(removed)
+                self.issue_labels = [lb for lb in self.issue_labels if lb not in removed]
+                return {}
             assert fields == ("state_event=close",), fields
             self.issue_state = "closed" if self.close_sticks else self.issue_state
             return {}
         if path.endswith("/issues/47"):
-            return {"state": self.issue_state}
+            return {"state": self.issue_state, "labels": list(self.issue_labels)}
         if method == "POST":
             note_id = 900 + len(self.notes)
             self.notes[note_id] = fields[0].split("=", 1)[1]
@@ -438,14 +445,48 @@ class WrapupTest(Case):
                 return other_git(path, *args)
             return self.git(path, *args)
 
+        # 在 STATE.md 明确登记过的兄弟仓库 issue-47-be 则纳入本任务清理。
+        sibling_repo = str(Path(self.repo).parent / "member-be")
+        sibling_git = FakeGit(sibling_repo)
+        sibling_wt = sibling_git.add(f"{Path(self.wt).parent}/member-be/issue-47-fix", **{"in": {"origin/main"}})
+        state_md = Path(self.repo, f".hwf/tmp/{TASK}/STATE.md")
+        state_md.parent.mkdir(parents=True, exist_ok=True)
+        state_md.write_text(f"- 后端 worktree：`{sibling_wt}`\n", encoding="utf-8")
+
+        def mux_git2(path: str, *args: str) -> subprocess.CompletedProcess[str]:
+            if path.startswith(other_repo) or "unrelated-repo" in path:
+                return other_git(path, *args)
+            if path.startswith(sibling_repo) or "member-be" in path:
+                return sibling_git(path, *args)
+            return self.git(path, *args)
+
         herdr = FakeHerdr([agent(SCHED, "w1:pS"), agent("i48-dev", "w1:pE")])
-        with patch.object(WR, "git", mux_git):
+        with patch.object(WR, "git", mux_git2):
             code, out = self.run_wrapup(herdr)
         self.assertEqual(code, 0, out)
         self.assertEqual(sorted(self.git.removed), sorted([exact, issue_wt]))
+        self.assertEqual(sibling_git.removed, [sibling_wt])
         self.assertIn(not_this_issue, self.git.trees)
         self.assertIn(foreign_wt, other_git.trees)
         self.assertEqual(set(json.loads((self.state / "members.json").read_text())), {"w1:pE"})
+
+    def test_close_issue_clears_stale_stage_labels_and_silent_cancel_skips_note(self) -> None:
+        self.glab.issue_labels = ["需求", "状态:待上线", "状态:等你处理"]
+        code, out = self.run_wrapup(FakeHerdr(self.team()), "--close-request", f"{ISSUE}#note_50")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.glab.removed_labels, ["状态:待上线", "状态:等你处理"])
+
+        # 对话模式未开工关单：--no-issue-note + cancelled 不发 GitLab 评论，也不要求 --release
+        self.glab.notes.clear()
+        buf = io.StringIO()
+        with patch.object(WR, "herdr", FakeHerdr([agent(SCHED, "w1:pS")])), redirect_stdout(buf):
+            code2 = WR.main([
+                "--repo", self.repo, "--task", TASK, "--issue", ISSUE,
+                "--status", "cancelled（对话模式未开工，用户已关闭 issue）", "--no-issue-note",
+            ])
+        self.assertEqual(code2, 0, buf.getvalue())
+        self.assertEqual(self.glab.notes, {})
+        self.assertTrue(self.index_status().startswith("cancelled"))
 
 
 if __name__ == "__main__":

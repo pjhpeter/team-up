@@ -34,6 +34,7 @@ class World:
         self.writes: list[tuple] = []   # GitLab 写操作 (method, path, fields, as_user)
         self.history: dict[str, list] = {}  # chat_id → 聊天记录（补漏用）
         self.unreadable_chats: set[str] = set()
+        self.retired_chats: set[str] = set()
         self.messages: dict[str, str] = {}  # message_id → 渲染后的 content（给 mget 用）
         self.raw_messages: dict[str, dict] = {}  # 原生消息接口保留引用关系，mget 可以不返回它
         self.message_senders: dict[str, dict] = {}  # message_id → mget 返回的 sender（不设则不返回）
@@ -132,6 +133,8 @@ class World:
             return ok({"ok": True, "data": {"message_id": f"om_s{len(self.sent)}"}})
         if cmd[1:3] == ["im", "+chat-messages-list"]:
             chat = cmd[cmd.index("--chat-id") + 1]
+            if chat in self.retired_chats:
+                return ok({"ok": False, "error": {"code": 230002, "message": "Bot/User can NOT be out of the chat."}})
             if chat in self.unreadable_chats:
                 return ok({"ok": False, "error": {"code": 230027, "message": "access denied"}})
             return ok({"ok": True, "data": {"messages": self.history.get(chat, [])}})
@@ -571,10 +574,27 @@ class BridgeTest(unittest.TestCase):
             {"message_id": "om_g2", "chat_id": "oc_g", "content": "群里闲聊", "sender": sender},
             {"message_id": "om_g3", "chat_id": "oc_g", "content": "@交付助手-试点 需求：补漏到的", "sender": sender,
              "mentions": [{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]}]
-        self.b.catch_up()  # oc_g2 读不到不应中断
+        self.b.catch_up()  # oc_g2 读不到（230027 无权限）不应中断，也不误删该群
+        self.assertIn("oc_g2", self.state["chats"])
         titles = [w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")]
         self.assertEqual(titles, ["补漏到的"])
         self.assertFalse(any("用法" in r["text"] for r in self.w.replies))
+
+    def test_catch_up_retires_chat_after_230002_out_of_chat(self) -> None:
+        # 机器人被移出群聊（230002）属于永久不可达：自动从 chats/group_chats/cursors 摘除并关闭关联话题。
+        self.b.handle(msg("om_gone", "@交付助手-试点 #7 看下", chat="oc_gone", chat_type="group",
+                          mentions=[{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]))
+        self.assertIn("oc_gone", self.state["chats"])
+        self.assertIn("oc_gone", self.state["group_chats"])
+        self.assertFalse(self.state["threads"]["om_gone"]["closed"])
+        self.w.retired_chats.add("oc_gone")
+
+        self.b.catch_up()
+        self.assertNotIn("oc_gone", self.state["chats"])
+        self.assertNotIn("oc_gone", self.state["group_chats"])
+        self.assertNotIn("chat:oc_gone", self.state["history_cursors"])
+        self.assertNotIn("thread:om_gone", self.state["history_cursors"])
+        self.assertTrue(self.state["threads"]["om_gone"]["closed"])
 
     def test_model_unavailable_in_unknown_thread_does_not_create_task(self) -> None:
         self.b.handle(msg("om_2", "这是啥", root="om_unknown", thread="omt_unknown"))

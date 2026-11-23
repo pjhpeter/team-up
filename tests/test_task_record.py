@@ -123,6 +123,60 @@ class StateTests(Case):
         with self.assertRaises(TR.RecordError):
             TR.state_set(self.repo, TASK, "通知模式", "安静")
 
+    def test_state_compact_archives_old_sections_and_long_bullet_logs_losslessly(self) -> None:
+        path = TR.state_path(self.repo, TASK)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 同时覆盖两种膨胀形态：过多 `## 阶段` 章节 + 单个 `## 成员与收取` 章节内大量 `- ` 流水（含代码块保护）
+        sections = [
+            "# group-proj-47 调度记录",
+            "",
+            "## 来源与授权",
+            "- 发起人：@pengjh",
+            "- 授权：已确认 /go",
+            "",
+            "## 调度与基线",
+            "- 主仓库：/repo",
+            "- 关键分支：feat/47",
+            "```bash",
+            "## 代码围栏内的注释标题不应被误切分",
+            "- fence 内条目",
+            "```",
+            "",
+        ]
+        for idx in range(1, 11):
+            sections.extend([f"## 第 {idx} 轮评审归档", f"- 轮次 {idx} 结论：通过", ""])
+        sections.append("## 成员与收取")
+        for b in range(1, 101):
+            sections.append(f"- 2026-11-23 10:{b % 60:02d} 交接记录 #{b}（session=s{b}）")
+            sections.append(f"  补充说明行 #{b}")
+        path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+
+        # state_set 在超阈值（>220 行）时自动触发无损归档
+        TR.state_set(self.repo, TASK, "当前阶段", "§9 待上线")
+        compacted = self.state()
+        hist = TR.state_history_path(self.repo, TASK).read_text(encoding="utf-8")
+
+        # 1) 顶部块、常驻章节、代码块完整保留
+        self.assertEqual(TR.read_top(compacted)["当前阶段"], "§9 待上线")
+        self.assertIn("## 来源与授权", compacted)
+        self.assertIn("## 调度与基线", compacted)
+        self.assertIn("## 代码围栏内的注释标题不应被误切分", compacted)
+
+        # 2) 早期评审章节迁入 STATE-history.md，最近章节保留在 STATE.md
+        self.assertNotIn("## 第 1 轮评审归档", compacted)
+        self.assertIn("## 第 1 轮评审归档", hist)
+        self.assertIn("## 第 10 轮评审归档", compacted)
+
+        # 3) 单个 `## 成员与收取` 早期条目迁入 STATE-history.md，最新 25 条留在 STATE.md
+        self.assertNotIn("交接记录 #1（session=s1）", compacted)
+        self.assertIn("交接记录 #1（session=s1）", hist)
+        self.assertIn("补充说明行 #1", hist)
+        self.assertIn("交接记录 #75（session=s75）", hist)
+        self.assertIn("交接记录 #76（session=s76）", compacted)
+        self.assertIn("交接记录 #100（session=s100）", compacted)
+        self.assertIn("早期累计 75 条历史记录已无损归档", compacted)
+        self.assertLess(compacted.count("\n"), 180)
+
 
 class NoteTests(Case):
     def test_quiet_mode_holds_stage_archives_step_and_only_tracks_user_facing_notice(self) -> None:

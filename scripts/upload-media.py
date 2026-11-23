@@ -27,11 +27,12 @@ import subprocess
 import sys
 import tempfile
 from typing import Any, Callable, Optional, Sequence
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 ALLOWED_EXTENSIONS = frozenset({".mp4", ".webm", ".png", ".jpg", ".jpeg", ".webp", ".gif"})
 DEFAULT_MAX_MB = 50.0
 UPLOAD_PATH_RE = re.compile(r"(/uploads/[0-9a-fA-F]+/[^/?#\s)\"']+)")
+PROJECT_UPLOAD_PREFIX_RE = re.compile(r"^/-/project/(\d+)/uploads/")
 
 Runner = Callable[..., "subprocess.CompletedProcess[bytes]"]
 
@@ -107,6 +108,7 @@ class MediaUploader:
         except Exception as exc:
             raise MediaUploadError("origin", str(exc)) from exc
         self.project_api = f"projects/{quote(self.project, safe='')}"
+        self._numeric_project_id: Optional[int] = None
 
     def _glab(self, stage: str, method: str, endpoint: str, extra_args: Sequence[str] = (), timeout: int = 180) -> bytes:
         argv = ["glab", "api", "--hostname", self.host, "-X", method, endpoint, *extra_args]
@@ -115,6 +117,35 @@ class MediaUploader:
             detail = (result.stderr or result.stdout).decode(errors="replace").strip()
             raise MediaUploadError(stage, f"glab api {method} {endpoint} failed: {detail[:400]}")
         return result.stdout
+
+    def _project_id(self) -> Optional[int]:
+        """查询并缓存 GitLab 数字项目 ID：新版 GitLab 浏览器直链必须走 /-/project/<id>/uploads/... 否则 404。"""
+        if self._numeric_project_id is not None:
+            return self._numeric_project_id
+        raw = self._glab("project", "GET", self.project_api, timeout=60)
+        try:
+            meta = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            return None
+        pid = meta.get("id") if isinstance(meta, dict) else None
+        if isinstance(pid, int) and pid > 0:
+            self._numeric_project_id = pid
+            return pid
+        return None
+
+    def _build_web_url(self, rel_url: str, raw_hint: Optional[str] = None) -> str:
+        encoded_rel = "/" + "/".join(quote(unquote(seg), safe="") for seg in rel_url.lstrip("/").split("/"))
+        if raw_hint:
+            hint_path = urlparse(raw_hint).path if raw_hint.startswith(("http://", "https://")) else raw_hint
+            match = PROJECT_UPLOAD_PREFIX_RE.match(hint_path)
+            if match:
+                self._numeric_project_id = int(match.group(1))
+                return f"https://{self.host}/-/project/{self._numeric_project_id}{encoded_rel}"
+        pid = self._project_id()
+        if pid is not None:
+            return f"https://{self.host}/-/project/{pid}{encoded_rel}"
+        fallback = raw_hint if (raw_hint and raw_hint.startswith("/")) else f"/{self.project}{encoded_rel}"
+        return f"https://{self.host}{fallback}"
 
     def create(self, file: Path, alt: Optional[str], max_mb: float) -> dict[str, Any]:
         resolved = file.expanduser().resolve()
@@ -135,7 +166,7 @@ class MediaUploader:
             raise MediaUploadError("upload", f"Non-JSON upload response: {raw[:200]!r}") from exc
 
         rel_url = extract_upload_path(str(meta.get("url") or ""))
-        full_path = str(meta.get("full_path") or f"/{self.project}{rel_url}")
+        full_path = str(meta.get("full_path") or "") or None
         label = sanitize_alt(alt if alt is not None else resolved.stem)
         verified = self.verify(rel_url, expected_sha256=digest, full_path=full_path)
         return {
@@ -147,8 +178,8 @@ class MediaUploader:
 
     def verify(self, raw_url: str, expected_sha256: Optional[str] = None, full_path: Optional[str] = None) -> dict[str, Any]:
         rel_url = extract_upload_path(raw_url)
-        # 路径段逐段 URL 编码以兼容中文文件名，同时保留 `/uploads/<secret>/<name>` 斜杠结构。
-        encoded_tail = "/".join(quote(seg, safe="") for seg in rel_url.lstrip("/").split("/"))
+        # 路径段逐段 URL 编码（先 unquote 防止已编码 URL 二次编码），同时保留 `/uploads/<secret>/<name>` 斜杠结构。
+        encoded_tail = "/".join(quote(unquote(seg), safe="") for seg in rel_url.lstrip("/").split("/"))
         raw = self._glab("readback", "GET", f"{self.project_api}/{encoded_tail}")
         if not raw:
             raise MediaUploadError("readback", f"Uploaded media readback is empty: {rel_url}")
@@ -158,11 +189,10 @@ class MediaUploader:
                 "readback",
                 f"SHA-256 mismatch for {rel_url}: online {online_digest} != local {expected_sha256}",
             )
-        resolved_full = full_path or f"/{self.project}{rel_url}"
         return {
             "ok": True,
             "url": rel_url,
-            "web_url": f"https://{self.host}{resolved_full}",
+            "web_url": self._build_web_url(rel_url, raw_hint=full_path or raw_url),
             "bytes": len(raw),
             "size_mb": round(len(raw) / (1024 * 1024), 2),
             "sha256": online_digest,

@@ -21,9 +21,10 @@
    idle/done、不在 --exclude（调度者自知还有在途任务的成员）里，而且同时满足下面两条才算空闲：
    - 属于本 issue：登记名前缀是本 issue 的 `i<编号>`，或建 issue 前领取的 `new`（领取后改名为 `i<编号>-…`）。
      别的 issue 的成员（`i464-dev-fe`）在那个 issue 收尾前还没释放，旧名 `delivery-…` 看不出归属，都不复用。
-   - pane 的工作目录就是 --cwd：重启只能在原 pane 原目录，目录不同会在错的 worktree 里干活。
-   2026-11-09 #453：脚本把 #464 未释放的开发复用过来、在 #464 的 worktree 里重启，调度者只好再建一个。
-4. 有空闲成员：--keep-session 且正在跑的命令行与配置一致 → 原样交回；否则在同一 pane 退出旧会话、按配置重启。
+   - 优先选 pane 当前工作目录就是 --cwd 的空闲成员（可 --keep-session 沿用会话）；若本 issue 同角色空闲窗格在旧目录，
+     则退出旧会话后先在 shell 执行 `cd -- <cwd>` 并回读 `pane get` 确认目录已切换，再按配置启动新会话，避免多开副本。
+   2026-11-09 #453：脚本把 #464 未释放的开发复用过来、在 #464 的 worktree 里重启，调度者只好再建一个（别的 issue 仍不复用）。
+4. 有空闲成员：同目录、--keep-session 且正在跑的命令行与配置一致 → 原样交回；否则在同一 pane 退出旧会话（跨目录先切 cwd）、按配置重启。
    没有：在本调度者 tab 里挑最宽敞的 pane 切一块（太挤就在同一 workspace 开新 tab），按配置启动。
 5. 设持久 pane 标题 `角色-模型-任务`，登记簿记下归属，stdout 输出一行 JSON，调度者照抄进 STATE。
 
@@ -38,6 +39,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -58,6 +60,7 @@ _TAB_SPEC.loader.exec_module(_TAB)
 START_TIMEOUT_MS = 90000
 SHELL_RETRIES = 10
 EXIT_WAIT_S = 30
+CWD_SWITCH_WAIT_S = 10
 MIN_WIDTH, MIN_HEIGHT = 60, 16  # 切完每块至少这么大，否则换方向或开新 tab
 NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,31}")
 EXIT_COMMAND = {"codex": "/quit"}  # 其余执行体用 /exit
@@ -257,25 +260,34 @@ def same_dir(a: object, b: str) -> bool:
     return bool(a) and os.path.realpath(str(a)) == os.path.realpath(b)
 
 
-def reusable(member: dict[str, Any], tag: str, cwd: str) -> bool:
-    """本 issue（或建 issue 前）的成员，且 pane 就在要干活的目录里。"""
-    if not re.fullmatch(rf"({re.escape(tag)}|new)-.+", str(member.get("name") or "")):
-        return False
-    pane = herdr("pane", "get", member["pane_id"])["result"]["pane"]
-    return same_dir(pane.get("cwd"), cwd)
+def belongs_to_issue(member: dict[str, Any], tag: str) -> bool:
+    """只复用本 issue（或建 issue 前 new-*）的成员，绝不跨 issue 抢别的未释放成员。"""
+    return bool(re.fullmatch(rf"({re.escape(tag)}|new)-.+", str(member.get("name") or "")))
 
 
-def _idle_sort_key(member: dict[str, Any], tag: str) -> tuple[bool, int, str]:
+def pane_cwd(pane_id: str) -> str:
+    pane = herdr("pane", "get", pane_id)["result"]["pane"]
+    return str(pane.get("cwd") or "")
+
+
+def _idle_sort_key(member: dict[str, Any], tag: str, same_cwd: bool) -> tuple[bool, bool, int, str]:
     name = str(member.get("name") or "")
     suffix = re.search(r"-(\d+)$", name)
-    return (not name.startswith(f"{tag}-"), int(suffix.group(1)) if suffix else 1, name)
+    # 优先选已在目标 cwd 的窗格（可沿用会话），其次同 issue，再次最小编号
+    return (not same_cwd, not name.startswith(f"{tag}-"), int(suffix.group(1)) if suffix else 1, name)
 
 
 def eligible_idle(members: Sequence[dict[str, Any]], exclude: Sequence[str], tag: str,
                   cwd: str) -> list[dict[str, Any]]:
-    idle = [m for m in members if m.get("agent_status") in ("idle", "done") and m.get("name") not in exclude
-            and reusable(m, tag, cwd)]
-    idle.sort(key=lambda m: _idle_sort_key(m, tag))  # 优先复用同 issue 且编号最小的窗格
+    idle: list[dict[str, Any]] = []
+    for m in members:
+        if m.get("agent_status") not in ("idle", "done") or m.get("name") in exclude:
+            continue
+        if not belongs_to_issue(m, tag):
+            continue
+        current_cwd = pane_cwd(str(m["pane_id"]))
+        idle.append(dict(m, _same_cwd=same_dir(current_cwd, cwd)))
+    idle.sort(key=lambda m: _idle_sort_key(m, tag, bool(m.get("_same_cwd"))))
     return idle
 
 
@@ -286,7 +298,7 @@ def pick_idle(members: Sequence[dict[str, Any]], exclude: Sequence[str], tag: st
 
 def prune_duplicate_idle(extras: Sequence[dict[str, Any]], base: str, kept_pane: str, scheduler_pane: str,
                          panes: Sequence[dict[str, Any]]) -> tuple[list[str], list[str]]:
-    """回收同 issue、同角色、同工作目录且未被 exclude 的多余空闲副本，保留每个 workspace 至少一个窗格。"""
+    """回收同 issue、同角色且未被 exclude 的多余空闲副本（含不同目录旧窗格），保留每个 workspace 至少一个窗格。"""
     left: dict[str, int] = {}
     for p in panes:
         ws = str(p.get("workspace_id") or "")
@@ -299,7 +311,7 @@ def prune_duplicate_idle(extras: Sequence[dict[str, Any]], base: str, kept_pane:
         ws = str(extra.get("workspace_id") or "")
         if not pid or pid in (kept_pane, scheduler_pane):
             continue
-        if not re.fullmatch(rf"{re.escape(base)}-\d+", name):
+        if not re.fullmatch(rf"{re.escape(base)}(?:-\d+)?", name):
             continue
         if left.get(ws, 0) <= 1:
             continue
@@ -338,6 +350,20 @@ def stop_agent(member: dict[str, Any]) -> None:
             return
         time.sleep(1)
     raise ClaimError(f"{member['name']} 在 {EXIT_WAIT_S}s 内没有退出，未重启；请人工查看 pane {pane}")
+
+
+def switch_pane_cwd(pane: str, cwd: str) -> None:
+    """旧会话退出回到交互式 shell 后切换到目标工作目录，并回读确认生效，防止在旧 worktree 误启动。"""
+    target = os.path.realpath(cwd)
+    herdr("pane", "run", pane, f"cd -- {shlex.quote(target)}")
+    deadline = time.time() + CWD_SWITCH_WAIT_S
+    while True:
+        if same_dir(pane_cwd(pane), target):
+            return
+        if time.time() >= deadline:
+            break
+        time.sleep(0.5)
+    raise ClaimError(f"pane {pane} 切换工作目录到 {target} 超时（当前：{pane_cwd(pane) or '未知'}），拒绝在错误目录启动")
 
 
 def start_agent(name: str, pane: str, profile: dict[str, Any]) -> dict[str, Any]:
@@ -399,17 +425,21 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
     if member:
         pane = {"pane_id": member["pane_id"], "tab_id": member["tab_id"]}
         old = str(member["name"])
+        same_cwd = bool(member.get("_same_cwd"))
         same_issue = re.fullmatch(rf"{re.escape(base)}(-\d+)?", old)
         name = old if same_issue else free_name(base, all_agents, pane["pane_id"])
         if not NAME_RE.fullmatch(name):
             raise ClaimError(f"登记名过长或不合法：{name}（协议规定不截断，报阻塞）")
         herdr("pane", "rename", pane["pane_id"], label)
-        if keep_session and member.get("agent") == profile["kind"] and running_args_match(pane["pane_id"], profile["args"]):
+        if (same_cwd and keep_session and member.get("agent") == profile["kind"]
+                and running_args_match(pane["pane_id"], profile["args"])):
             if name != old:
                 herdr("agent", "rename", pane["pane_id"], name)
             action, agent = "kept", member
         else:
             stop_agent(member)
+            if not same_cwd:
+                switch_pane_cwd(pane["pane_id"], cwd)
             action, agent = "restarted", start_agent(name, pane["pane_id"], profile)
     else:
         name = free_name(base, all_agents, None)
@@ -438,7 +468,8 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
 
     record(pane, scheduler["name"], profile_name, drop_panes=pruned_panes, live_panes=live_panes)
     pruned_set = set(pruned_panes)
-    busy = [m["name"] for m in members if m is not member and m.get("pane_id") not in pruned_set]
+    picked_pane = pane["pane_id"] if member is not None else None
+    busy = [m["name"] for m in members if m.get("pane_id") != picked_pane and m.get("pane_id") not in pruned_set]
     return {"action": action, "name": name, "pane_id": pane["pane_id"], "tab_id": pane["tab_id"],
             "session": (agent.get("agent_session") or {}).get("value"), "kind": profile["kind"],
             "args": profile["args"], "label": label, "created_by": scheduler["name"], "other_same_role": busy,

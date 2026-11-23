@@ -150,9 +150,13 @@ def check_close_request(issue: Issue, link: str) -> str:
 def close_issue(issue: Issue) -> None:
     path = f"projects/{quote(issue.project, safe='')}/issues/{issue.iid}"
     glab_api(issue.host, "PUT", path, "state_event=close")
-    state = glab_api(issue.host, "GET", path).get("state")
+    detail = glab_api(issue.host, "GET", path)
+    state = detail.get("state")
     if state != "closed":
         raise WrapupError(f"关闭 {issue.url} 后回读状态是 {state}")
+    stale = [str(lb) for lb in (detail.get("labels") or []) if str(lb).startswith("状态:")]
+    if stale:
+        glab_api(issue.host, "PUT", path, f"remove_labels={','.join(stale)}")
 
 
 # ---------- 第 1 步：测试服务 ----------
@@ -339,13 +343,39 @@ def _belongs_to_repo_tree(wt_repo: str, main_repo: Optional[str]) -> bool:
     return real_wt == real_main or real_wt.startswith(real_main + os.sep)
 
 
+def _load_task_state_text(main_repo: Optional[str], task: str) -> str:
+    if not main_repo:
+        return ""
+    task_dir = Path(main_repo) / ".hwf/tmp" / task
+    chunks: list[str] = []
+    for fname in ("STATE.md", "STATE-history.md"):
+        fpath = task_dir / fname
+        if fpath.is_file():
+            try:
+                chunks.append(fpath.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                continue
+    return "\n".join(chunks)
+
+
+def _recorded_in_state(wt_path: str, state_text: str) -> bool:
+    """跨仓库兄弟目录（如 ~/code/member 的 issue-499-fix）仅在本任务 STATE.md 明确登记过路径时才认领。"""
+    if not state_text:
+        return False
+    real_wt = os.path.realpath(wt_path)
+    p = Path(real_wt)
+    tail = f"{p.parent.name}/{p.name}"
+    return real_wt in state_text or wt_path in state_text or f"worktrees/{tail}" in state_text
+
+
 def task_worktrees(task: str, main_repo: Optional[str] = None, iid: Optional[str] = None) -> list[Worktree]:
     """查找本任务的工作树：
     1. `<worktree 根>/<仓库>/<任务标识>` 及 `<任务标识>-<用途>`（精确边界，不误匹配 proj-470）；
-    2. 归属主仓库或其子目录后端仓库的 `issue-<编号>` / `issue-<编号>-<用途>`；
+    2. 归属主仓库树或在本任务 STATE.md 明确登记过的 `issue-<编号>` / `issue-<编号>-<用途>`；
     3. 嵌套在上述目录内的子 worktree（如基线存证目录）。
     """
     root = worktree_root()
+    state_text = _load_task_state_text(main_repo, task)
     task_candidates: list[tuple[str, bool]] = []
     if root.is_dir():
         for repo_dir in sorted(root.iterdir()):
@@ -369,7 +399,7 @@ def task_worktrees(task: str, main_repo: Optional[str] = None, iid: Optional[str
             print(f"跳过不是 git worktree 的目录 {top}：{error}")
             continue
         wt_repo = entries[0][0]  # git worktree list 第一项总是主工作树
-        if require_repo_match and not _belongs_to_repo_tree(wt_repo, main_repo):
+        if require_repo_match and not (_belongs_to_repo_tree(wt_repo, main_repo) or _recorded_in_state(top, state_text)):
             continue
         accepted_tops.append(top)
         entries_by_top.append((top, wt_repo, entries))
@@ -413,7 +443,8 @@ def shipped(path: str, ref: str) -> bool:
 
 def saved_ref(path: str, release: str) -> Optional[str]:
     """返回保存了 HEAD 的远端分支：先认 release/main（含按内容 cherry-pick 进去的），再认任意远端分支。"""
-    for ref in (release, "main"):
+    refs = ([release] if release else []) + ["main"]
+    for ref in refs:
         if shipped(path, f"origin/{ref}"):
             return f"origin/{ref}"
     remote = git(path, "branch", "-r", "--contains", "HEAD", "--format=%(refname:short)").stdout.split()
@@ -466,7 +497,8 @@ def judge_worktrees(worktrees: Sequence[Worktree], release: str, panes: Sequence
         elif reason := unsaved_reason(wt.path):
             wt.keep = reason
         elif not saved_ref(wt.path, release):
-            wt.keep = f"HEAD {wt.head[:10]} 不在任何远端分支里（按内容比对 origin/{release}、origin/main 也没有）"
+            checked_refs = f"origin/{release}、origin/main" if release else "origin/main"
+            wt.keep = f"HEAD {wt.head[:10]} 不在任何远端分支里（按内容比对 {checked_refs} 也没有）"
         elif users:
             wt.keep = f"还有 pane 在用：{', '.join(map(str, users))}"
     return problems
@@ -661,13 +693,23 @@ def wrapup(opts: argparse.Namespace) -> int:
             print(f"{tag}6. 将按 @{requester} 的要求关闭 {issue.url}")
         print(f"{tag}7. 将把 INDEX 中 {opts.task} 的状态改为：{opts.status}")
         return 0
-    try:
-        link = post_note(issue, body)
-        print(f"回执评论：{link}")
-        append_state(repo, opts.task, body, link)
-    except (WrapupError, ValueError) as error:
-        problems.append(f"回执：{error}")
-        print(f"回执未发出：{error}", file=sys.stderr)
+    silent_cancel = (
+        getattr(opts, "no_issue_note", False)
+        and opts.status.strip().lower().startswith("cancelled")
+        and not requester
+        and not problems
+    )
+    if silent_cancel:
+        append_state(repo, opts.task, body, "（对话模式未开工取消，免发评论）")
+        print("回执评论：已跳过（对话模式未开工取消，仅写入本地 STATE.md）")
+    else:
+        try:
+            link = post_note(issue, body)
+            print(f"回执评论：{link}")
+            append_state(repo, opts.task, body, link)
+        except (WrapupError, ValueError) as error:
+            problems.append(f"回执：{error}")
+            print(f"回执未发出：{error}", file=sys.stderr)
     if requester and not problems:
         try:
             close_issue(issue)
@@ -687,12 +729,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--repo", required=True, help="主仓库路径（INDEX 与 STATE 所在）")
     parser.add_argument("--task", required=True, help="INDEX 里的任务标识，如 frontend-web-v1-478")
     parser.add_argument("--issue", required=True, help="发回执的 issue：发起 issue，没有则根 issue")
-    parser.add_argument("--release", required=True, help="根 issue 的汇总分支，如 release-470")
+    parser.add_argument("--release", default="", help="根 issue 的汇总分支，如 release-470（未开工对话取消可省略）")
     parser.add_argument("--status", required=True, help="收尾后写进 INDEX 的状态，以 done/delivered/closed/cancelled 开头")
     parser.add_argument("--port", type=int, action="append", default=[], help="本交付用过、需要回读的端口，可重复")
     parser.add_argument("--scheduler", help="调度者登记名；默认取当前 pane 上的调度者")
     parser.add_argument("--close-request", help="用户明确要求关闭 issue 的那条评论链接；给了才在收尾全部通过后关闭 --issue，"
                                                 "不给就不关")
+    parser.add_argument("--no-issue-note", action="store_true",
+                        help="对话模式未开工且用户已主动关单取消（无残留）时跳过发 issue 收尾评论，只写本地 STATE 与 INDEX")
     parser.add_argument("--dry-run", action="store_true", help="只打印将做什么，不做任何改动")
     opts = parser.parse_args(argv)
     try:

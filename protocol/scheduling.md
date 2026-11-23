@@ -38,7 +38,7 @@
 
 - 只用 `scripts/member-start.py <profile> --task <任务> --cwd <工作树>` 领取，不手写 pane split/agent start 参数。配置缺模型或脚本非零则报阻塞，不绕过；返回 JSON 的身份、args、归属原样记入 STATE。
 - 脚本使用 `i<issue编号>-<profile>`，未建 issue 时 `new-<profile>`，占名时加后缀；profile ≤12 字符。按调度 tab 的编号生成，不手工起名；建 issue 后更新 new 名称，旧 `delivery-<profile>-<handle>` 成员不复用。
-- 只复用本团队、本 issue、cwd 一致的同角色空闲 pane；先收取已有产出、核对 INDEX/STATE 和读屏，再判断空闲。`idle/done` 不证明无在途工作或已交付，`working/blocked/unknown`、启动未就绪及审批界面都不算空闲。已知有在途任务或未收取结果，用 `--exclude` 排除。
+- 只复用本团队、本 issue 的同角色空闲 pane（优先选 cwd 一致的窗格以沿用会话；若本 issue 同角色空闲窗格在旧目录，`member-start.py` 会先退出旧会话、切换 shell `cwd` 并回读确认后再启动新会话，同时自动回收多余空闲副本）；先收取已有产出、核对 INDEX/STATE 和读屏，再判断空闲。`idle/done` 不证明无在途工作或已交付，`working/blocked/unknown`、启动未就绪及审批界面都不算空闲。已知有在途任务或未收取结果，用 `--exclude` 排除。
 - 新建成员前、切换阶段时，按下方「pane 收尾」重新盘点。优先用已有合格成员；不为假设的后续工作囤积窗格。
 - 有合格空闲成员就复用，包括本团队其他 tab 中的成员；均忙才新建。成员不跨调度者占用、不抢别的 issue 未释放的成员；创建前记录角色、pane、session 与 `created_by`，各团队无跨调度者角色锁。
 - 每个调度者独占 tab；成员只在自己的 tab 内创建/复用，布局、保持焦点、最小窗格由 member-start 管理，太挤另开 tab。记录实际返回的 pane/tab，不拼 ID，不搬动其他团队。
@@ -62,7 +62,7 @@
 1. `herdr agent prompt <明确target>` 不带 `--wait`；同一轮立即用后台作业运行 `python3 ~/.hwf/scripts/member-wait.py <成员> --repo <主仓库> --task <任务标识>`。不先回复用户再挂等待。回合结束前本团队每个 working/blocked 成员都须有后台等待；不使用前台等待、轮询、sleep 循环或周期性监控替代。禁用裸 `herdr agent wait`（2026-11-19 #484：成员断网后 herdr 仍报 working，干等约 2 小时），记录守卫会拦下。
 2. member-wait 单次最多等 10 分钟，边等边看屏幕。按退出码处理，同一次处理中做完：
    - `0` 到达目标状态：解析 `agent_status`，仍需等待的续挂或派下一环。blocked 用 `--until working --until idle --until done`。
-   - `3` 等满 10 分钟仍在干活、屏幕在变：评审类问一次 checkpoint（“还有哪条验收没结论；没有则收敛输出”）后续挂；其他角色直接续挂。checkpoint 只核范围，不要求降严重度或放行，不计轮。
+   - `3` 等满 10 分钟仍在干活、屏幕在变：评审类问一次 checkpoint（“还有哪条验收没结论；没有则收敛输出”）后续挂；其他角色直接续挂。checkpoint 只核范围，不要求降严重度或放行，不计轮。**常规退出码 `3` 续挂（及 `member-settle` 的 `finished: no` 续挂）禁止逐次往 `STATE.md` 追加过程流水**，只在派活、收取最终结论或退出码 `4`/`5` 异常换会话时记 STATE。
    - `4` 卡住（报错停留 5 分钟，或 working 但屏幕 15 分钟没变）：脚本已把「⚠ 卡住、正在换新会话」写进 issue 正文。关掉该 pane，用 member-start 开新会话，把原派活内容原样重发，再挂 member-wait；STATE 记旧 session 与原因。不要接着等旧会话。
    - `5` 卡住且需要用户处理（登录、代理、额度，或同一任务 60 分钟内第二次卡住）：脚本已写「等你处理」并发 ntfy。停下等用户，不再自己换会话重试；用户处理后先 `state-set 待用户事项 无`，再重派。
 3. 后台 shell 返回假超时或未响应不代表成员完成；一次 `agent get` 核对后原样续挂，不写等待循环。watch-guard 拦下时补齐等待；成员确已不属本任务则在 STATE 记录，不猜测忽略。
@@ -112,7 +112,7 @@
 ### 任务标识与索引
 
 - 有 issue：项目 path 的 `/` 替为 `-` 再接 IID；无 issue：`req-<本机YYYYMMDD>-<原始输入sha1前8位>`，原文逐字算，不裁剪。
-- 初始化读 INDEX 前用 `scripts/clean-tmp.py <仓库根>`：只清理最新文件超过 10 天且 INDEX 已收尾、发起 issue 已关闭（或无索引）的任务目录；在途、未关闭发起 issue、INDEX 不删。脚本非零记 STATE 后继续初始化；目录被清也按 GitLab 恢复同一标识。
+- 初始化读 INDEX 前用 `scripts/clean-tmp.py <仓库根>`：清理最新文件超过 10 天且 INDEX 已收尾、发起 issue 已关闭（或无索引）的 `.hwf/tmp/<任务>` 目录，并按同等安全门禁（无窗格占用、无未提交/未跟踪改动、`.hwf/tmp` 无独有证据、HEAD 已在远端分支）自动回收同仓库过期陈旧 worktree；在途、未关闭发起 issue、INDEX 不删。脚本非零记 STATE 后继续初始化；目录被清也按 GitLab 恢复同一标识。
 - 创建目录后用 `task-record.py index-add` 追加，变化用 index-set，只改自己那行；收尾状态只由 wrapup.py 写。禁止手写/重定向/替换 INDEX。恢复先匹配，不另建 issue、不重置轮次、不覆盖其他任务。
 
 ### STATE.md
@@ -124,12 +124,12 @@
 - 各评审计数、具体产物版本、结论与 reviews 路径；方案/用例 snippet URL/ID/SHA/上传时间/回填位置，裁定、验收映射、测试证据；最终验收轮次/所看SHA/原文/note。
 - 成员身份三元组、agent kind、issue、工作目录/分支/HEAD、可写范围、pane created_by；当前在途成员及等待；创建的服务进程/端口/origin、启动停止时间、关闭动作、回读与残留。
 
-STATE 顶部只保留当前情况，旧细节归任务历史；待上线时“下一动作”写完整 wrapup 命令及发起 issue 关闭限制。恢复读主入口、必读主题、INDEX/STATE 和 GitLab 最新记录，核对活跃成员，再继续；压缩依配置执行，不用会话记忆代替状态。输出较大先落盘后按需读取，同一 help 不重复查。
+STATE 顶部只保留当前情况；当 `STATE.md` 超过约 220 行或 28KB 时，`task-record.py state-set`（或手动 `task-record.py state-compact`）会自动保留来源/授权/基线/关键决定等核心章节与最近轮次记录，将更早的已封板阶段与成员流水无损归档至同目录 `STATE-history.md`。恢复会话默认只读 `STATE.md`，仅在回溯特定早期证据时按需检索 `STATE-history.md`。待上线时“下一动作”写完整 wrapup 命令及发起 issue 关闭限制。恢复读主入口、必读主题、INDEX/STATE 和 GitLab 最新记录，核对活跃成员，再继续；压缩依配置执行，不用会话记忆代替状态。输出较大先落盘后按需读取，同一 help 不重复查。
 
 ### pane 收尾
 
 成员结果收齐时就释放，不默认留到整单结束。调度者按本轮实际派活、交付物、会话身份及读屏，把成员分为「正在用 / 下步复用 / 结果待收 / 可关闭」。在 STATE 记录交付物与成员的对应关系；未提交改动也要有工作树、当前状态及接手人。不用空闲时长判断是否可关。
 
 - 留作下步复用，必须写明下一项具体派活。同一任务、角色、工作目录默认最多留一个空闲候补；正在并行执行、等待审批或结果待收的不占候补名额。
-- 只关闭自己为本任务创建、已完成交接、无未答问题且没有下一项派活的成员。关闭前再次核对 pane、会话、归属、读屏及是否承载服务；用户、他人、借用的窗格、调度者及身份不明的一律不动。从负责本任务的调度者窗格运行 `python3 ~/.hwf/scripts/member-release.py --issue <编号> --pane <窗格> --session <本轮已交接的会话标识>`；脚本核对登记与实时身份、复用收尾脚本关闭并回读，STATE 记关闭结果和保留原因。
+- 只关闭自己为本任务创建、已完成交接、无未答问题且没有下一项派活的成员。关闭前再次核对 pane、会话、归属、读屏及是否承载服务；用户、他人、借用的窗格、调度者及身份不明的一律不动。单个释放运行 `python3 ~/.hwf/scripts/member-release.py --issue <编号> --pane <窗格> --session <本轮已交接的会话标识>`；进入 `状态:待上线`（等待用户合并 `main` 或等待跨团队前置上线）或长时外部阻塞等待前，运行 `python3 ~/.hwf/scripts/member-release.py --issue <编号> --all-idle` 一键释放本单全部空闲就绪成员（后续用户回复时再按需重领），STATE 记关闭结果和保留原因。
 - 阶段中释放成员只关窗格，不调用整项 wrapup，不清工作树、分支、浏览器、服务或证据。交付结束仍按 [delivery.md](delivery.md) §9 处理剩余资源，目录另按 [worktrees.md](worktrees.md) 核验。

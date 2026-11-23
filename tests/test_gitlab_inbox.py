@@ -1275,3 +1275,79 @@ class HotReloadTest(unittest.TestCase):
             os.utime(s1, ns=(os_utime_ns + 2_000_000, os_utime_ns + 2_000_000))
             self.assertEqual(INBOX.reloadable_changes(base, paths), [s1])
 
+
+class ClosedChatOriginAndBackoffTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="hwf-inbox-close-")
+        patcher = patch.object(INBOX, "STATE_PATH", Path(tmp) / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_chat_mode_closed_origin_prompts_silent_wrapup_and_clears_stage_labels(self) -> None:
+        state = {
+            "origins": {
+                URL: {
+                    "project": "frontend/web-v1",
+                    "project_id": 10,
+                    "iid": 7,
+                    "repo": REPO,
+                    "initiator": "pengjh",
+                    "mode": INBOX.CHAT,
+                    "last_note_id": 5,
+                }
+            }
+        }
+        world = FakeWorld([], notes=[note(5)])
+        world.issue_state = "closed"
+        world.issue_labels = ["需求", "状态:待开始", "状态:等你处理", "herdr-auto"]
+        make(world, state).poll()
+        self.assertNotIn(URL, state["origins"])
+        self.assertEqual(world.label_updates, ["projects/10/issues/7?remove_labels=状态:待开始,状态:等你处理"])
+        self.assertEqual(len(world.prompts), 1)
+        self.assertIn("cancelled（对话模式未开工，用户已关闭 issue）", world.prompts[0])
+        self.assertIn("禁止在 issue 发追问评论", world.prompts[0])
+
+    def test_deliver_mode_closed_origin_still_checks_evidence_and_clears_stage_labels(self) -> None:
+        state = {
+            "origins": {
+                URL: {
+                    "project": "frontend/web-v1",
+                    "project_id": 10,
+                    "iid": 7,
+                    "repo": REPO,
+                    "initiator": "pengjh",
+                    "mode": INBOX.DELIVER,
+                    "last_note_id": 5,
+                }
+            }
+        }
+        world = FakeWorld([], notes=[note(5)])
+        world.issue_state = "closed"
+        world.issue_labels = ["状态:待上线", "herdr-auto"]
+        make(world, state).poll()
+        self.assertEqual(world.label_updates, ["projects/10/issues/7?remove_labels=状态:待上线"])
+        self.assertIn("请用户重开继续或明确取消", world.prompts[0])
+
+    def test_backoff_and_failure_suppression_recover_cleanly(self) -> None:
+        self.assertEqual(INBOX.compute_poll_backoff(60, 0), 60)
+        self.assertEqual(INBOX.compute_poll_backoff(60, 1), 60)
+        self.assertEqual(INBOX.compute_poll_backoff(60, 2), 120)
+        self.assertEqual(INBOX.compute_poll_backoff(60, 3), 240)
+        self.assertEqual(INBOX.compute_poll_backoff(60, 4), 300)
+        self.assertEqual(INBOX.compute_poll_backoff(60, 12), 300)
+
+        tracker = INBOX.PollFailureTracker(heartbeat_every=3)
+        self.assertEqual(tracker.record_failure(RuntimeError("TLS handshake timeout")), "poll failed: TLS handshake timeout")
+        self.assertIsNone(tracker.record_failure(RuntimeError("TLS handshake timeout")))
+        hb = tracker.record_failure(RuntimeError("TLS handshake timeout"))
+        self.assertIsNotNone(hb)
+        assert hb is not None
+        self.assertIn("3 consecutive rounds", hb)
+        # 错误原因变化时立即输出，不等下一次心跳周期
+        changed = tracker.record_failure(RuntimeError("502 Bad Gateway"))
+        self.assertEqual(changed, "poll failed: 502 Bad Gateway")
+        recovered = tracker.record_success()
+        self.assertEqual(recovered, "poll recovered after 4 consecutive failure(s)")
+        self.assertEqual(tracker.consecutive_failures, 0)
+        self.assertIsNone(tracker.record_success())
+

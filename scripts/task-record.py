@@ -3,8 +3,9 @@
 
     task-record.py index-add --repo <主仓库> --task <任务标识> --input <输入原文> [--status in-progress] [--queued]
     task-record.py index-set --repo <主仓库> --task <任务标识> --status <状态>
-    task-record.py state-set --repo <主仓库> --task <任务标识> --field <字段> --value <内容>
-    task-record.py note      --repo <主仓库> --task <任务标识> --issue <issue URL> --kind <类别> --body-file <文件> [--will …]
+    task-record.py state-set     --repo <主仓库> --task <任务标识> --field <字段> --value <内容>
+    task-record.py state-compact --repo <主仓库> --task <任务标识> [--max-lines 220] [--keep-sections 6] [--keep-bullets 25]
+    task-record.py note          --repo <主仓库> --task <任务标识> --issue <issue URL> --kind <类别> --body-file <文件> [--will …]
     task-record.py preflight --will <动作>...
     task-record.py card-check --file <arch 判定落盘文件>
     task-record.py release-check --repo <仓库路径> --release <release-根编号> [--base origin/main] [--develop origin/develop] --commit <步骤源SHA>... [--no-fetch]
@@ -79,6 +80,15 @@ QUIET, VERBOSE = "免打扰", "详尽"
 TOP_OPEN = "<!-- hwf:top 本段只由 task-record.py 改 -->"
 TOP_CLOSE = "<!-- /hwf:top -->"
 TOP_FIELDS = ("通知模式", "当前阶段", "下一动作", "待用户事项", "最近用户通知")
+AUTO_COMPACT_LINES = 220
+AUTO_COMPACT_BYTES = 28_000
+DEFAULT_KEEP_SECTIONS = 6
+DEFAULT_KEEP_BULLETS = 25
+PINNED_SECTION_KEYWORDS = (
+    "来源", "授权", "基线", "关键决定", "需求", "理解卡", "接口约定", "步骤", "依赖", "验收口径", "待定清单", "上线清单",
+)
+LOG_SECTION_KEYWORDS = ("成员", "收取", "过程", "流水", "记录", "日志", "轮次", "交接")
+ARCHIVE_HINT_RE = re.compile(r"^>\s*早期累计\s*(\d+)\s*条历史记录已无损归档至同目录\s*`?STATE-history\.md`?\s*$")
 # 这三项会原样显示在根 issue 进度区，必须短到一眼看完（2026-11-19 #484）。
 PROGRESS_FIELDS = {"当前阶段": "现在", "下一动作": "下一步", "待用户事项": "等你处理"}
 NOW_LIMIT, TITLE_LIMIT = 150, 80
@@ -152,6 +162,10 @@ def state_path(repo: str, task: str) -> Path:
     return Path(repo) / ".hwf/tmp" / task / "STATE.md"
 
 
+def state_history_path(repo: str, task: str) -> Path:
+    return Path(repo) / ".hwf/tmp" / task / "STATE-history.md"
+
+
 def read_top(text: str) -> dict[str, str]:
     start, end = text.find(TOP_OPEN), text.find(TOP_CLOSE)
     if start < 0 or end < start:
@@ -200,8 +214,212 @@ def state_set(repo: str, task: str, name: str, value: str) -> None:
     tmp = path.with_suffix(".tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
+    if len(text.encode("utf-8")) > AUTO_COMPACT_BYTES or text.count("\n") + 1 > AUTO_COMPACT_LINES:
+        state_compact(repo, task)
     if name in PROGRESS_FIELDS and progress_path(repo, task).exists():
         progress(repo, task)
+
+
+def _is_fence_line(line: str) -> Optional[str]:
+    stripped = line.lstrip()
+    if stripped.startswith("```"):
+        return "```"
+    if stripped.startswith("~~~"):
+        return "~~~"
+    return None
+
+
+def _split_h2_sections(text: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """按顶层 `## ` 标题拆分 Markdown（忽略代码围栏内的 `#`）。"""
+    preamble: list[str] = []
+    sections: list[tuple[str, list[str]]] = []
+    current_heading: Optional[str] = None
+    current_body: list[str] = []
+    fence: Optional[str] = None
+
+    for line in text.splitlines():
+        marker = _is_fence_line(line)
+        if marker is not None:
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+        if fence is None and line.startswith("## ") and not line.startswith("### "):
+            if current_heading is not None:
+                sections.append((current_heading, current_body))
+            current_heading = line
+            current_body = []
+            continue
+        if current_heading is None:
+            preamble.append(line)
+        else:
+            current_body.append(line)
+
+    if current_heading is not None:
+        sections.append((current_heading, current_body))
+    return preamble, sections
+
+
+def _is_pinned_section(heading: str) -> bool:
+    title = heading.lstrip("#").strip()
+    if any(k in title for k in LOG_SECTION_KEYWORDS) and not any(k in title for k in ("来源", "授权", "关键决定")):
+        return False
+    return any(k in title for k in PINNED_SECTION_KEYWORDS)
+
+
+def _compact_section_bullets(heading: str, body_lines: list[str], keep_bullets: int) -> tuple[list[str], list[str]]:
+    """裁剪单个流水章节内超长的顶层 `- ` 列表项，返回 (保留行, 归档行)。"""
+    intro: list[str] = []
+    blocks: list[list[str]] = []
+    prev_archived = 0
+    fence: Optional[str] = None
+    started_blocks = False
+
+    for line in body_lines:
+        marker = _is_fence_line(line)
+        if marker is not None:
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+        if not started_blocks and fence is None:
+            m = ARCHIVE_HINT_RE.match(line.strip())
+            if m:
+                prev_archived += int(m.group(1))
+                continue
+            if line.startswith("- "):
+                started_blocks = True
+                blocks.append([line])
+                continue
+            # 遇到子标题 ### 则不按纯平铺列表裁剪，交由章节级归档处理
+            if line.startswith("### "):
+                return body_lines, []
+            intro.append(line)
+            continue
+        if fence is None and line.startswith("- "):
+            blocks.append([line])
+        elif fence is None and line.startswith("### "):
+            # 后续混合了 ### 子段落时保守不拆单条 bullet，防止打乱子标题归属
+            return body_lines, []
+        else:
+            blocks[-1].append(line)
+
+    if len(blocks) <= keep_bullets:
+        if prev_archived > 0:
+            restored_hint = f"> 早期累计 {prev_archived} 条历史记录已无损归档至同目录 `STATE-history.md`"
+            kept_intro = [l for l in intro if l.strip()]
+            out = ([""] if not kept_intro else [""] + kept_intro) + ["", restored_hint, ""]
+            for blk in blocks:
+                out.extend(blk)
+            return out, []
+        return body_lines, []
+
+    cut = len(blocks) - keep_bullets
+    archived_blocks = blocks[:cut]
+    kept_blocks = blocks[cut:]
+    total_archived = prev_archived + cut
+    hint_line = f"> 早期累计 {total_archived} 条历史记录已无损归档至同目录 `STATE-history.md`"
+
+    archived_lines = [heading, ""]
+    for blk in archived_blocks:
+        archived_lines.extend(blk)
+    while archived_lines and not archived_lines[-1].strip():
+        archived_lines.pop()
+
+    clean_intro = [l for l in intro if l.strip()]
+    new_body: list[str] = [""]
+    if clean_intro:
+        new_body.extend(clean_intro)
+        new_body.append("")
+    new_body.append(hint_line)
+    new_body.append("")
+    for blk in kept_blocks:
+        new_body.extend(blk)
+    return new_body, archived_lines
+
+
+def state_compact(
+    repo: str,
+    task: str,
+    max_lines: int = AUTO_COMPACT_LINES,
+    keep_sections: int = DEFAULT_KEEP_SECTIONS,
+    keep_bullets: int = DEFAULT_KEEP_BULLETS,
+) -> dict[str, Any]:
+    """将超长 STATE.md 的早期历史章节与单章节早期流水无损归档到同目录 STATE-history.md。"""
+    path = state_path(repo, task)
+    if not path.is_file():
+        return {"compacted": False, "before_lines": 0, "after_lines": 0, "archived_chunks": 0}
+    raw = path.read_text(encoding="utf-8")
+    before_lines = raw.count("\n") + (1 if raw and not raw.endswith("\n") else 0)
+    if before_lines <= max_lines and len(raw.encode("utf-8")) <= AUTO_COMPACT_BYTES:
+        return {"compacted": False, "before_lines": before_lines, "after_lines": before_lines, "archived_chunks": 0}
+
+    preamble, sections = _split_h2_sections(raw)
+    if not sections:
+        return {"compacted": False, "before_lines": before_lines, "after_lines": before_lines, "archived_chunks": 0}
+
+    unpinned_indices = [idx for idx, (hdr, _) in enumerate(sections) if not _is_pinned_section(hdr)]
+    to_archive_idx: set[int] = set()
+    if len(unpinned_indices) > keep_sections:
+        to_archive_idx = set(unpinned_indices[:-keep_sections])
+
+    archived_chunks: list[str] = []
+    kept_sections: list[tuple[str, list[str]]] = []
+
+    for idx, (hdr, body) in enumerate(sections):
+        if idx in to_archive_idx:
+            chunk_lines = [hdr, *body]
+            while chunk_lines and not chunk_lines[-1].strip():
+                chunk_lines.pop()
+            archived_chunks.append("\n".join(chunk_lines))
+            continue
+        if not _is_pinned_section(hdr):
+            new_body, bullet_arch = _compact_section_bullets(hdr, body, keep_bullets)
+            if bullet_arch:
+                archived_chunks.append("\n".join(bullet_arch))
+            kept_sections.append((hdr, new_body))
+        else:
+            kept_sections.append((hdr, body))
+
+    if not archived_chunks:
+        return {"compacted": False, "before_lines": before_lines, "after_lines": before_lines, "archived_chunks": 0}
+
+    hist_path = state_history_path(repo, task)
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    header = f"# {task} 调度历史归档（STATE-history.md）\n\n> 本文件由 `task-record.py` 自动从 `STATE.md` 无损迁入，供按需检索早期轮次证据。\n"
+    existing_hist = hist_path.read_text(encoding="utf-8") if hist_path.is_file() else header
+    batch_text = f"\n<!-- archived at {stamp} -->\n\n" + "\n\n".join(archived_chunks) + "\n"
+    hist_tmp = hist_path.with_suffix(".tmp")
+    hist_tmp.write_text(existing_hist.rstrip("\n") + "\n" + batch_text, encoding="utf-8")
+    hist_tmp.replace(hist_path)
+
+    # 在 preamble 末尾确保有一行指向 STATE-history.md 的说明（只加一次）
+    history_pointer = "> 早期已封板阶段与成员过程流水已归档至同目录 `STATE-history.md`（按需检索，常规恢复无需通读）。"
+    if "STATE-history.md" not in "\n".join(preamble):
+        while preamble and not preamble[-1].strip():
+            preamble.pop()
+        preamble.extend(["", history_pointer, ""])
+
+    rebuilt_lines: list[str] = list(preamble)
+    if rebuilt_lines and rebuilt_lines[-1].strip():
+        rebuilt_lines.append("")
+    for hdr, body in kept_sections:
+        rebuilt_lines.append(hdr)
+        rebuilt_lines.extend(body)
+        if rebuilt_lines and rebuilt_lines[-1].strip():
+            rebuilt_lines.append("")
+    new_text = "\n".join(rebuilt_lines).rstrip("\n") + "\n"
+    after_lines = new_text.count("\n")
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(new_text, encoding="utf-8")
+    tmp.replace(path)
+    return {
+        "compacted": True,
+        "before_lines": before_lines,
+        "after_lines": after_lines,
+        "archived_chunks": len(archived_chunks),
+        "history_path": str(hist_path),
+    }
 
 
 # ---------- 自查：同意之后本账号做不做得了 ----------
@@ -630,6 +848,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     top = sub.add_parser("state-set", parents=[common])
     top.add_argument("--field", required=True, choices=TOP_FIELDS)
     top.add_argument("--value", required=True)
+    compact = sub.add_parser("state-compact", parents=[common])
+    compact.add_argument("--max-lines", type=int, default=AUTO_COMPACT_LINES)
+    compact.add_argument("--keep-sections", type=int, default=DEFAULT_KEEP_SECTIONS)
+    compact.add_argument("--keep-bullets", type=int, default=DEFAULT_KEEP_BULLETS)
     post = sub.add_parser("note", parents=[common])
     post.add_argument("--issue", required=True)
     post.add_argument("--kind", required=True, choices=sorted(KINDS))
@@ -659,6 +881,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         elif opts.command == "state-set":
             state_set(opts.repo, opts.task, opts.field, opts.value)
             print(f"STATE 顶部「{opts.field}」已更新")
+        elif opts.command == "state-compact":
+            res = state_compact(opts.repo, opts.task, max_lines=opts.max_lines,
+                                keep_sections=opts.keep_sections, keep_bullets=opts.keep_bullets)
+            if res["compacted"]:
+                print(f"STATE.md 已归档瘦身：{res['before_lines']} -> {res['after_lines']} 行（{res['history_path']}）")
+            else:
+                print(f"STATE.md 无需归档（{res['before_lines']} 行）")
         elif opts.command == "note":
             code, text = note(opts.repo, opts.task, opts.issue, opts.kind,
                               Path(opts.body_file).read_text(encoding="utf-8"), opts.will)

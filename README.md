@@ -27,7 +27,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `herdr/droid-arch.json` | 架构师（droid）的模型与思考档；交互式 droid 只能用 `--settings` 文件指定 |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱、飞书桥、周期复盘（`retrospect.py`）、主动接活（`proactive.py`）、找调度者、按角色领取与跨目录复用成员（`member-start.py`）、阶段中释放空闲成员（`member-release.py`，支持待上线前 `--all-idle`）、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件生成有效 `/-/project/<id>/uploads/...` 直链并回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、长记录自动归档 `STATE-history.md`、按通知模式发评论、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删本单与跨仓登记 worktree、发收尾回执、写 INDEX）、清理过期临时目录与干净 worktree（`clean-tmp.py`）、新项目接入等脚本 |
+| `scripts/` | 收件箱、飞书桥、周期复盘（`retrospect.py`）、主动接活（`proactive.py`）、找调度者、按角色领取与跨目录复用成员（`member-start.py`）、阶段中释放空闲成员（`member-release.py`，支持待上线前 `--all-idle`）、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件生成有效 `/-/project/<id>/uploads/...` 直链并回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、长记录自动归档 `STATE-history.md`、按通知模式发评论、拦截交卷评论缺失或折叠藏匿的逐条验收录屏对账表、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删本单与跨仓登记 worktree、发收尾回执、写 INDEX）、清理过期临时目录与干净 worktree（`clean-tmp.py`）、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `omp-extensions/` | omp 扩展：调度者手改 INDEX 或直接用 glab 发 issue 评论时拦下，要求改用 `task-record.py`（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |

@@ -41,7 +41,7 @@ function indexReason() {
 }
 
 function noteReason() {
-  return `issue 评论不直接用 glab 发。把正文写进文件后运行：${SCRIPT} note --repo <主仓库> --task <任务标识> --issue <issue URL> --kind <todo|risk|answer|step-done|delivery-done|stage|record> --body-file <文件>。请用户同意或授权时用 --kind todo，并用 --will 写明用户同意后你要做的动作（merge=<MR URL>、push=<项目 URL>@<分支>、tag=<项目 URL>@<tag>，只需要用户自己做就写 none），脚本会先查你做不做得了；已确认方案、已评审用例或登记池备忘用 --kind record（只留 GitLab 存档，不刷飞书私聊）。`;
+  return `issue 评论不直接用 glab 发。把正文写进文件后运行：${SCRIPT} note --repo <主仓库> --task <任务标识> --issue <issue URL> --kind <todo|risk|answer|step-done|delivery-done|stage|record> --body-file <文件>。请用户同意或授权时用 --kind todo，并用 --will 写明用户同意后你要做的动作（merge=<MR URL>、push=<项目 URL>@<分支>、tag=<项目 URL>@<tag>，只需要用户自己做就写 none），脚本会先查你做不做得了；step-done 与 delivery-done 必须在 <details> 折叠区外附「验收标准逐条对账表」（含播放器 Markdown、时间段与 /-/project/<ID>/uploads/... 直链）；已确认方案、已评审用例或登记池备忘用 --kind record（只留 GitLab 存档，不刷飞书私聊）。`;
 }
 
 function schedulerName(selfPane) {

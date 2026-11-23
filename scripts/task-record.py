@@ -25,6 +25,9 @@ STATE 顶部：state-set 维护 STATE.md 开头 `<!-- hwf:top -->` 标记之间�
 评论：note 按 STATE 顶部的通知模式决定发不发，并在评论末尾附隐藏标记 `<!-- hwf-kind:<类别> -->` 供飞书秘书识别。
 免打扰下 stage（阶段进度）不发，退出码 3，内容只写 STATE；step-done（步骤汇总）与 record（登记或存档）只写 GitLab 留档备查，
 不推送飞书私聊、也不覆盖 STATE「最近用户通知」；只有 todo、risk、answer、delivery-done 会推送飞书私聊并更新「最近用户通知」（详尽模式全推）。
+step-done、delivery-done（及宣告最终验收通过的交卷评论）必须在 <details> 折叠区外附「验收标准逐条对账表」
+（| 验收项 | 结果 | 录屏与时间段（或免录说明） |），逐条带 ![说明](/uploads/...mp4)、起止时间段与
+https://<域名>/-/project/<数字ID>/uploads/... 直链（纯单测或用户同意免测项写明原因与证据），缺表、折叠藏证、跳号或仅贴截图均按退出码 3 拦下。
 todo（要用户处理或授权）必须用 --will 写明用户同意后本账号要做的动作，脚本先自查做不做得了：
     --will merge=<MR URL>   --will push=<项目 URL>@<分支>   --will tag=<项目 URL>@<tag 名>   --will none（只需要用户自己做）
 有一项做不了就不发，改成请用户来做；查不出来的在评论末尾注明。正文和已发过的完全一样时不发。
@@ -544,6 +547,16 @@ def card_sections(text: str) -> dict[str, str]:
     return {name: "\n".join(lines).strip() for name, lines in sections.items()}
 
 
+def _card_acceptance_items(sections: dict[str, str]) -> list[str]:
+    items: list[str] = []
+    for line in sections.get("验收条件", "").splitlines():
+        if ITEM.match(line):
+            items.append(line)
+        elif items and line.strip():
+            items[-1] += "\n" + line
+    return items
+
+
 def card_check(text: str) -> list[str]:
     """返回缺项清单；空列表表示需求理解卡写全了。"""
     sections = card_sections(text)
@@ -552,12 +565,7 @@ def card_check(text: str) -> list[str]:
         problems.append("「现状」缺失或没有 file:line 依据")
     if not sections.get("历史与坑"):
         problems.append("「历史与坑」缺失或是空的（没有相关记录也要写明查了什么）")
-    items: list[str] = []
-    for line in sections.get("验收条件", "").splitlines():
-        if ITEM.match(line):
-            items.append(line)
-        elif items and line.strip():
-            items[-1] += "\n" + line
+    items = _card_acceptance_items(sections)
     if not items:
         problems.append("「验收条件」缺失或不是编号列表")
     for number, item in enumerate(items, 1):
@@ -785,6 +793,296 @@ def progress(repo: str, task: str, issue_url: Optional[str] = None, steps: Optio
     return issue.url
 
 
+# ---------- 交卷评论逐条验收对账表校验 ----------
+
+INNER_DETAILS_RE = re.compile(r"<details\b[^>]*>(?:(?!</?details\b).)*?</details>", re.I | re.S)
+UNCLOSED_DETAILS_RE = re.compile(r"<details\b[^>]*>.*\Z", re.I | re.S)
+INLINE_CODE_RE = re.compile(r"`+[^`]*`+")
+LEGACY_UPLOAD_URL_RE = re.compile(
+    r"https?://[^/\s|)\"'<>`]+/(?!-/project/\d+/uploads/)[^\s|)\"'<>`]*?/uploads/[0-9a-fA-F]{16,}/[^\s|)\"'<>`]+"
+)
+VIDEO_EMBED_RE = re.compile(
+    r"!\[[^\]]*\]\((?P<rel>/uploads/(?P<secret>[0-9a-fA-F]+)/[^)\s]+\.(?:mp4|webm))(?:\s+\"[^\"]*\")?\)", re.I
+)
+DIRECT_VIDEO_URL_RE = re.compile(
+    r"https?://[^/\s|)\"'<>`]+/-/project/\d+/uploads/(?P<secret>[0-9a-fA-F]+)/[^\s|)\"'<>`]+\.(?:mp4|webm)", re.I
+)
+ANY_VIDEO_REF_RE = re.compile(r"/uploads/[0-9a-fA-F]+/[^\s|)\"'<>`]+\.(?:mp4|webm)", re.I)
+IMAGE_EMBED_RE = re.compile(
+    r"!\[[^\]]*\]\((?P<rel>/uploads/(?P<secret>[0-9a-fA-F]+)/[^)\s]+\.(?:png|jpe?g|webp|gif))(?:\s+\"[^\"]*\")?\)", re.I
+)
+DIRECT_IMAGE_URL_RE = re.compile(
+    r"https?://[^/\s|)\"'<>`]+/-/project/\d+/uploads/(?P<secret>[0-9a-fA-F]+)/[^\s|)\"'<>`]+\.(?:png|jpe?g|webp|gif)", re.I
+)
+ANY_IMAGE_REF_RE = re.compile(r"/uploads/[0-9a-fA-F]+/[^\s|)\"'<>`]+\.(?:png|jpe?g|webp|gif)", re.I)
+_TIMESTAMP_TOKEN = r"\d{1,2}:\d{2}(?::\d{2})?(?:\.\d+)?"
+TIME_RANGE_RE = re.compile(rf"(?<!\d){_TIMESTAMP_TOKEN}\s*(?:[-–—~～]|至|到)\s*{_TIMESTAMP_TOKEN}(?!\d)")
+AC_ID_RE = re.compile(r"^(?:第\s*)?(?P<prefix>[A-Za-z]{0,4})[-_#]?(?P<num>[1-9]\d*)(?:\s*[条项.、:：·)\]]|\s|$)")
+VIDEO_FALLBACK_RE = re.compile(r"无法录屏|不可回放|录屏受限")
+USER_EXEMPT_RE = re.compile(r"用户同意|用户确认|人工验收|免测|免录")
+NOTE_OR_URL_RE = re.compile(r"#note_\d+|https?://\S+|会话确认")
+UNIT_OR_API_RE = re.compile(
+    r"单测|单元测试|vitest|pytest|unittest|\.test\.|\.spec\.|纯接口|无页面|无界面|后端接口|命令行|构建检查|静态检查",
+    re.I,
+)
+STEP_DEFER_RE = re.compile(r"归属步骤|见步骤|后续步骤")
+FINAL_ACCEPTANCE_CLAIM_RE = re.compile(r"最终验收通过|§9\.1[^\n]{0,20}通过|整项(?:交付|需求)(?:已)?完成|全部验收通过")
+
+
+def _strip_fences(text: str) -> str:
+    out: list[str] = []
+    fence: Optional[str] = None
+    for line in text.splitlines():
+        marker = _is_fence_line(line)
+        if marker is not None:
+            if fence is None:
+                fence = marker
+            elif fence == marker:
+                fence = None
+            continue
+        if fence is None:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _strip_folded_and_fences(text: str) -> str:
+    # 飞书转达会直接剥离 <details>，对账表必须留在折叠区与代码块之外。
+    cleaned = _strip_fences(text)
+    while INNER_DETAILS_RE.search(cleaned):
+        cleaned = INNER_DETAILS_RE.sub("", cleaned)
+    return UNCLOSED_DETAILS_RE.sub("", cleaned)
+
+
+def _strip_inline_code(text: str) -> str:
+    return INLINE_CODE_RE.sub("", text)
+
+
+def legacy_upload_url_problems(body: str) -> list[str]:
+    """拦截手拼 `/<组>/<项目>/uploads/...` 旧式链接（新版 GitLab 直接 404）。"""
+    cleaned = _strip_inline_code(_strip_fences(body))
+    bad = list(dict.fromkeys(m.group(0) for m in LEGACY_UPLOAD_URL_RE.finditer(cleaned)))
+    if not bad:
+        return []
+    return [
+        f"附件链接使用了旧路径（新版 GitLab 打开会 404）：{url}；请改用 upload-media.py 输出的 https://<域名>/-/project/<数字ID>/uploads/... 直链"
+        for url in bad
+    ]
+
+
+def _split_pipe_row(line: str) -> list[str]:
+    raw = line.strip()
+    if "|" not in raw:
+        return []
+    if raw.startswith("|"):
+        raw = raw[1:]
+    if raw.endswith("|") and not raw.endswith(r"\|"):
+        raw = raw[:-1]
+    return [cell_text.replace(r"\|", "|").strip() for cell_text in re.split(r"(?<!\\)\|", raw)]
+
+
+def _find_acceptance_table(markdown: str) -> Optional[tuple[int, int, list[int], list[list[str]]]]:
+    """查找包含「验收*」「结果/结论/状态」「录屏/证据/说明」列的 Markdown 表格。"""
+    lines = markdown.splitlines()
+    idx = 0
+    while idx + 1 < len(lines):
+        headers = _split_pipe_row(lines[idx])
+        seps = _split_pipe_row(lines[idx + 1])
+        if (
+            len(headers) >= 3
+            and len(seps) == len(headers)
+            and all(re.fullmatch(r":?-{2,}:?", s) for s in seps)
+        ):
+            rows: list[list[str]] = []
+            idx += 2
+            while idx < len(lines) and "|" in lines[idx] and lines[idx].strip():
+                parsed = _split_pipe_row(lines[idx])
+                if len(parsed) < len(headers):
+                    parsed.extend([""] * (len(headers) - len(parsed)))
+                rows.append(parsed)
+                idx += 1
+            item_col = next((i for i, h in enumerate(headers) if "验收" in h), None)
+            res_col = next(
+                (i for i, h in enumerate(headers) if i != item_col and any(k in h for k in ("结果", "结论", "状态"))),
+                None,
+            )
+            ev_cols = [i for i in range(len(headers)) if i not in (item_col, res_col)]
+            if (
+                item_col is not None
+                and res_col is not None
+                and ev_cols
+                and any(any(k in headers[i] for k in ("录屏", "视频", "证据", "说明", "时间")) for i in ev_cols)
+            ):
+                return item_col, res_col, ev_cols, rows
+            continue
+        idx += 1
+    return None
+
+
+def _expected_acceptance_count(repo: Optional[str], task: Optional[str]) -> Optional[int]:
+    """从任务目录下最新通过 card-check 的非待澄清理解卡提取确认验收条数；debug 或无卡任务返回 None。"""
+    if not repo or not task:
+        return None
+    task_dir = state_path(repo, task).parent
+    candidates: list[tuple[float, str, int]] = []
+    for folder in ("planning", "analysis"):
+        sub = task_dir / folder
+        if not sub.is_dir():
+            continue
+        for md in sub.glob("*.md"):
+            if md.name.endswith((".comment.md", ".publish.md")):
+                continue
+            try:
+                raw = md.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if card_check(raw):
+                continue
+            sections = card_sections(raw)
+            if "待澄清" in sections.get("复杂度判定", ""):
+                continue
+            count = len(_card_acceptance_items(sections))
+            if count > 0:
+                candidates.append((md.stat().st_mtime, md.name, count))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][2]
+
+
+def _task_has_recorded_videos(repo: Optional[str], task: Optional[str]) -> bool:
+    if not repo or not task:
+        return False
+    testing_dir = state_path(repo, task).parent / "testing"
+    if not testing_dir.is_dir():
+        return False
+    return any(
+        p.is_file() and p.stat().st_size > 0
+        for ext in ("*.mp4", "*.webm")
+        for p in testing_dir.rglob(ext)
+    )
+
+
+def acceptance_table_problems(
+    body: str,
+    *,
+    kind: str,
+    repo: Optional[str] = None,
+    task: Optional[str] = None,
+) -> list[str]:
+    """核验交卷评论是否在折叠区外附了完整的「验收标准逐条对账表」。"""
+    outer = _strip_folded_and_fences(body)
+    found = _find_acceptance_table(outer)
+    if found is None:
+        if _find_acceptance_table(_strip_fences(body)) is not None:
+            return [
+                "「验收标准逐条对账表」被放进了 <details> 折叠区（飞书转达会直接剥离、GitLab 默认折叠不可见）；"
+                "请移到简短文字摘要正下方、<details> 折叠区之外"
+            ]
+        return [
+            "缺少「验收标准逐条对账表」：必须在 <details> 折叠区之外附上 `| 验收项 | 结果 | 录屏与时间段（或免录说明） |` 表格，"
+            "按已确认验收标准逐行贴齐播放器 Markdown、起止时间段与 /-/project/<数字ID>/uploads/... 直链（纯单测或免测项写明原因）"
+        ]
+
+    item_col, res_col, ev_cols, rows = found
+    if not rows:
+        return ["「验收标准逐条对账表」没有任何数据行"]
+
+    problems: list[str] = []
+    seen_nums: set[int] = set()
+    video_rows = 0
+    whole_delivery = kind != "step-done"
+
+    for row_no, row in enumerate(rows, 1):
+        item_raw = row[item_col].strip()
+        item_head = re.sub(r"^[\s*`_]+", "", item_raw)
+        id_match = AC_ID_RE.match(item_head)
+        if not id_match:
+            problems.append(f"对账表第 {row_no} 行「验收项」缺少明确编号（如 `1. ...`、`AC1 ...` 或 `E1 ...`）：{item_raw[:40]}")
+        else:
+            seen_nums.add(int(id_match["num"]))
+
+        res_clean = _strip_inline_code(row[res_col]).strip(" -—")
+        if not res_clean:
+            problems.append(f"对账表第 {row_no} 行「结果」为空")
+
+        ev_raw = " ".join(row[col] for col in ev_cols).strip()
+        ev_clean = _strip_inline_code(ev_raw)
+        video_embeds = list(VIDEO_EMBED_RE.finditer(ev_clean))
+
+        if video_embeds:
+            video_rows += 1
+            direct_secrets = {m["secret"].lower() for m in DIRECT_VIDEO_URL_RE.finditer(ev_clean)}
+            missing_direct = [m["rel"] for m in video_embeds if m["secret"].lower() not in direct_secrets]
+            if missing_direct:
+                problems.append(
+                    f"对账表第 {row_no} 行内嵌了视频播放器，但缺少 upload-media.py 返回的 "
+                    f"https://<域名>/-/project/<数字ID>/uploads/... 裸直链（飞书端无法点开）：{', '.join(missing_direct)}"
+                )
+            if not TIME_RANGE_RE.search(ev_clean):
+                problems.append(f"对账表第 {row_no} 行缺少该验收点在录屏中的起止时间段（如 `00:04–00:18`）")
+            continue
+
+        if VIDEO_EMBED_RE.search(ev_raw):
+            problems.append(
+                f"对账表第 {row_no} 行的 `![说明](/uploads/...mp4)` 被包进了反引号，GitLab 不会渲染播放器，请去掉反引号直接原样内嵌"
+            )
+            continue
+
+        if ANY_VIDEO_REF_RE.search(ev_raw):
+            problems.append(f"对账表第 {row_no} 行只贴了视频链接、未原样内嵌 `![说明](/uploads/...mp4)` 播放器")
+            continue
+
+        if ANY_IMAGE_REF_RE.search(ev_raw):
+            img_embeds = list(IMAGE_EMBED_RE.finditer(ev_clean))
+            direct_img_secrets = {m["secret"].lower() for m in DIRECT_IMAGE_URL_RE.finditer(ev_clean)}
+            imgs_ok = bool(img_embeds) and all(m["secret"].lower() in direct_img_secrets for m in img_embeds)
+            if VIDEO_FALLBACK_RE.search(ev_clean) and imgs_ok:
+                continue
+            if USER_EXEMPT_RE.search(ev_clean) and NOTE_OR_URL_RE.search(ev_raw):
+                continue
+            if UNIT_OR_API_RE.search(ev_raw) and imgs_ok:
+                continue
+            problems.append(
+                f"对账表第 {row_no} 行仅贴静态截图、未附过程录屏（.mp4）：真机界面/交互验收必须交付录屏；"
+                "确属无法录屏或不可回放须写明具体原因并同时附截图播放器与 /-/project/<ID>/uploads/... 直链，用户同意免录须附 #note_ 链接"
+            )
+            continue
+
+        if UNIT_OR_API_RE.search(ev_raw) and len(ev_raw) >= 10:
+            continue
+        if "默认不验" in ev_clean:
+            continue
+        if USER_EXEMPT_RE.search(ev_clean) and NOTE_OR_URL_RE.search(ev_raw):
+            continue
+        if kind == "step-done" and STEP_DEFER_RE.search(ev_clean):
+            continue
+        problems.append(
+            f"对账表第 {row_no} 行缺少录屏证据（`![说明](/uploads/...mp4)` + 起止时间段 + `/-/project/<ID>/uploads/...` 直链）；"
+            "若属纯单测、纯后端无页面或用户同意免测，须写明具体原因与单测通过证据或 #note_ 评论链接"
+        )
+
+    if whole_delivery and seen_nums:
+        max_num = max(seen_nums)
+        missing_nums = [n for n in range(1, max_num + 1) if n not in seen_nums]
+        if missing_nums:
+            problems.append(
+                f"验收对账表编号不连续，漏掉了第 {'、'.join(map(str, missing_nums))} 条（须从第 1 条起逐条对齐，不得跳号挑录）"
+            )
+        expected_n = _expected_acceptance_count(repo, task)
+        if expected_n is not None and max_num < expected_n:
+            problems.append(
+                f"需求理解卡确认了 {expected_n} 条验收条件，但对账表只列到第 {max_num} 条"
+                "（纯单测或用户同意简化/免测的条目也必须保留对应行并写明原因，不得漏行）"
+            )
+
+    if whole_delivery and video_rows == 0 and _task_has_recorded_videos(repo, task):
+        problems.append(
+            "本任务 testing/ 目录已录制 .mp4 视频，但对账表中 0 条附视频：已录制有效录屏的验收项必须上传并内嵌交付，禁止弃用视频"
+        )
+
+    return problems
+
+
 # ---------- 评论 ----------
 
 def format_kind_tag(kind: str) -> str:
@@ -810,13 +1108,27 @@ def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequ
     blocked = [text for verdict, text in results if verdict == "no"]
     if blocked:
         return EXIT_HELD, "没发：下面的动作本账号做不了，不要请用户同意，改成请用户来做（--will none）：\n- " + "\n- ".join(blocked)
+    if kind != "record":
+        legacy_urls = legacy_upload_url_problems(body)
+        if legacy_urls:
+            return EXIT_HELD, "没发：发现手拼的旧版附件路径，会导致浏览器/飞书点开 404：\n- " + "\n- ".join(legacy_urls)
+    log = state_path(repo, task).with_name("notes.jsonl")
+    sent = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
+    has_delivery_done = any(item.get("issue") == issue_url and item.get("kind") == "delivery-done" for item in sent)
+    needs_table = kind in ("step-done", "delivery-done") or (
+        kind == "todo"
+        and not has_delivery_done
+        and bool(FINAL_ACCEPTANCE_CLAIM_RE.search(_strip_folded_and_fences(body)))
+    )
+    if needs_table:
+        ac_problems = acceptance_table_problems(body, kind=kind, repo=repo, task=task)
+        if ac_problems:
+            return EXIT_HELD, "没发：交卷评论未满足「验收标准逐条对账表」硬门禁：\n- " + "\n- ".join(ac_problems)
     unknown = [text for verdict, text in results if verdict == "unknown"]
     if unknown:
         body += "\n\n自查没查出来的：\n" + "\n".join(f"- {text}" for text in unknown)
-    log = state_path(repo, task).with_name("notes.jsonl")
     # 摘要仍对不含隐藏标签的正文计算，兼容历史 notes.jsonl 去重记录。
     digest = hashlib.sha256(body.encode()).hexdigest()
-    sent = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
     same = next((item for item in sent if item["sha256"] == digest and item["issue"] == issue_url), None)
     if same:
         return EXIT_HELD, f"没发：同样的内容已经发过 {same['link']}"

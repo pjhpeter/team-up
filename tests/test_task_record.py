@@ -188,16 +188,23 @@ class NoteTests(Case):
         self.assertIn(todo_link, TR.read_top(self.state())["最近用户通知"])
 
         # 免打扰下 step-done 与 record 照常写 GitLab 备查，但带对应 hwf-kind 且不覆盖「最近用户通知」。
-        step_code, _ = self.note("step-done", "步骤 1 完成")
+        valid_table = (
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |\n"
+            "| --- | --- | --- |\n"
+            "| 1. 按钮展示与点击 | 通过 | ![AC1](/uploads/0123456789abcdef0123456789abcdef/ac1.mp4) "
+            "00:02–00:11 https://git.example.com/-/project/10/uploads/0123456789abcdef0123456789abcdef/ac1.mp4 |"
+        )
+        step_body = f"步骤 1 完成\n\n{valid_table}"
+        step_code, _ = self.note("step-done", step_body)
         rec_code, _ = self.note("record", "已评审用例存档")
         self.assertEqual((step_code, rec_code), (TR.EXIT_OK, TR.EXIT_OK))
         self.assertEqual(self.glab.posted[-2:], [
-            "步骤 1 完成\n\n<!-- hwf-kind:step-done -->",
+            f"{step_body}\n\n<!-- hwf-kind:step-done -->",
             "已评审用例存档\n\n<!-- hwf-kind:record -->",
         ])
         self.assertIn(todo_link, TR.read_top(self.state())["最近用户通知"])
 
-        done_code, done_link = self.note("delivery-done", "整项交付完成")
+        done_code, done_link = self.note("delivery-done", f"整项交付完成\n\n{valid_table}")
         self.assertEqual(done_code, TR.EXIT_OK)
         self.assertTrue(self.glab.posted[-1].endswith("<!-- hwf-kind:delivery-done -->"))
         self.assertIn(done_link, TR.read_top(self.state())["最近用户通知"])
@@ -247,7 +254,160 @@ class NoteTests(Case):
         self.assertEqual(self.note("todo", f"请点击合并：{MR}", "none")[0], TR.EXIT_OK)
         self.glab.closes_issues = [{"iid": 484, "state": "opened"}]
         self.glab.mr["state"] = "merged"
-        self.assertEqual(self.note("step-done", f"步骤 1 已合并测试分支：{MR}")[0], TR.EXIT_OK)
+        merged_step = (
+            f"步骤 1 已合并测试分支：{MR}\n\n"
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |\n"
+            "| --- | --- | --- |\n"
+            "| 1. 接口返回校验 | 通过 | 纯后端接口单测：`tests/api.spec.ts` 8 条通过 |"
+        )
+        self.assertEqual(self.note("step-done", merged_step)[0], TR.EXIT_OK)
+
+    def test_delivery_and_step_done_enforce_outer_acceptance_reconciliation_table(self) -> None:
+        sec1 = "11111111111111111111111111111111"
+        sec2 = "22222222222222222222222222222222"
+        good_row_1 = (
+            f"| E1 · 顶部提示关闭 | 通过 | ![E1](/uploads/{sec1}/ac1-close.mp4)<br>"
+            f"时间段：00:01.5–00:12.0<br>直链：https://git.example.com/-/project/10/uploads/{sec1}/ac1-close.mp4 |"
+        )
+
+        # 1) 完全不带对账表 -> 拦下
+        code, msg = self.note("delivery-done", "整项交付完成，请合并上线 MR")
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("缺少「验收标准逐条对账表」", msg)
+
+        # 2) 对账表只藏在 <details> 折叠区里（#495 漏法） -> 拦下
+        folded_only = (
+            "整项交付完成\n\n<details><summary>完整内容</summary>\n\n"
+            f"| 验收项 | 结果 | 录屏与时间段 |\n| --- | --- | --- |\n{good_row_1}\n\n</details>"
+        )
+        code, msg = self.note("delivery-done", folded_only)
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("<details>", msg)
+
+        # 3) 编号跳漏（只贴 E1 与 E5，漏掉 E2/E3/E4 —— #496 漏法） -> 拦下
+        skipped_nums = "\n".join([
+            "整项交付完成",
+            "",
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |",
+            "| --- | --- | --- |",
+            good_row_1,
+            f"| E5 · 冒烟切页 | 通过 | ![E5](/uploads/{sec2}/ac5.mp4) 00:00–00:08 "
+            f"https://git.example.com/-/project/10/uploads/{sec2}/ac5.mp4 |",
+        ])
+        code, msg = self.note("delivery-done", skipped_nums)
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("2、3、4", msg)
+
+        # 4) 仅贴静态截图充数、未写无法录屏原因（#495 第 2/3/4 条漏法） -> 拦下
+        screenshot_only = "\n".join([
+            "步骤 1 完成",
+            "",
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |",
+            "| --- | --- | --- |",
+            f"| 1. 右键粘贴避让 | 通过 | ![截图](/uploads/{sec1}/shot.png) "
+            f"https://git.example.com/-/project/10/uploads/{sec1}/shot.png |",
+        ])
+        code, msg = self.note("step-done", screenshot_only)
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("仅贴静态截图", msg)
+
+        # 5) 播放器被包进反引号、缺飞书直链或缺时间段 -> 分别拦下
+        backticked = "\n".join([
+            "| 验收项 | 结果 | 录屏与时间段 |",
+            "| --- | --- | --- |",
+            f"| 1. 弹窗关闭 | 通过 | `![AC1](/uploads/{sec1}/ac1.mp4)` 00:02–00:09 "
+            f"https://git.example.com/-/project/10/uploads/{sec1}/ac1.mp4 |",
+        ])
+        self.assertIn("反引号", self.note("step-done", backticked)[1])
+
+        no_direct = "\n".join([
+            "| 验收项 | 结果 | 录屏与时间段 |",
+            "| --- | --- | --- |",
+            f"| 1. 弹窗关闭 | 通过 | ![AC1](/uploads/{sec1}/ac1.mp4) 00:02–00:09 |",
+        ])
+        self.assertIn("/-/project/", self.note("step-done", no_direct)[1])
+
+        no_time = "\n".join([
+            "| 验收项 | 结果 | 录屏与时间段 |",
+            "| --- | --- | --- |",
+            f"| 1. 弹窗关闭 | 通过 | ![AC1](/uploads/{sec1}/ac1.mp4) "
+            f"https://git.example.com/-/project/10/uploads/{sec1}/ac1.mp4 |",
+        ])
+        self.assertIn("时间段", self.note("step-done", no_time)[1])
+
+        # 6) 手拼旧式 `/<组>/<项目>/uploads/...` 404 链接（#499 漏法） -> answer/todo/delivery-done 全部拦下
+        bad_url_body = f"补发录屏：https://git.example.com/group/proj/uploads/{sec1}/ac1.mp4"
+        code, msg = self.note("answer", bad_url_body)
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("404", msg)
+
+    def test_card_count_recorded_mp4_and_todo_final_acceptance_bypass_are_enforced(self) -> None:
+        sec1 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        sec2 = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        # 写入含 3 条确认验收条件的需求理解卡，以及 testing/ 下录制好的 .mp4 文件。
+        planning_dir = TR.state_path(self.repo, TASK).parent / "planning"
+        planning_dir.mkdir(parents=True, exist_ok=True)
+        card_3 = CARD.replace(
+            "验收前提：无特殊前提",
+            "3. 既有重复卡流程不回归 ｜ 证据：定向单测通过输出\n\n验收前提：无特殊前提",
+        )
+        (planning_dir / "01-arch.md").write_text(card_3, encoding="utf-8")
+        testing_dir = TR.state_path(self.repo, TASK).parent / "testing" / "r1"
+        testing_dir.mkdir(parents=True, exist_ok=True)
+        (testing_dir / "ac1-toolbar.mp4").write_bytes(b"\x00\x00\x00\x18ftypmp42video")
+
+        # 1) testing/ 有已录制的 .mp4，但全表 0 段视频 -> 拦下
+        zero_video_table = "\n".join([
+            "整项交付完成",
+            "",
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |",
+            "| --- | --- | --- |",
+            "| 1. 工具栏不换行 | 通过 | 纯单测：`tests/toolbar.spec.ts` 4 条通过 |",
+            "| 2. 断网重试按钮 | 通过 | 用户同意免测 #note_12 |",
+            "| 3. 既有重复卡回归 | 通过 | 纯单测：`tests/dup.vitest.ts` 6 条通过 |",
+        ])
+        code, msg = self.note("delivery-done", zero_video_table)
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("testing/ 目录已录制 .mp4", msg)
+
+        # 2) 理解卡确认 3 条，但对账表只列了前 2 条 -> 拦下
+        only_two_rows = "\n".join([
+            "整项交付完成",
+            "",
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |",
+            "| --- | --- | --- |",
+            f"| 1. 工具栏不换行 | 通过 | ![AC1](/uploads/{sec1}/ac1.mp4) 00:01–00:08 "
+            f"https://git.example.com/-/project/10/uploads/{sec1}/ac1.mp4 |",
+            "| 2. 断网重试按钮 | 通过 | 用户同意免真机验证 #note_18 |",
+        ])
+        code, msg = self.note("delivery-done", only_two_rows)
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("确认了 3 条验收条件", msg)
+
+        # 3) 用 --kind todo 宣告「最终验收通过」却不附逐条对账表（#499 note_28782 绕过路径） -> 拦下
+        code, msg = self.note("todo", "§9.1 最终验收通过，请先部署后端再合并上线", "none")
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("验收标准逐条对账表", msg)
+
+        # 4) 补齐全部 3 条（含真机视频、无法录屏截图回退、纯单测）并在折叠区放完整报告 -> 放行
+        complete_delivery = "\n".join([
+            "整项交付完成，上线 MR 待你点击合并。",
+            "",
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |",
+            "| --- | --- | --- |",
+            f"| 1. 工具栏不换行 | 通过 | ![AC1](/uploads/{sec1}/ac1.mp4)<br>00:01–00:08<br>"
+            f"https://git.example.com/-/project/10/uploads/{sec1}/ac1.mp4 |",
+            f"| 2. 断网重试按钮 | 通过 | 沙箱断网代理切换瞬态无法录屏，附同轮截图 ![AC2](/uploads/{sec2}/ac2.png) "
+            f"https://git.example.com/-/project/10/uploads/{sec2}/ac2.png |",
+            "| 3. 既有重复卡回归 | 通过 | 纯单测：`tests/dup.vitest.ts` 6 条通过 |",
+            "",
+            "<details><summary>完整内容</summary>\n\n详细评审与归档流水\n\n</details>",
+        ])
+        code, _ = self.note("delivery-done", complete_delivery)
+        self.assertEqual(code, TR.EXIT_OK)
+
+        # 已发过 delivery-done 后，后续补充 todo 不再重复要求对账表
+        self.assertEqual(self.note("todo", "补充提醒：最终验收通过的前置后端已部署，请合并", "none")[0], TR.EXIT_OK)
 
     def test_protected_tag_blocks_and_unreadable_rule_is_disclosed(self) -> None:
         will = "tag=https://git.example.com/group/proj@2.7.20"

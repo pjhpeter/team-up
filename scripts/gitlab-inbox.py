@@ -102,7 +102,10 @@ THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "a
 # 每次投递都把通知规则放回上下文，避免调度者只在首次启动时读过、续跑后忘记。
 # 成员 skill 与 herdr 角色配置同样决定在途交付行为，改动一并提醒在途调度者。
 PROTOCOL_PATHS = ("PROTOCOL.md", "protocol/", "skills/", "herdr/")
-NOTIFY_REMINDER = "\n[通知] issue 评论只用 task-record.py note，发前按 ~/.hwf/protocol/communication.md「通知模式」「发布入口」核对。"
+NOTIFY_REMINDER = (
+    "\n[通知] issue 评论只用 task-record.py note，发前按 ~/.hwf/protocol/communication.md「通知模式」「发布入口」核对；"
+    "落实完用户中途提问或修改指令并再次停下等待前，须发 --kind answer 回报结果。"
+)
 
 
 class InboxError(RuntimeError):

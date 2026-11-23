@@ -200,6 +200,7 @@ class InboxTests(unittest.TestCase):
         inbox.poll()
         self.assertEqual(len(world.prompts), 2)
         self.assertIn("note_8", world.prompts[0])
+        self.assertIn("--kind answer", world.prompts[0])
         self.assertIn("body 9", world.prompts[1])
         self.assertEqual(state["origins"][URL]["last_note_id"], 9)
         inbox.poll()

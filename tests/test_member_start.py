@@ -155,6 +155,10 @@ class ProfileTest(Case):
 
     def test_label(self) -> None:
         self.assertEqual(MS.pane_label("dev", ["--model", "jc-gpt/gpt-6.1-sol"], "#453"), "dev-gpt-6.1-sol-#453")
+        self.assertEqual(
+            MS.pane_label("dev", ["--model", "jc-gpt/gpt-6.1-sol"], "核查最小范围", "#453"),
+            "dev-gpt-6.1-sol-#453 核查最小范围",
+        )
 
 
 class ClaimTest(Case):
@@ -318,6 +322,7 @@ class ClaimTest(Case):
         self.assertEqual(out["other_same_role"], ["i453-dev-4"])
         reg = MS.read_registry()
         self.assertEqual(set(reg.keys()), {"w1:pD1"})
+        self.assertEqual(reg["w1:pD1"].get("issue"), "#453")
 
 
 if __name__ == "__main__":

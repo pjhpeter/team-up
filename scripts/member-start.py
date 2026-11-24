@@ -154,8 +154,11 @@ def override_model(args: Sequence[str], model: str) -> list[str]:
         raise ClaimError("这个角色的模型写在 --settings 文件里，不能临时替换；按用户授权改领其他角色")
     raise ClaimError("配置里找不到模型参数，无法替换")
 
-def pane_label(profile: str, args: Sequence[str], task: str) -> str:
+def pane_label(profile: str, args: Sequence[str], task: str, issue: str = "") -> str:
     model = (model_of(args) or "").rsplit("/", 1)[-1]
+    # 补齐 issue 编号，避免 Agent 退出后空壳窗格丢失归属标识
+    if issue and issue.startswith("#") and not re.search(rf"{re.escape(issue)}(?!\d)", task):
+        task = f"{issue} {task}"
     return f"{profile}-{model}-{task}"
 
 
@@ -174,7 +177,8 @@ def read_registry() -> dict[str, Any]:
 
 
 def record(pane: dict[str, str], scheduler: str, profile: str,
-           drop_panes: Sequence[str] = (), live_panes: Optional[set[str]] = None) -> None:
+           drop_panes: Sequence[str] = (), live_panes: Optional[set[str]] = None,
+           issue: str = "") -> None:
     data = read_registry()
     gone = set(drop_panes)
     if live_panes is not None:
@@ -184,8 +188,15 @@ def record(pane: dict[str, str], scheduler: str, profile: str,
     else:
         for pid in gone:
             data.pop(pid, None)
-    data[pane["pane_id"]] = {"scheduler": scheduler, "profile": profile, "tab_id": pane["tab_id"],
-                             "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    entry: dict[str, Any] = {
+        "scheduler": scheduler,
+        "profile": profile,
+        "tab_id": pane["tab_id"],
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    if issue:
+        entry["issue"] = issue
+    data[pane["pane_id"]] = entry
     path = registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
@@ -420,7 +431,7 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
     idle_candidates = eligible_idle(members, exclude, tag, cwd)
     member = idle_candidates[0] if idle_candidates else None
     base = f"{tag}-{profile_name}"
-    label = pane_label(profile_name, profile["args"], task)
+    label = pane_label(profile_name, profile["args"], task, issue)
 
     if member:
         pane = {"pane_id": member["pane_id"], "tab_id": member["tab_id"]}
@@ -451,8 +462,11 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
             herdr("pane", "rename", pane["pane_id"], label)
             agent = start_agent(name, pane["pane_id"], profile)
         except (RuntimeError, KeyError):
-            subprocess.run([_START.HERDR, "pane", "close", pane["pane_id"]], capture_output=True, timeout=10,
-                           check=False)
+            try:
+                herdr("pane", "close", pane["pane_id"])
+            except (RuntimeError, KeyError, AssertionError):
+                subprocess.run([_START.HERDR, "pane", "close", pane["pane_id"]], capture_output=True, timeout=10,
+                               check=False)
             raise
 
     pruned_panes: list[str] = []
@@ -466,7 +480,7 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
             )
         live_panes = {str(p.get("pane_id")) for p in panes_snapshot if p.get("pane_id")} - set(pruned_panes)
 
-    record(pane, scheduler["name"], profile_name, drop_panes=pruned_panes, live_panes=live_panes)
+    record(pane, scheduler["name"], profile_name, drop_panes=pruned_panes, live_panes=live_panes, issue=issue)
     pruned_set = set(pruned_panes)
     picked_pane = pane["pane_id"] if member is not None else None
     busy = [m["name"] for m in members if m.get("pane_id") != picked_pane and m.get("pane_id") not in pruned_set]

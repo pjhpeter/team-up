@@ -62,12 +62,13 @@ def release(iid: int, pane: str, session: str, scheduler: Optional[str] = None, 
 
 
 def release_all_idle(iid: int, scheduler: Optional[str] = None, dry_run: bool = False) -> int:
-    """核对当前调度者名下归属 i<iid>-* 且 idle/done + interactive_ready 的全部成员并安全释放。"""
+    """核对当前调度者名下归属本单且空闲就绪的成员（含已退回命令行的本单空壳窗格）并安全释放。"""
     owner = _WR.current_scheduler(scheduler)
     registry = _WR._MS.read_registry()
     self_pane = os.environ.get("HERDR_PANE_ID") or ""
     all_agents = _WR.herdr("agent", "list")["result"]["agents"]
-    live_panes = {str(p.get("pane_id") or "") for p in _WR.herdr("pane", "list")["result"]["panes"]}
+    all_panes = _WR.herdr("pane", "list")["result"]["panes"]
+    live_panes = {str(p.get("pane_id") or "") for p in all_panes}
     live_agents = {str(a.get("pane_id") or "") for a in all_agents}
     dead_registered = sorted(
         pane for pane, entry in registry.items()
@@ -100,6 +101,21 @@ def release_all_idle(iid: int, scheduler: Optional[str] = None, dry_run: bool = 
             skipped.append(f"{name} / {pane}（{exc}）")
             continue
         targets.append(verified)
+
+    # 复用 wrapup.pick_members 回收 Agent 已退出只剩命令行的本单空壳成员窗格
+    shell_panes = [p for p in all_panes if str(p.get("pane_id") or "") not in live_agents]
+    if shell_panes:
+        sched_agents = [a for a in all_agents if a.get("name") == owner]
+        skip_panes = {p for p in (self_pane,) if p} | {
+            str(a.get("pane_id") or "")
+            for a in all_agents
+            if str(a.get("name") or "").startswith(_WR._FS.NAME_PREFIX)
+        }
+        shell_problems: list[str] = []
+        targets.extend(
+            _WR.pick_members(owner, str(iid), True, sched_agents, registry, skip_panes, shell_panes, shell_problems)
+        )
+        skipped.extend(shell_problems)
 
     if not targets:
         lines = ["没有空闲可释放的成员"] + skipped

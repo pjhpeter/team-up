@@ -203,12 +203,64 @@ def team_tabs(scheduler: str, agents: Sequence[dict[str, Any]], registry: dict[s
     return {t for t in tabs if t}
 
 
+ISSUE_NUM_RE = re.compile(r"#(\d+)(?!\d)")
+# 匹配 member-start.py 设置的成员持久标题前缀（角色-模型-任务），用于回收未进登记簿的空壳窗格
+ORPHAN_MEMBER_LABEL_RE = re.compile(
+    r"^(?:arch(?:-lite)?|precheck|code-review|test(?:-writer|-herdr)?|dev(?:-[a-z0-9]+)?)-.+?#(\d+)(?!\d)"
+)
+
+
+def _extract_issue_num(text: object) -> Optional[str]:
+    match = ISSUE_NUM_RE.search(str(text or ""))
+    return match.group(1) if match else None
+
+
+def _load_tab_labels() -> dict[str, str]:
+    try:
+        tabs = herdr("tab", "list")["result"]["tabs"]
+    except (RuntimeError, KeyError, TypeError, AssertionError):
+        return {}
+    return {str(t.get("tab_id") or ""): str(t.get("label") or "") for t in tabs if t.get("tab_id")}
+
+
+def _is_orphan_member_shell(
+    member: Any,
+    iid: str,
+    scheduler_workspaces: set[str],
+    tabs: set[str],
+    tab_labels: dict[str, str],
+) -> bool:
+    """识别启动失败未进 members.json、已退回命令行的本单孤儿空壳窗格。"""
+    if member.get("name") or member.get("agent"):
+        return False
+    ws = str(member.get("workspace_id") or "")
+    if scheduler_workspaces and ws not in scheduler_workspaces:
+        return False
+    label = str(member.get("label") or "")
+    match = ORPHAN_MEMBER_LABEL_RE.match(label)
+    if not match or match.group(1) != iid:
+        return False
+    tab_id = str(member.get("tab_id") or "")
+    return tab_id in tabs or tab_labels.get(tab_id, "").strip() == f"#{iid} 成员"
+
+
 def pick_members(scheduler: str, iid: str, only_issue: bool, agents: Sequence[dict[str, Any]],
                  registry: dict[str, Any], skip_panes: set[str],
                  panes: Optional[Sequence[dict[str, Any]]] = None,
                  problems: Optional[list[str]] = None) -> list[dict[str, Any]]:
-    """同时检查登记窗格和运行中的 Agent；身份不明的登记项必须阻止完成，不能静默漏掉。"""
+    """同时检查登记窗格、运行中 Agent 与本单空壳窗格；身份不明的登记项必须阻止完成。"""
     tabs = team_tabs(scheduler, agents, registry)
+    scheduler_workspaces = {
+        str(a.get("workspace_id") or "") for a in agents if a.get("name") == scheduler and a.get("workspace_id")
+    }
+    tab_labels: Optional[dict[str, str]] = None
+
+    def get_tab_labels() -> dict[str, str]:
+        nonlocal tab_labels
+        if tab_labels is None:
+            tab_labels = _load_tab_labels()
+        return tab_labels
+
     live = {str(p["pane_id"]): dict(p) for p in (panes if panes is not None else agents)}
     for agent in agents:
         pane = str(agent.get("pane_id") or "")
@@ -216,21 +268,38 @@ def pick_members(scheduler: str, iid: str, only_issue: bool, agents: Sequence[di
     picked = []
     for pane, member in live.items():
         name = str(member.get("name") or "")
-        if not pane or pane in skip_panes:
+        if not pane or pane in skip_panes or name.startswith(_FS.NAME_PREFIX):
             continue
         entry = registry.get(pane) or {}
         owner = entry.get("scheduler")
         named = bool(MEMBER_NAME.fullmatch(name))
         label = str(member.get("label") or "")
-        label_issue = re.search(r"#(\d+)(?!\d)", label)
-        this_issue = name.startswith(f"i{iid}-") if named else bool(label_issue and label_issue[1] == iid)
-        if owner != scheduler and not (owner is None and named and this_issue and member.get("tab_id") in tabs):
-            continue
-        if only_issue and not this_issue and (named or label_issue):
+        pane_iid = _extract_issue_num(entry.get("issue")) or _extract_issue_num(label)
+        if not named and pane_iid is None and (owner == scheduler or (owner is None and label)):
+            pane_iid = _extract_issue_num(get_tab_labels().get(str(member.get("tab_id") or "")))
+        this_issue = name.startswith(f"i{iid}-") if named else (pane_iid == iid)
+        if owner != scheduler:
+            if owner is None and named and this_issue and member.get("tab_id") in tabs:
+                pass
+            elif owner is None and _is_orphan_member_shell(
+                member, iid, scheduler_workspaces, tabs, get_tab_labels()
+            ):
+                picked.append(member | {"name": label})
+                continue
+            else:
+                continue
+        if only_issue and not this_issue and (named or pane_iid is not None):
             continue
         reason = ""
         if not named:
-            if name or not label_issue or not label.startswith(str(entry.get("profile") or "") + "-") or member.get("tab_id") != entry.get("tab_id"):
+            profile = str(entry.get("profile") or "")
+            if (
+                name
+                or not profile
+                or not label.startswith(f"{profile}-")
+                or member.get("tab_id") != entry.get("tab_id")
+                or pane_iid is None
+            ):
                 reason = "登记窗格的当前身份无法确认"
             elif member.get("agent") and member.get("agent_status") not in ("idle", "done"):
                 reason = "无名 Agent 尚未结束或状态不明"

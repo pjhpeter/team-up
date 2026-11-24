@@ -101,10 +101,12 @@ def agent(name: str | None, pane: str, tab: str = "w1:t1", cwd: str = "/repo") -
 
 
 class FakeHerdr:
-    def __init__(self, agents: list[dict], extra_panes: list[dict] | None = None, stuck: set[str] | None = None) -> None:
+    def __init__(self, agents: list[dict], extra_panes: list[dict] | None = None, stuck: set[str] | None = None,
+                 tabs: list[dict] | None = None) -> None:
         self.agents = agents
         self.panes = [dict(a) for a in agents] + (extra_panes or [])
         self.stuck = stuck or set()
+        self.tabs = tabs or []
         self.closed: list[str] = []
 
     def __call__(self, *args: str, timeout: int = 30) -> dict:
@@ -112,6 +114,8 @@ class FakeHerdr:
             return {"result": {"agents": [a for a in self.agents if a["pane_id"] in {p["pane_id"] for p in self.panes}]}}
         if args[:2] == ("pane", "list"):
             return {"result": {"panes": list(self.panes)}}
+        if args[:2] == ("tab", "list"):
+            return {"result": {"tabs": list(self.tabs)}}
         if args[:2] == ("pane", "close"):
             self.closed.append(args[2])
             if args[2] not in self.stuck:
@@ -310,6 +314,50 @@ class WrapupTest(Case):
         code, out = self.run_wrapup(herdr)
         self.assertEqual(code, 0, out)
         self.assertEqual(sorted(herdr.closed), ["w1:pA", "w1:pB"])
+        self.assertEqual(WR._MS.read_registry(), {})
+
+    def test_exited_shell_in_issue_member_tab_without_label_number_or_registry_is_closed(self) -> None:
+        reg_data = {
+            "w1:pREG": {"scheduler": SCHED, "profile": "code-review", "tab_id": "w1:t2", "at": "x"},
+        }
+        (self.state / "members.json").write_text(json.dumps(reg_data), encoding="utf-8")
+        reg_shell = {
+            "pane_id": "w1:pREG",
+            "tab_id": "w1:t2",
+            "workspace_id": "w1",
+            "cwd": "/repo",
+            "foreground_cwd": "/repo",
+            "agent_status": "unknown",
+            "label": "code-review-gpt-6.2-astra-核验最小范围",
+        }
+        orphan_shell = {
+            "pane_id": "w1:pORPHAN",
+            "tab_id": "w1:t3",
+            "workspace_id": "w1",
+            "cwd": "/repo",
+            "foreground_cwd": "/repo",
+            "agent_status": "unknown",
+            "label": "test-gpt-6.2-sol-#47 冒烟恢复",
+        }
+        other_orphan = {
+            "pane_id": "w1:pOTHER",
+            "tab_id": "w1:t4",
+            "workspace_id": "w1",
+            "cwd": "/repo",
+            "foreground_cwd": "/repo",
+            "agent_status": "unknown",
+            "label": "test-gpt-6.2-sol-#48 冒烟恢复",
+        }
+        tabs = [
+            {"tab_id": "w1:t1", "workspace_id": "w1", "label": "#47 调度 修 bug"},
+            {"tab_id": "w1:t2", "workspace_id": "w1", "label": "#47 成员"},
+            {"tab_id": "w1:t3", "workspace_id": "w1", "label": "#47 成员"},
+            {"tab_id": "w1:t4", "workspace_id": "w1", "label": "#48 成员"},
+        ]
+        herdr = FakeHerdr([agent(SCHED, "w1:pS")], [reg_shell, orphan_shell, other_orphan], tabs=tabs)
+        code, out = self.run_wrapup(herdr)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(herdr.closed), ["w1:pORPHAN", "w1:pREG"])
         self.assertEqual(WR._MS.read_registry(), {})
 
     def test_registered_pane_with_unverifiable_identity_blocks_completion(self) -> None:

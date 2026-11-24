@@ -39,7 +39,11 @@ def make_agent(name: str, pane: str, status: str = "idle", ready: bool = True, t
 class FakeHerdr:
     def __init__(self, agents: list[dict]) -> None:
         self.agents = [dict(a) for a in agents]
-        self.panes = [{"pane_id": a["pane_id"], "workspace_id": a["workspace_id"]} for a in agents]
+        self.panes = [
+            {"pane_id": a["pane_id"], "tab_id": a.get("tab_id", "w1:t1"), "workspace_id": a["workspace_id"]}
+            for a in agents
+        ]
+        self.tabs: list[dict] = []
         self.closed: list[str] = []
 
     def __call__(self, *args: str, timeout: int = 30) -> dict:
@@ -62,6 +66,8 @@ class FakeHerdr:
             return {"result": {"agent": dict(found)}}
         if cmd == ("pane", "list"):
             return {"result": {"panes": list(self.panes)}}
+        if cmd == ("tab", "list"):
+            return {"result": {"tabs": list(self.tabs)}}
         if cmd == ("pane", "close"):
             self.closed.append(args[2])
             self.panes = [p for p in self.panes if p["pane_id"] != args[2]]
@@ -137,6 +143,60 @@ class MemberReleaseTest(unittest.TestCase):
         code, out = self.run_cli(fake, "--issue", "47", "--all-idle")
         self.assertEqual(code, 0)
         self.assertIn("没有空闲可释放的成员", out)
+
+    def test_all_idle_closes_exited_shell_panes_registered_or_in_issue_member_tab(self) -> None:
+        self.write_registry({
+            "w1:pSHELL_REG": (SCHED, "code-review", "w1:t2"),
+            "w1:pUNVERIFIED": (SCHED, "dev", "w1:t1"),
+        })
+        fake = FakeHerdr([make_agent(SCHED, "w1:pS", status="idle")])
+        fake.panes.extend([
+            {
+                "pane_id": "w1:pSHELL_REG",
+                "tab_id": "w1:t2",
+                "workspace_id": "w1",
+                "agent_status": "unknown",
+                "label": "code-review-gpt-6.2-astra-核验最小范围",
+            },
+            {
+                "pane_id": "w1:pSHELL_ORPHAN",
+                "tab_id": "w1:t3",
+                "workspace_id": "w1",
+                "agent_status": "unknown",
+                "label": "test-gpt-6.2-sol-#47 冒烟恢复",
+            },
+            {
+                "pane_id": "w1:pOTHER_ORPHAN",
+                "tab_id": "w1:t4",
+                "workspace_id": "w1",
+                "agent_status": "unknown",
+                "label": "test-gpt-6.2-sol-#48 冒烟恢复",
+            },
+            {
+                "pane_id": "w1:pUSER_SHELL",
+                "tab_id": "w1:t9",
+                "workspace_id": "w1",
+                "agent_status": "unknown",
+            },
+            {
+                "pane_id": "w1:pUNVERIFIED",
+                "tab_id": "w1:t1",
+                "workspace_id": "w1",
+                "agent_status": "unknown",
+            },
+        ])
+        fake.tabs = [
+            {"tab_id": "w1:t1", "workspace_id": "w1", "label": "#47 调度 测试"},
+            {"tab_id": "w1:t2", "workspace_id": "w1", "label": "#47 成员"},
+            {"tab_id": "w1:t3", "workspace_id": "w1", "label": "#47 成员"},
+            {"tab_id": "w1:t4", "workspace_id": "w1", "label": "#48 成员"},
+            {"tab_id": "w1:t9", "workspace_id": "w1", "label": "终端"},
+        ]
+        code, out = self.run_cli(fake, "--issue", "47", "--all-idle")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sorted(fake.closed), ["w1:pSHELL_ORPHAN", "w1:pSHELL_REG"])
+        remained = set(json.loads((self.state / "members.json").read_text()).keys())
+        self.assertEqual(remained, {"w1:pUNVERIFIED"})
 
 
 if __name__ == "__main__":

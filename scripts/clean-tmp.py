@@ -37,21 +37,48 @@ sys.modules[_WR_SPEC.name] = _WR
 _WR_SPEC.loader.exec_module(_WR)
 
 DEFAULT_DAYS = 10
-# 遍历 worktree 修改时间时跳过重型依赖/构建缓存目录，避免扫描数十万个 node_modules 文件阻塞几十秒。
+MAX_MTIME_SCAN_FILES = 2000
+# 遍历任务证据与 worktree 修改时间时跳过重型依赖、构建缓存及解包大目录，并限制逐文件 stat 上限。
 SKIP_WALK_DIRS = frozenset({
     "node_modules", ".git", ".nuxt", ".output", ".pnpm-store", "dist", ".cache", ".turbo", ".vite", ".next",
+    "swift-cache", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "build", "out", "coverage",
 })
+SKIP_WALK_SUFFIXES = (".app", ".asar.unpacked", ".framework", ".dSYM")
+SKIP_WALK_PREFIXES = ("asar-", "unpacked-", "hwf-inspect-")
 
 
-def latest_mtime(path: Path) -> float:
+def _should_skip_walk_dir(name: str) -> bool:
+    return (
+        name in SKIP_WALK_DIRS
+        or name.endswith(SKIP_WALK_SUFFIXES)
+        or name.startswith(SKIP_WALK_PREFIXES)
+    )
+
+
+def latest_mtime(path: Path, max_files: int = MAX_MTIME_SCAN_FILES) -> float:
     latest = path.stat().st_mtime
+    scanned = 0
     for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in SKIP_WALK_DIRS]
+        kept_dirs: list[str] = []
+        for d in dirs:
+            if _should_skip_walk_dir(d):
+                continue
+            kept_dirs.append(d)
+            try:
+                latest = max(latest, (Path(root) / d).lstat().st_mtime)
+            except FileNotFoundError:
+                continue
+        dirs[:] = kept_dirs
+        if scanned >= max_files:
+            continue
         for name in files:
             try:
                 latest = max(latest, (Path(root) / name).lstat().st_mtime)
+                scanned += 1
             except FileNotFoundError:
                 continue
+            if scanned >= max_files:
+                break
     return latest
 
 
@@ -109,8 +136,18 @@ def _pane_uses_path(panes: list[dict], target_real: str) -> bool:
     return False
 
 
-def expired_worktrees(repo: str, days: int, now: float) -> list[Path]:
-    """筛选同仓库下超过 N 天未改动、任务已收尾、无窗格占用、无未保存改动且 HEAD 已在远端分支的干净 worktree。"""
+def _active_sets_for_repo(repo_path: str) -> tuple[set[str], set[str]]:
+    try:
+        active = DISCOVERY.active_rows(repo_path)
+    except Exception:
+        active = []
+    tasks = {row.task for row in active}
+    iids = {m.group(1) for task in tasks if (m := re.search(r"-(\d+)$", task))}
+    return tasks, iids
+
+
+def expired_worktrees_with_repos(repo: str, days: int, now: float) -> list[tuple[Path, str]]:
+    """跨 `~/.herdr/worktrees/` 全部仓库子目录筛选超过 N 天未改动且满足六重安全门禁的干净 worktree。"""
     root = _WR.worktree_root()
     if not root.is_dir():
         return []
@@ -124,16 +161,11 @@ def expired_worktrees(repo: str, days: int, now: float) -> list[Path]:
         # 无法核验实时窗格占用时绝不盲删任何 worktree。
         return []
 
-    active = DISCOVERY.active_rows(real_repo)
-    active_tasks = {row.task for row in active}
-    active_iids = {
-        m.group(1)
-        for task in active_tasks
-        if (m := re.search(r"-(\d+)$", task))
-    }
+    primary_tasks, primary_iids = _active_sets_for_repo(real_repo)
+    active_cache: dict[str, tuple[set[str], set[str]]] = {real_repo: (primary_tasks, primary_iids)}
+    fetched_repos: dict[str, bool] = {}
     cutoff = now - days * 86400
-    fetched: Optional[bool] = None
-    removable: list[Path] = []
+    removable: dict[Path, str] = {}
 
     for repo_dir in sorted(root.iterdir()):
         if not repo_dir.is_dir() or repo_dir.is_symlink():
@@ -141,7 +173,7 @@ def expired_worktrees(repo: str, days: int, now: float) -> list[Path]:
         for sub in sorted(repo_dir.iterdir()):
             if not sub.is_dir() or sub.is_symlink():
                 continue
-            if _matches_active_task(sub.name, active_tasks, active_iids):
+            if _matches_active_task(sub.name, primary_tasks, primary_iids):
                 continue
             if latest_mtime(sub) >= cutoff:
                 continue
@@ -152,22 +184,35 @@ def expired_worktrees(repo: str, days: int, now: float) -> list[Path]:
                 entries = _WR.list_worktrees(real_sub)
             except Exception:
                 continue
-            if not entries or entries[0][0] != real_repo:
+            if not entries:
                 continue
-            # 检查该目录及其嵌套子 worktree，且永不把主工作树自身加入删除候选
-            sub_entries = [(p, bare) for p, _head, _branch, bare in entries
-                           if (p == real_sub or p.startswith(real_sub + os.sep)) and p != real_repo]
+            wt_main_repo = os.path.realpath(entries[0][0])
+            # 独立 git clone 的首项是它自身，不属于 linked worktree，绝不清理。
+            if real_sub == wt_main_repo or not (Path(wt_main_repo) / ".git").exists():
+                continue
+            if wt_main_repo not in active_cache:
+                wt_tasks, wt_iids = _active_sets_for_repo(wt_main_repo)
+                active_cache[wt_main_repo] = (wt_tasks | primary_tasks, wt_iids | primary_iids)
+            repo_tasks, repo_iids = active_cache[wt_main_repo]
+            if _matches_active_task(sub.name, repo_tasks, repo_iids):
+                continue
+            # 检查该目录及其嵌套子 worktree，且永不把主工作树自身加入删除候选。
+            sub_entries = [
+                (p, bare)
+                for p, _head, _branch, bare in entries
+                if (p == real_sub or p.startswith(real_sub + os.sep)) and p != wt_main_repo
+            ]
             if not sub_entries or any(bare for _, bare in sub_entries):
                 continue
-            if fetched is None:
-                fetched = _WR.git(real_repo, "fetch", "--quiet", "origin").returncode == 0
-            if not fetched:
-                return []
+            if wt_main_repo not in fetched_repos:
+                fetched_repos[wt_main_repo] = _WR.git(wt_main_repo, "fetch", "--quiet", "origin").returncode == 0
+            if not fetched_repos[wt_main_repo]:
+                continue
             all_safe = True
             for wt_p, _ in sub_entries:
                 if (
                     _pane_uses_path(panes, wt_p)
-                    or has_unique_tmp_files(Path(wt_p), Path(real_repo))
+                    or has_unique_tmp_files(Path(wt_p), Path(wt_main_repo))
                     or _WR.unsaved_reason(wt_p) is not None
                     or _WR.saved_ref(wt_p, "") is None
                 ):
@@ -175,11 +220,14 @@ def expired_worktrees(repo: str, days: int, now: float) -> list[Path]:
                     break
             if all_safe:
                 for wt_p, _ in sub_entries:
-                    removable.append(Path(wt_p))
+                    removable[Path(wt_p)] = wt_main_repo
 
-    unique = list(dict.fromkeys(removable))
-    unique.sort(key=lambda p: str(p).count(os.sep), reverse=True)
-    return unique
+    ordered = sorted(removable.items(), key=lambda item: str(item[0]).count(os.sep), reverse=True)
+    return ordered
+
+
+def expired_worktrees(repo: str, days: int, now: float) -> list[Path]:
+    return [wt_path for wt_path, _ in expired_worktrees_with_repos(repo, days, now)]
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -204,22 +252,21 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"failed {path}: {error}", file=sys.stderr)
 
     if not args.no_worktrees:
-        real_repo = os.path.realpath(args.repo)
-        wts = expired_worktrees(args.repo, args.days, now)
-        removed_any = False
-        for wt_path in wts:
+        wts = expired_worktrees_with_repos(args.repo, args.days, now)
+        pruned_repos: set[str] = set()
+        for wt_path, wt_repo in wts:
             if args.dry_run:
                 print(f"would remove worktree {wt_path}")
                 continue
-            res = _WR.git(real_repo, "worktree", "remove", "--force", str(wt_path))
+            res = _WR.git(wt_repo, "worktree", "remove", "--force", str(wt_path))
             if res.returncode == 0:
-                removed_any = True
+                pruned_repos.add(wt_repo)
                 print(f"removed worktree {wt_path}")
             else:
                 failed = True
                 print(f"failed worktree {wt_path}: {res.stderr.strip()}", file=sys.stderr)
-        if removed_any:
-            _WR.git(real_repo, "worktree", "prune")
+        for wt_repo in sorted(pruned_repos):
+            _WR.git(wt_repo, "worktree", "prune")
 
     return 1 if failed else 0
 

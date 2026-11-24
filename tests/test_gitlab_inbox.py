@@ -67,6 +67,8 @@ class FakeWorld:
         self.opened_assigned: list[dict[str, Any]] = []  # 指派给本账号、带开关标签、仍打开的 issue
         self.authored: list[dict[str, Any]] = []  # 本账号建的、近期有更新的 issue
         self.by_iid: list[dict[str, Any]] = []  # 按 iids[] 查到的、近期有更新的 issue
+        self.closed_followed: list[dict[str, Any]] = []  # 低频清理 followed 时按 state=closed 查到的已关单
+        self.agents_list: list[dict[str, Any]] = []
         self.issue_queries: list[str] = []
         self.reset_rc = 0
         self.agent_status = "working"  # herdr agent get 返回的调度者状态
@@ -103,6 +105,9 @@ class FakeWorld:
                 out = json.dumps(self.todos)
             elif "/issues?state=opened" in path:
                 out = json.dumps(self.opened_assigned)
+            elif "/issues?state=closed" in path:
+                self.issue_queries.append(path)
+                out = json.dumps(self.closed_followed)
             elif "/issues?scope=all" in path:
                 self.issue_queries.append(path)
                 out = json.dumps(self.authored if "author_username=" in path else self.by_iid)
@@ -124,6 +129,8 @@ class FakeWorld:
             task, pane = self.owners.get(argv[4], (None, None))
             out = json.dumps({"task": task, "pane": pane, "live_pane": pane, "scheduler": "delivery-scheduler-w1-p1" if task else None,
                               "status": self.index_status if task else None})
+        elif argv[:3] == ["herdr", "agent", "list"]:
+            out = json.dumps({"result": {"agents": self.agents_list}}) if self.agents_list else ""
         elif argv[:3] == ["herdr", "agent", "get"]:
             out = json.dumps({"result": {"agent": {"agent_status": self.agent_status,
                                                    "terminal_title_stripped": self.agent_title}}})
@@ -1443,4 +1450,79 @@ class NaturalGoTest(unittest.TestCase):
         jev = FakeInboxJev(go_prob=0.99)
         INBOX.Inbox(CONFIG, state, run=world, jev=jev).poll()
         self.assertEqual(jev.calls, 0)
+
+
+class FollowedPruneAndSessionRotationTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="hwf-inbox-prune-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        patcher = patch.object(INBOX, "STATE_PATH", self.tmp / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_prunes_closed_followed_older_than_7d_and_suppresses_cross_url_transient_errors(self) -> None:
+        now = 1_800_000_000.0
+        old_url = "https://git.example/frontend/web-v1/-/issues/101"
+        recent_url = "https://git.example/frontend/web-v1/-/issues/102"
+        open_url = "https://git.example/frontend/web-v1/-/issues/103"
+        state = {
+            "follow_since": now - 60,
+            "followed_pruned_at": now - 7200,
+            "followed": {
+                old_url: {"project": "frontend/web-v1", "iid": 101},
+                recent_url: {"project": "frontend/web-v1", "iid": 102},
+                open_url: {"project": "frontend/web-v1", "iid": 103},
+            },
+        }
+        world = FakeWorld([])
+        world.closed_followed = [
+            {"iid": 101, "web_url": old_url, "state": "closed", "closed_at": "2020-01-01T00:00:00Z"},
+            {"iid": 102, "web_url": recent_url, "state": "closed",
+             "closed_at": INBOX.time.strftime("%Y-%m-%dT%H:%M:%SZ", INBOX.time.gmtime(now - 86400))},
+        ]
+        evicted = make(world, state).prune_closed_followed(now)
+        self.assertEqual(evicted, [old_url])
+        self.assertEqual(set(state["followed"].keys()), {recent_url, open_url})
+
+        # 跨 URL 的同类 TLS/DNS 瞬时故障归一为同一签名，连败期间不因 URL 变化重复刷日志。
+        tracker = INBOX.PollFailureTracker(heartbeat_every=0)
+        first = tracker.record_failure(RuntimeError("GET projects/10/issues/7 failed: TLS handshake timeout"))
+        second = tracker.record_failure(RuntimeError("GET projects/10/issues/8 failed: TLS handshake timeout"))
+        self.assertIsNotNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(tracker.record_success(), "poll recovered after 2 consecutive failure(s)")
+
+    def test_rotates_only_truly_idle_oversized_scheduler_sessions(self) -> None:
+        repo_dir = self.tmp / "web-v1"
+        (repo_dir / ".hwf/tmp").mkdir(parents=True)
+        (repo_dir / ".hwf/tmp/INDEX.md").write_text(
+            "| 任务标识 | 输入原文 | 调度者 | 状态 |\n"
+            "| `frontend-web-v1-1` | done | `delivery-scheduler-w1-p1` | done |\n"
+            "| `frontend-web-v1-2` | busy | `delivery-scheduler-w1-p2` | in-progress |\n",
+            encoding="utf-8",
+        )
+        big_idle = self.tmp / "idle.jsonl"
+        big_busy = self.tmp / "busy.jsonl"
+        small_idle = self.tmp / "small.jsonl"
+        with big_idle.open("wb") as fh:
+            fh.seek(INBOX.MAX_IDLE_SCHEDULER_SESSION_BYTES + 1024)
+            fh.write(b"\n")
+        with big_busy.open("wb") as fh:
+            fh.seek(INBOX.MAX_IDLE_SCHEDULER_SESSION_BYTES + 1024)
+            fh.write(b"\n")
+        small_idle.write_bytes(b"{}\n")
+
+        cfg = {**CONFIG, "projects": {"frontend/web-v1": str(repo_dir)}}
+        world = FakeWorld([])
+        world.agents_list = [
+            {"name": "delivery-scheduler-w1-p1", "pane_id": "w1:p1", "agent_status": "idle",
+             "agent_session": {"value": str(big_idle)}},
+            {"name": "delivery-scheduler-w1-p2", "pane_id": "w1:p2", "agent_status": "idle",
+             "agent_session": {"value": str(big_busy)}},
+            {"name": "delivery-scheduler-w1-p3", "pane_id": "w1:p3", "agent_status": "idle",
+             "agent_session": {"value": str(small_idle)}},
+        ]
+        rotated = INBOX.Inbox(cfg, {}, run=world, jev=None).rotate_oversized_idle_schedulers()
+        self.assertEqual(rotated, ["delivery-scheduler-w1-p1"])
+        self.assertEqual(world.resets, ["w1:p1"])
 

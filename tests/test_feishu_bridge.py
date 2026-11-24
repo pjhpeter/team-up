@@ -35,6 +35,8 @@ class World:
         self.history: dict[str, list] = {}  # chat_id → 聊天记录（补漏用）
         self.unreadable_chats: set[str] = set()
         self.retired_chats: set[str] = set()
+        self.transient_net_chats: set[str] = set()
+        self.chat_list_calls: list[str] = []
         self.messages: dict[str, str] = {}  # message_id → 渲染后的 content（给 mget 用）
         self.raw_messages: dict[str, dict] = {}  # 原生消息接口保留引用关系，mget 可以不返回它
         self.message_senders: dict[str, dict] = {}  # message_id → mget 返回的 sender（不设则不返回）
@@ -133,6 +135,9 @@ class World:
             return ok({"ok": True, "data": {"message_id": f"om_s{len(self.sent)}"}})
         if cmd[1:3] == ["im", "+chat-messages-list"]:
             chat = cmd[cmd.index("--chat-id") + 1]
+            self.chat_list_calls.append(chat)
+            if chat in self.transient_net_chats:
+                return ok({"ok": False, "error": {"message": "dial tcp: lookup open.feishu.cn: no such host"}})
             if chat in self.retired_chats:
                 return ok({"ok": False, "error": {"code": 230002, "message": "Bot/User can NOT be out of the chat."}})
             if chat in self.unreadable_chats:
@@ -874,6 +879,61 @@ class BridgeTest(unittest.TestCase):
             sec_py.write_text("b = 3\n", encoding="utf-8")
             os.utime(sec_py, ns=(t1 + 2_000_000, t1 + 2_000_000))
             self.assertEqual(FB.reloadable_changes(base, paths), [sec_py])
+
+    def test_closed_issue_prunes_thread_cursor_and_stale_open_thread_archives_and_resumes(self):
+        clock = [1_000_000.0]
+        self.b.now = lambda: clock[0]
+        self.b.handle(msg("om_c", "#7", chat="oc_g", chat_type="group",
+                          mentions=[{"key": "@_user_1", "id": BOT, "name": "Bot"}]))
+        self.b.handle(msg("om_s", "需求：长期挂起的话题测试", chat="oc_g", chat_type="group",
+                          mentions=[{"key": "@_user_1", "id": BOT, "name": "Bot"}]))
+        self.state["history_cursors"]["thread:om_c"] = 999_000_000
+        self.state["history_cursors"]["thread:om_s"] = 999_000_000
+
+        # 关单后 poll_gitlab 标记话题关闭并清掉 thread 补漏游标。
+        self.w.issues[7]["state"] = "closed"
+        self.b.poll_gitlab()
+        self.assertTrue(self.state["threads"]["om_c"]["closed"])
+        self.assertNotIn("thread:om_c", self.state["history_cursors"])
+        self.assertFalse(self.state["threads"]["om_s"]["closed"])
+
+        # 超过 14 天无活动的话题自动归档停止轮询，并清掉补漏游标。
+        clock[0] += (FB.STALE_THREAD_DAYS + 1) * 86400
+        self.b.poll_gitlab()
+        self.assertTrue(self.state["threads"]["om_s"]["closed"])
+        self.assertTrue(self.state["threads"]["om_s"].get("archived_stale"))
+        self.assertNotIn("thread:om_s", self.state["history_cursors"])
+
+        # 用户后续在飞书话题实时回复且 GitLab 工单仍打开时，自动解除静默归档并转交评论。
+        self.b.handle(msg("om_s_follow", "@Bot 补充一点上下文", root="om_s", chat="oc_g", chat_type="group",
+                          mentions=[{"key": "@_user_1", "id": BOT, "name": "Bot"}]))
+        self.assertFalse(self.state["threads"]["om_s"]["closed"])
+        self.assertNotIn("archived_stale", self.state["threads"]["om_s"])
+        self.assertTrue(any("补充一点上下文" in n["body"] for n in self.w.issues[8]["notes"]))
+
+    def test_poll_history_aborts_batch_on_transient_network_outage_and_backs_off(self):
+        clock = [2_000_000.0]
+        self.b.now = lambda: clock[0]
+        self.state["chats"] = {"oc_1": 1_000, "oc_2": 1_000, "oc_3": 1_000}
+        self.w.transient_net_chats.add("oc_1")
+
+        # 首个群遇到 DNS/TLS 瞬时断网时立即中止本轮，不再把 oc_2/oc_3 连刷一遍，且按阶梯退避。
+        self.b.history_requested.set()
+        self.b.poll_history()
+        self.assertEqual(self.w.chat_list_calls, ["oc_1"])
+        self.assertEqual(self.b.next_history_poll, clock[0] + 60)
+
+        clock[0] += 61
+        self.b.poll_history()
+        self.assertEqual(self.w.chat_list_calls, ["oc_1", "oc_1"])
+        self.assertEqual(self.b.next_history_poll, clock[0] + 120)
+
+        # 网络恢复后补读全部聊天并重置退避。
+        self.w.transient_net_chats.clear()
+        clock[0] += 121
+        self.b.poll_history()
+        self.assertEqual(self.w.chat_list_calls[-3:], ["oc_1", "oc_2", "oc_3"])
+        self.assertEqual(self.b._history_tracker.consecutive_failures, 0)
 
 
 if __name__ == "__main__":

@@ -127,6 +127,7 @@ class FakeHerdr:
 class FakeGlab:
     def __init__(self) -> None:
         self.notes: dict[int, str] = {}
+        self.issue_notes: list[dict] = []
         self.authored = {50: {"author": {"username": "pengjh"}}, 51: {"author": {"username": "pjhagent"}},
                          52: {"author": {"username": "pengjh"}, "system": True}}
         self.issue_state = "opened"
@@ -134,7 +135,7 @@ class FakeGlab:
         self.removed_labels: list[str] = []
         self.close_sticks = True
 
-    def __call__(self, host: str, method: str, path: str, *fields: str) -> dict:
+    def __call__(self, host: str, method: str, path: str, *fields: str) -> dict | list:
         if path == "user":
             return {"username": "pjhagent"}
         if method == "PUT":
@@ -148,6 +149,8 @@ class FakeGlab:
             return {}
         if path.endswith("/issues/47"):
             return {"state": self.issue_state, "labels": list(self.issue_labels)}
+        if "/notes?" in path:
+            return list(self.issue_notes)
         if method == "POST":
             note_id = 900 + len(self.notes)
             self.notes[note_id] = fields[0].split("=", 1)[1]
@@ -535,6 +538,56 @@ class WrapupTest(Case):
         self.assertEqual(code2, 0, buf.getvalue())
         self.assertEqual(self.glab.notes, {})
         self.assertTrue(self.index_status().startswith("cancelled"))
+
+    def test_claims_sibling_issue_worktree_recorded_by_repo_and_branch(self) -> None:
+        wt_root = Path(self.wt).parent
+        base = wt_root.parent
+        sibling_repo = str(base / "member-be")
+        other_repo = str(base / "other-be")
+        sibling_git = FakeGit(sibling_repo)
+        other_git = FakeGit(other_repo)
+        sibling_wt = sibling_git.add(f"{wt_root}/member-be/issue-47-api", branch="feat/issue-47-api",
+                                     **{"in": {"origin/main"}})
+        foreign_wt = other_git.add(f"{wt_root}/other-be/issue-47-api", branch="feat/issue-47-api",
+                                   **{"in": {"origin/main"}})
+        state_md = Path(self.repo, f".hwf/tmp/{TASK}/STATE.md")
+        state_md.parent.mkdir(parents=True, exist_ok=True)
+        # 仅登记兄弟仓库名与分支名（未贴完整绝对路径）时，也应认领该兄弟仓库 worktree，同时不误删无关仓库。
+        state_md.write_text("- 跨仓改动：后端 `member-be` 分支 `feat/issue-47-api` 已合入 develop\n", encoding="utf-8")
+
+        def mux_git(path: str, *args: str) -> subprocess.CompletedProcess[str]:
+            if path.startswith(other_repo) or "other-be" in path:
+                return other_git(path, *args)
+            if path.startswith(sibling_repo) or "member-be" in path:
+                return sibling_git(path, *args)
+            return self.git(path, *args)
+
+        with patch.object(WR, "git", mux_git):
+            code, out = self.run_wrapup(FakeHerdr([agent(SCHED, "w1:pS")]))
+        self.assertEqual(code, 0, out)
+        self.assertEqual(sibling_git.removed, [sibling_wt])
+        self.assertIn(foreign_wt, other_git.trees)
+
+    def test_blocks_wrapup_on_unanswered_user_note_and_allows_answered_or_close_request(self) -> None:
+        self.glab.issue_notes = [
+            {"id": 82, "author": {"username": "pjhagent"}, "system": False, "body": "阶段推进\n<!-- hwf-kind:stage -->"},
+            {"id": 81, "author": {"username": "pengjh"}, "system": False, "body": "顺便问下旧数据兼容吗？"},
+            {"id": 80, "author": {"username": "pjhagent"}, "system": False, "body": "已完成\n<!-- hwf-kind:delivery-done -->"},
+        ]
+        code, out = self.run_wrapup(FakeHerdr([agent(SCHED, "w1:pS")]))
+        self.assertEqual(code, 1)
+        self.assertEqual(self.glab.notes, {})
+        self.assertEqual(self.index_status(), "in-progress（开发中）")
+
+        # 补发实质回复（answer）后放行；或者最新用户留言本身就是 --close-request 关单指令时放行。
+        self.glab.issue_notes = [
+            {"id": 50, "author": {"username": "pengjh"}, "system": False, "body": "没问题，关闭 issue 吧"},
+            {"id": 83, "author": {"username": "pjhagent"}, "system": False, "body": "旧数据自动兼容。\n<!-- hwf-kind:answer -->"},
+            *self.glab.issue_notes,
+        ]
+        code2, out2 = self.run_wrapup(FakeHerdr([agent(SCHED, "w1:pS")]), "--close-request", f"{ISSUE}#note_50")
+        self.assertEqual(code2, 0, out2)
+        self.assertEqual(self.glab.issue_state, "closed")
 
 
 if __name__ == "__main__":

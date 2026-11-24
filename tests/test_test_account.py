@@ -30,9 +30,10 @@ class AccountTest(unittest.TestCase):
         root = Path(tmp.name)
         self.repo = root / "repo"
         (self.repo / ".hwf/tmp").mkdir(parents=True)
-        patcher = patch.object(TA, "CLAIMS_PATH", root / "state/test-accounts.json")
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        for attr, rel in (("CLAIMS_PATH", "state/test-accounts.json"), ("META_PATH", "state/test-account-meta.json")):
+            patcher = patch.object(TA, attr, root / rel)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.write_index([("t1", "in-progress"), ("t2", "in-progress"), ("t3", "in-progress")])
 
     def write_index(self, rows) -> None:
@@ -141,6 +142,57 @@ class AccountTest(unittest.TestCase):
         )
         self.assertEqual(self.claim("t1", "#494", candidates=("a", "b")), "a")
         self.assertEqual(TA.release("t1", "494", ["a"]), ["a"])
+
+    def test_pool_file_and_plan_tags_filter_accounts_without_leaking_passwords(self) -> None:
+        pool_md = self.repo / "accounts.md"
+        pool_md.write_text(
+            "## 国内测试环境\n"
+            "| 账号 | 密码 | 备注 |\n"
+            "|---|---|---|\n"
+            "| `paid_user@lookai.cc` | `SecPwd#1` | 已开通 Plus 会员 |\n"
+            "| `free_user@lookai.cc` | `SecPwd#2` | 免费未试用 |\n\n"
+            "## 国际测试环境\n"
+            "| `intl_free@lookai.cc` | `SecPwd#3` | free account |\n",
+            encoding="utf-8",
+        )
+        # 按套餐与环境一步筛出国内免费账号，无需先盲领付费号进浏览器撞墙再换号。
+        out1 = io.StringIO()
+        with contextlib.redirect_stdout(out1):
+            rc1 = TA.main([
+                "claim", "--repo", str(self.repo), "--task", "t1", "--issue", "501",
+                "--pool-file", str(pool_md), "--require-tag", "free", "--require-tag", "region:cn",
+            ])
+        self.assertEqual(rc1, TA.EXIT_OK)
+        self.assertEqual(out1.getvalue().strip(), "free_user@lookai.cc")
+
+        # 测试后账号变成已付费，用 tag 子命令登记后自动移除互斥的 free 标签。
+        tag_out = io.StringIO()
+        with contextlib.redirect_stdout(tag_out):
+            self.assertEqual(
+                TA.main(["tag", "--account", "free_user@lookai.cc", "--add", "paid", "--note", "验收升级后已付费"]),
+                TA.EXIT_OK,
+            )
+        tag_payload = json.loads(tag_out.getvalue())
+        self.assertIn("paid", tag_payload["tags"])
+        self.assertNotIn("free", tag_payload["tags"])
+
+        # 再由 t2 申请国内 free 账号时，因无剩余匹配账号直接返回 EXIT_ALL_BUSY(3)。
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc2 = TA.main([
+                "claim", "--repo", str(self.repo), "--task", "t2", "--issue", "502",
+                "--pool-file", str(pool_md), "--require-tag", "free", "--require-tag", "region:cn",
+            ])
+        self.assertEqual(rc2, TA.EXIT_ALL_BUSY)
+
+        # pool 子命令输出全部掩码账号且绝不包含任何密码原文。
+        pool_out = io.StringIO()
+        with contextlib.redirect_stdout(pool_out):
+            self.assertEqual(TA.main(["pool", "--pool-file", str(pool_md)]), TA.EXIT_OK)
+        raw_pool = pool_out.getvalue()
+        self.assertNotIn("SecPwd", raw_pool)
+        self.assertNotIn("free_user@lookai.cc", raw_pool)
+        rows = json.loads(raw_pool)
+        self.assertEqual(len(rows), 3)
 
 
 if __name__ == "__main__":

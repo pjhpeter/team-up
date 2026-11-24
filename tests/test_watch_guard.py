@@ -31,6 +31,8 @@ const lines = [
         {{ type: "toolCall", id: "c3", arguments: {{ command: "herdr agent prompt i487-dev-fe 'other team'" }} }},
         {{ type: "toolCall", id: "c4", arguments: {{ command: "herdr agent prompt i484-dev-fe 'my member'" }} }},
         {{ type: "toolCall", id: "c5", arguments: {{ command: "herdr agent prompt i484-arch 'watched member'" }} }},
+        {{ type: "toolCall", id: "c6", arguments: {{ command: "herdr agent prompt zsh 'shell pane'" }} }},
+        {{ type: "toolCall", id: "c7", arguments: {{ command: "herdr agent prompt i487-test 'peer issue unregistered'" }} }},
         {{ type: "toolCall", id: "w1", arguments: {{ command: "python3 ~/.hwf/scripts/member-wait.py i484-arch --repo /r --task t" }} }},
       ],
     }},
@@ -48,6 +50,8 @@ const agents = [
   {{ name: "i487-dev-fe", pane_id: "w18:pBQ", agent_status: "working" }},
   {{ name: "i484-dev-fe", pane_id: "w18:pAN", agent_status: "working" }},
   {{ name: "i484-arch", pane_id: "w18:pBB", agent_status: "working" }},
+  {{ name: "zsh", pane_id: "w18:pSH", agent_status: "working" }},
+  {{ name: "i487-test", pane_id: "w18:pBT", agent_status: "working" }},
 ];
 const registry = {{
   "w18:pBQ": {{ scheduler: "delivery-scheduler-w18-p73", profile: "dev-fe" }},
@@ -62,6 +66,26 @@ console.log(JSON.stringify(unwatched));
         self.assertEqual(res.returncode, 0, res.stderr)
         unwatched = json.loads(res.stdout.strip())
         self.assertEqual(unwatched, [{"name": "i484-dev-fe", "pane": "w18:pAN", "status": "working"}])
+
+    def test_record_guard_blocks_oversized_agent_prompt_and_allows_compact_dispatch(self) -> None:
+        rec_ext = EXT.parent / "hwf-scheduler-record-guard.ts"
+        with tempfile.TemporaryDirectory() as tmp:
+            mod = Path(tmp) / "hwf-scheduler-record-guard.mjs"
+            shutil.copyfile(rec_ext, mod)
+            script = f"""
+import {{ violation }} from {json.dumps(mod.as_uri())};
+
+const okRes = violation("bash", {{ command: "herdr agent prompt i484-dev '请按 /repo/.hwf/tmp/t/dispatch-dev.md 执行'" }});
+const huge = "herdr agent prompt i484-dev '" + "x".repeat(2600) + "'";
+const blockRes = violation("bash", {{ command: huge }});
+console.log(JSON.stringify({{ okRes, blockRes }}));
+"""
+            res = subprocess.run(["node", "--input-type=module", "-e", script], capture_output=True, text=True, check=False)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        out = json.loads(res.stdout.strip())
+        self.assertIsNone(out["okRes"])
+        self.assertIn("2500 字", out["blockRes"])
+        self.assertIn("dispatch-<角色>.md", out["blockRes"])
 
 
 if __name__ == "__main__":

@@ -55,7 +55,12 @@ class Case(unittest.TestCase):
         return self.remote.get(f"{branch}:{rel}")
 
     def fake_run(self, argv, cwd=None, **kw):
-        self.runs.append((list(argv), Path(cwd)))
+        env = kw.get("env") or {}
+        cred_file = env.get("HWF_TEST_CREDENTIAL_FILE")
+        self.last_env = dict(env)
+        self.last_input = kw.get("input")
+        self.cred_existed_during_run = bool(cred_file and Path(cred_file).exists())
+        self.runs.append((list(argv), Path(cwd) if cwd else self.wt))
         return subprocess.CompletedProcess(argv, self.login_code, self.login_stdout, "")
 
     def write_config(self, text: str = CONFIG) -> None:
@@ -117,6 +122,71 @@ class ReadyTest(Case):
         self.assertEqual(code, 1)
         self.assertEqual(json.loads(buf.getvalue()),
                          {"ok": False, "stage": "login:fill-form", "message": "找不到输入框"})
+
+    def test_account_from_env_masks_output_and_cleans_credential_file_and_scrubs_errors(self) -> None:
+        self.write_config()
+        secrets_md = self.root / "accounts.md"
+        secrets_md.write_text(
+            "| 账号 | 密码 |\n|---|---|\n| `pengjiahui@lookai.cc` | `Sup3rS3cret!88` |\n",
+            encoding="utf-8",
+        )
+        buf = io.StringIO()
+        with (
+            patch.dict(TB.os.environ, {
+                "HWF_TEST_ACCOUNT": "pengjiahui@lookai.cc",
+                "HWF_TEST_ACCOUNTS_FILE": str(secrets_md),
+            }),
+            contextlib.redirect_stdout(buf),
+        ):
+            code = TB.main([str(self.wt), "--url", "http://localhost:3469", "--out", str(self.out)])
+        self.assertEqual(code, 0)
+        payload = json.loads(buf.getvalue())
+        self.assertEqual(payload["account"], "pe***@lookai.cc")
+        self.assertNotIn("pengjiahui@lookai.cc", buf.getvalue())
+        self.assertNotIn("Sup3rS3cret!88", buf.getvalue())
+        self.assertTrue(self.cred_existed_during_run)
+        self.assertFalse(Path(self.last_env["HWF_TEST_CREDENTIAL_FILE"]).exists())
+
+        # 登录报错里若意外回显了明文密码和完整账号，输出必须自动脱敏。
+        self.login_code = 1
+        self.login_stdout = '{"ok": false, "stage": "auth", "message": "pengjiahui@lookai.cc bad pass Sup3rS3cret!88"}'
+        err_buf = io.StringIO()
+        with (
+            patch.dict(TB.os.environ, {
+                "HWF_TEST_ACCOUNT": "pengjiahui@lookai.cc",
+                "HWF_TEST_ACCOUNTS_FILE": str(secrets_md),
+            }),
+            contextlib.redirect_stdout(err_buf),
+        ):
+            code2 = TB.main([str(self.wt), "--url", "http://localhost:3469", "--out", str(self.out)])
+        self.assertEqual(code2, 1)
+        self.assertNotIn("Sup3rS3cret!88", err_buf.getvalue())
+        self.assertNotIn("pengjiahui@lookai.cc", err_buf.getvalue())
+        self.assertIn("pe***@lookai.cc", err_buf.getvalue())
+
+    def test_ego_mode_logins_in_isolated_space_and_blocks_clear_origin_on_prod(self) -> None:
+        secrets_md = self.root / "accounts.md"
+        secrets_md.write_text("| `13812345678` | `Pass#2026` |\n", encoding="utf-8")
+        self.login_stdout = '{"ok": true, "stage": "done", "tab_id": 7, "final_url": "https://test.lookai.cc/home"}'
+        with patch.dict(TB.os.environ, {"HWF_TEST_ACCOUNTS_FILE": str(secrets_md)}):
+            out = TB.ready(
+                self.wt, "https://test.lookai.cc/login", "13812345678", self.out,
+                mode="ego", space_name="team-test", clear_origin=True,
+            )
+        self.assertEqual(out["mode"], "ego")
+        self.assertEqual(out["account"], "13***78")
+        self.assertEqual(out["open"]["space_name"], "team-test")
+        self.assertEqual(self.runs[-1][0], ["ego-browser", "nodejs"])
+        self.assertNotIn("Pass#2026", json.dumps(out))
+
+        # 生产域名严禁传 --clear-origin。
+        with patch.dict(TB.os.environ, {"HWF_TEST_ACCOUNTS_FILE": str(secrets_md)}):
+            with self.assertRaises(TB.ReadyError) as caught:
+                TB.ready(
+                    self.wt, "https://app.lookai.cc/home", "13812345678", self.out,
+                    mode="ego", space_name="team-test", clear_origin=True,
+                )
+        self.assertEqual(caught.exception.stage, "clear-origin")
 
 
 if __name__ == "__main__":

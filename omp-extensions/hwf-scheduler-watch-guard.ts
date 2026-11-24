@@ -18,6 +18,12 @@ const STATE_DIR = process.env.HWF_STATE_DIR || path.join(os.homedir(), ".hwf", "
 const LOG_FILE = path.join(STATE_DIR, "watch-guard.log");
 const MEMBERS_FILE = path.join(STATE_DIR, "members.json");
 const SCHEDULER_PREFIX = "delivery-scheduler-";
+const MEMBER_NAME_RE = /^(?:i\d+|new)-[a-z0-9_-]+$|^delivery-(?!scheduler-)[a-z0-9_-]+$/i;
+
+function issuePrefixOf(name) {
+  const m = /^(i\d+)-/i.exec(String(name ?? ""));
+  return m ? m[1].toLowerCase() : "";
+}
 
 // 去掉 shell 引号；变量形式（$NAME）无法静态解析，返回 null。
 function cleanTarget(raw) {
@@ -83,20 +89,46 @@ export function analyzeSession(jsonl) {
 export function findUnwatched({ prompted, watched }, agents, selfPane, registry = {}, selfScheduler = "") {
   if (watched.has("*")) return [];
   const selfName = selfScheduler || agents.find((a) => a.pane_id === selfPane)?.name || "";
+  const schedulerPanes = new Set(
+    agents
+      .filter((a) => String(a?.name ?? "").startsWith(SCHEDULER_PREFIX))
+      .map((a) => a.pane_id)
+      .filter(Boolean),
+  );
+  // 统计其他调度者在登记簿中占用的 issue 前缀（如 i499），防止未写入登记簿的他人成员被误拦。
+  const foreignIssuePrefixes = new Set();
+  const ownIssuePrefixes = new Set();
+  for (const [pid, meta] of Object.entries(registry ?? {})) {
+    const ownerSched = meta?.scheduler;
+    if (!ownerSched) continue;
+    const issueNum = String(meta?.issue ?? "").replace(/^#/, "");
+    const agentName = agents.find((a) => a.pane_id === pid)?.name ?? "";
+    const prefix = (/^\d+$/.test(issueNum) ? `i${issueNum}` : "") || issuePrefixOf(agentName);
+    if (!prefix) continue;
+    if (selfName && ownerSched === selfName) ownIssuePrefixes.add(prefix);
+    else if (selfName && ownerSched !== selfName) foreignIssuePrefixes.add(prefix);
+  }
   const seenPanes = new Set();
   const result = [];
   for (const target of prompted) {
-    if (String(target).startsWith(SCHEDULER_PREFIX)) continue;
-    const agent = agents.find((a) => a.name === target || a.pane_id === target);
+    const targetStr = String(target ?? "");
+    if (!targetStr || targetStr.startsWith(SCHEDULER_PREFIX) || schedulerPanes.has(targetStr)) continue;
+    const agent = agents.find((a) => a.name === targetStr || a.pane_id === targetStr);
     if (!agent || agent.pane_id === selfPane || seenPanes.has(agent.pane_id)) continue;
-    // 调度者之间互相同步消息时不挂 member-wait，避免两个并行调度者互相拦截。
-    if (String(agent.name ?? "").startsWith(SCHEDULER_PREFIX)) continue;
+    const agentName = String(agent.name ?? "");
+    // 调度者窗格及非成员命名的未登记窗格（如用户终端或尚未完成改名的并行调度者）一律跳过。
+    if (agentName.startsWith(SCHEDULER_PREFIX) || schedulerPanes.has(agent.pane_id)) continue;
     const owner = registry?.[agent.pane_id]?.scheduler;
     if (owner && selfName && owner !== selfName) continue;
+    if (!owner) {
+      if (!MEMBER_NAME_RE.test(agentName)) continue;
+      const prefix = issuePrefixOf(agentName);
+      if (prefix && foreignIssuePrefixes.has(prefix) && !ownIssuePrefixes.has(prefix)) continue;
+    }
     if (agent.agent_status !== "working" && agent.agent_status !== "blocked") continue;
-    if (watched.has(target) || watched.has(agent.name) || watched.has(agent.pane_id)) continue;
+    if (watched.has(targetStr) || watched.has(agentName) || watched.has(agent.pane_id)) continue;
     seenPanes.add(agent.pane_id);
-    result.push({ name: agent.name ?? target, pane: agent.pane_id, status: agent.agent_status });
+    result.push({ name: agentName || targetStr, pane: agent.pane_id, status: agent.agent_status });
   }
   return result;
 }

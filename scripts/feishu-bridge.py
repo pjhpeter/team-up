@@ -56,6 +56,11 @@ from urllib.parse import quote
 import urllib.request
 import uuid
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import poll_backoff as PB
+
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 CONFIG_PATH = HWF_HOME / "feishu-bridge.local.json"
 INBOX_CONFIG_PATH = HWF_HOME / "gitlab-inbox.config.json"
@@ -67,6 +72,10 @@ TRANSFER_TIMEOUT_S = 300  # 下载/上传附件可能是几十 MB 的文件，�
 SEEN_CAP = 2000
 HISTORY_POLL_S = 60
 HISTORY_OVERLAP_MS = 120_000  # 历史接口时间只精确到分钟，重读边界以免漏掉同一分钟的消息
+STALE_THREAD_DAYS = 14
+STALE_THREAD_S = STALE_THREAD_DAYS * 86400
+POLL_BACKOFF_STEPS = (30, 60, 180)
+HISTORY_BACKOFF_STEPS = (60, 120, 180)
 HELP_COOLDOWN_S = 600
 NOTE_RETRIES = 3  # 一条评论连续发送失败几次后改发 GitLab 链接
 FEISHU_TEXT_CAP = 2500  # 超过就截断并附 GitLab 原文链接
@@ -250,6 +259,7 @@ class Bridge:
         self.delivered: Optional[dict[str, Any]] = None  # 处理当前这条消息时已代用户写进评论的 issue（project、iid）
         self.history_requested = threading.Event()
         self.next_history_poll = 0.0
+        self._history_tracker = PB.PollFailureTracker(heartbeat_every=0, label="catch-up")
 
     @property
     def secretary(self) -> Any:
@@ -1057,7 +1067,8 @@ class Bridge:
             as_user=True)
         iid = issue["iid"]
         self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
-                                      "title": title, "last_note": 0, "closed": False}
+                                      "title": title, "last_note": 0, "closed": False,
+                                      "last_active_at": int(self.now())}
         if msg:
             self.remember_target(msg, {"iid": iid, "title": title})
         if mode in ("deliver", "debug"):
@@ -1094,7 +1105,8 @@ class Bridge:
         # 评论发出去才算关联成功：失败时要用户重发，不能留一个半截的话题
         self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
                                       "last_note": notes[0]["id"] if notes else 0,
-                                      "title": issue["title"], "closed": issue["state"] == "closed", "bound": True}
+                                      "title": issue["title"], "closed": issue["state"] == "closed", "bound": True,
+                                      "last_active_at": int(self.now())}
         if msg:
             self.remember_target(msg, issue)
         self.reply(mid, f"已关联 [#{iid}]({self.issue_url(self.project, iid)})：{issue['title']}\n"
@@ -1115,8 +1127,15 @@ class Bridge:
         mid = msg["message_id"]
         t = self.state["threads"][root]
         if t.get("closed"):
-            self.reply(mid, "这张 issue 已关闭，这里只保留归档。要继续请回主聊天说新的需求，或发「#编号」进入别的独立话题。", f"closed-{mid}")
-            return
+            if t.get("archived_stale"):
+                issue = self.api(f"projects/{quote(t['project'], safe='')}/issues/{t['iid']}")
+                if issue.get("state") != "closed":
+                    # 仅因久未活跃停止后台轮询的话题，用户重新发言且工单仍开着时自动恢复同步。
+                    t["closed"] = False
+                    t.pop("archived_stale", None)
+            if t.get("closed"):
+                self.reply(mid, "这张 issue 已关闭，这里只保留归档。要继续请回主聊天说新的需求，或发「#编号」进入别的独立话题。", f"closed-{mid}")
+                return
         # /go、/status、/new 这类指令要整条只有指令，收件箱才认得，所以不加尾注。
         if text.startswith("/"):
             body = text
@@ -1129,11 +1148,22 @@ class Bridge:
         if t.get("bound"):
             body = f"@{self.agent} {body}"
         self.note_as_user(t["project"], t["iid"], body)
+        t["last_active_at"] = int(self.now())
         if mode in ("deliver", "debug"):
             t.pop("execution_pending", None)
 
+    @staticmethod
+    def _parse_gitlab_iso(raw: Any) -> Optional[float]:
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        try:
+            return datetime.fromisoformat(raw.strip().replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
     # ---------- GitLab → 飞书 ----------
     def poll_gitlab(self) -> None:
+        now = self.now()
         for root, t in list(self.state["threads"].items()):
             if t.get("closed") or t.get("topic_pending"):
                 continue
@@ -1149,6 +1179,8 @@ class Bridge:
             private = t["chat_id"] == self.secretary.chat and t["chat_id"] not in self.state["group_chats"]
             if private:
                 self.secretary.forward_private_notes(t, notes)
+            if notes:
+                t["last_active_at"] = int(now)
             for n in sorted(notes, key=lambda x: x["id"]):
                 if n["id"] <= t.get("last_note", 0):
                     continue
@@ -1160,8 +1192,23 @@ class Bridge:
             issue = self.api(f"projects/{pid}/issues/{t['iid']}")
             if issue["state"] == "closed":
                 t["closed"] = True
+                self.state["history_cursors"].pop(f"thread:{root}", None)
                 if not private:
                     self.reply(root, f"#{t['iid']} 已关闭，这个话题不再同步。", f"gl-closed-{t['iid']}-{root[-12:]}")
+                continue
+            updated_ts = self._parse_gitlab_iso(issue.get("updated_at"))
+            last_active = float(t.get("last_active_at") or updated_ts or 0)
+            if last_active <= 0:
+                t["last_active_at"] = int(now)
+                continue
+            if updated_ts is not None and updated_ts > last_active:
+                last_active = updated_ts
+                t["last_active_at"] = int(updated_ts)
+            if not notes and (now - last_active) >= STALE_THREAD_S:
+                t["closed"] = True
+                t["archived_stale"] = True
+                self.state["history_cursors"].pop(f"thread:{root}", None)
+                log(f"archived stale thread {root} ({t['project']}#{t['iid']}) after {STALE_THREAD_DAYS}d inactivity")
 
     def retire_chat(self, chat: str, reason: str) -> None:
         """机器人已被移出群聊或群已解散时，摘除补读记录并关闭关联话题，避免每分钟重复刷 230002。"""
@@ -1227,11 +1274,25 @@ class Bridge:
         self.history_requested.clear()  # 补读期间再重连，通知留给下一轮，不能在结束时清掉
         try:
             self.catch_up()
-        finally:
+        except BridgeError as error:
+            if PB.is_transient_network_error(error):
+                notice = self._history_tracker.record_failure(error)
+                if notice:
+                    log(notice)
+                wait_s = PB.compute_step_backoff(
+                    HISTORY_POLL_S, self._history_tracker.consecutive_failures, HISTORY_BACKOFF_STEPS
+                )
+                self.next_history_poll = self.now() + wait_s
+                return
             self.next_history_poll = self.now() + HISTORY_POLL_S
+            raise
+        recovered = self._history_tracker.record_success()
+        if recovered:
+            log(recovered)
+        self.next_history_poll = self.now() + HISTORY_POLL_S
 
     def catch_up(self) -> None:
-        """增量补读已知聊天和未关闭话题；一个来源失败不推进它的进度，也不挡住其他来源。"""
+        """增量补读已知聊天和未关闭话题；单聊/单话题权限失败跳过，瞬时断网立即中止本轮避免连刷几十条。"""
         until_ms = int(self.now()) * 1000
         cursors = self.state["history_cursors"]
         for chat, last_ms in list(self.state["chats"].items()):
@@ -1245,6 +1306,8 @@ class Bridge:
             except (BridgeError, KeyError, ValueError) as e:
                 if is_retired_chat_error(e):
                     self.retire_chat(chat, str(e))
+                elif isinstance(e, BridgeError) and PB.is_transient_network_error(e):
+                    raise
                 else:
                     log(f"catch-up skip chat {chat}: {e}")
                 continue
@@ -1267,6 +1330,8 @@ class Bridge:
                         cursors.pop(key, None)
                         log(f"closed unreachable thread {root}: {' '.join(str(e).split())[:240]}")
                         self.persist()
+                elif isinstance(e, BridgeError) and PB.is_transient_network_error(e):
+                    raise
                 else:
                     log(f"catch-up skip thread {root}: {e}")
                 continue
@@ -1432,7 +1497,7 @@ def watched_scripts(base_dir: Optional[Path] = None) -> tuple[Path, ...]:
     root = base_dir or Path(__file__).resolve().parent
     return tuple(root / name for name in (
         "feishu-bridge.py", "secretary.py", "task_intent.py", "feishu_topics.py",
-        "proactive.py", "jev_client.py", "jev_gates.py",
+        "proactive.py", "jev_client.py", "jev_gates.py", "poll_backoff.py",
     ))
 
 
@@ -1551,6 +1616,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     baseline = snapshot_mtimes(watched)
     poll = int(cfg.get("poll_seconds", 15))
     next_poll = 0.0
+    poll_tracker = PB.PollFailureTracker(heartbeat_every=0, label="poll")
     while True:
         try:
             e = events.get(timeout=1)
@@ -1566,17 +1632,37 @@ def main(argv: Optional[list[str]] = None) -> int:
         except (BridgeError, KeyError, ValueError) as err:
             log(f"catch-up failed: {err}")
         if time.time() >= next_poll:
-            next_poll = time.time() + poll
+            poll_err: Optional[BaseException] = None
             try:
                 topic_queue.consume()
                 bridge.poll_gitlab()
             except (BridgeError, KeyError, ValueError) as err:
-                log(f"poll failed: {err}")
-            try:
-                bridge.secretary.poll()
-                bridge.secretary.patrol()
-            except Exception as err:  # 秘书出错不能拖垮桥本身
-                log(f"secretary failed: {err!r}")
+                poll_err = err
+            # GitLab 已经瞬时断网时不再紧接着跑秘书轮询，避免同一轮打出双份网络报错。
+            if poll_err is None or not PB.is_transient_network_error(poll_err):
+                try:
+                    bridge.secretary.poll()
+                    bridge.secretary.patrol()
+                except Exception as err:  # 秘书出错不能拖垮桥本身
+                    if poll_err is None and PB.is_transient_network_error(err):
+                        poll_err = err
+                    else:
+                        log(f"secretary failed: {err!r}")
+            if poll_err is not None:
+                notice = poll_tracker.record_failure(poll_err)
+                if notice:
+                    log(notice)
+                wait_s = (
+                    PB.compute_step_backoff(poll, poll_tracker.consecutive_failures, POLL_BACKOFF_STEPS)
+                    if PB.is_transient_network_error(poll_err)
+                    else poll
+                )
+                next_poll = time.time() + wait_s
+            else:
+                recovered = poll_tracker.record_success()
+                if recovered:
+                    log(recovered)
+                next_poll = time.time() + poll
             save_json(STATE_PATH, state)
             if events.empty():
                 changed = reloadable_changes(baseline, watched)

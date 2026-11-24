@@ -58,6 +58,7 @@ if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import jev_client as JC
 import jev_gates as JG
+import poll_backoff as PB
 
 JEV_GO_AUTH_MIN = 0.90
 JEV_DEBUG_FLOW_MIN = 0.80
@@ -94,6 +95,9 @@ STATUS_WORDS = {"working": "正在干活", "idle": "空闲", "done": "空闲",
 # 参与 issue 按 updated_after 增量查询；往回多看一段，抵消本机与 GitLab 的时钟差，重复的评论靠 forwarded 去重。
 FOLLOW_OVERLAP_S = 300
 FOLLOWED_CAP = 100  # 用户 @ 过本账号的非发起 issue，一次 iids[] 查询能装下的量
+FOLLOWED_CLOSED_RETENTION_S = 7 * 86400  # 已关闭满 7 天的跟进 issue 自动移出 followed，再次 @ 时会自动接回
+FOLLOWED_PRUNE_INTERVAL_S = 3600  # 低频批量巡检久未更新的已关跟进单
+MAX_IDLE_SCHEDULER_SESSION_BYTES = 30 * 1024 * 1024  # 完全空闲且无在途任务的调度者会话超过 30MB 时自动轮换
 CLOSED_CAP = 200  # 已关闭的发起 issue 只为“用户重开后接着跟踪”保留，留最近的即可。
 # 发起 issue 描述里指定调度者参数的行：`/model jc-gpt/gpt-6.1-sol`、`/thinking high`（2026-10-22 用户指示）。
 PARAM_LINE = re.compile(r"^\s*/(model|thinking)\s+(\S+)\s*$", re.IGNORECASE)
@@ -227,6 +231,61 @@ class Inbox:
         other = "（它手上还有别的任务，新消息会交给空闲调度者接手）" if info["pane"] is None else ""
         return result + f"会话状态：调度者 `{info['scheduler']}` {STATUS_WORDS.get(status, status)}{other}。"
 
+    def rotate_oversized_idle_schedulers(self) -> list[str]:
+        """接新单或轮询收尾时，为名下无任何在途任务且会话文件超过阈值的空闲调度者自动开新会话。"""
+        result = self._exec(["herdr", "agent", "list"])
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        try:
+            agents = json.loads(result.stdout)["result"]["agents"]
+        except (ValueError, KeyError, TypeError):
+            return []
+        oversized: list[tuple[dict[str, Any], int]] = []
+        for agent in agents:
+            name = str(agent.get("name") or "")
+            pane = str(agent.get("pane_id") or "")
+            status = str(agent.get("agent_status") or "")
+            session_file = str((agent.get("agent_session") or {}).get("value") or "")
+            if not name.startswith("delivery-scheduler-") or not pane or status not in ("idle", "done") or not session_file:
+                continue
+            try:
+                size = Path(session_file).stat().st_size
+            except OSError:
+                continue
+            if size > MAX_IDLE_SCHEDULER_SESSION_BYTES:
+                oversized.append((agent, size))
+        if not oversized:
+            return []
+        fs = find_scheduler_module()
+        busy_names = {
+            row.scheduler
+            for repo_path in self.projects.values()
+            for row in fs.active_rows(repo_path)
+            if row.scheduler
+        }
+        for url, origin in self.state["origins"].items():
+            repo_path = origin.get("repo")
+            if repo_path:
+                try:
+                    owner_sched = fs.owner_of(url, repo_path, agents).get("scheduler")
+                except Exception:
+                    owner_sched = None
+                if owner_sched:
+                    busy_names.add(str(owner_sched))
+        rotated: list[str] = []
+        for agent, size in oversized:
+            name = str(agent["name"])
+            pane = str(agent["pane_id"])
+            if name in busy_names:
+                continue
+            res = self._exec([sys.executable, str(RESET_SESSION), pane])
+            if res.returncode == 0:
+                rotated.append(name)
+                log(f"rotated oversized idle scheduler {name} ({pane}, {size / (1024 * 1024):.1f}MB) -> {res.stdout.strip()}")
+            else:
+                log(f"skip rotating scheduler {name} ({pane}): {res.stderr.strip()}")
+        return rotated
+
     def launch(self, repo: str, task: str, key: str, url: str | None = None) -> bool:
         """走 team-up 入口；key（任务标识或 issue URL）冷却期内不重复走，返回是否已发出。
 
@@ -235,6 +294,7 @@ class Inbox:
         if time.time() - self.state["launched_at"].get(key, 0) < LAUNCH_COOLDOWN_S:
             log(f"{key}: entry launched recently, waiting for scheduler to register")
             return False
+        self.rotate_oversized_idle_schedulers()
         origin = self.state["origins"].get(url or "") or {}
         result = self._exec(
             ["hwf", "run", "team-up", "--detach", "--json", "--input", f"task={task}{NOTIFY_REMINDER}",
@@ -681,8 +741,66 @@ class Inbox:
                 seen.add(url)
                 if not self.poll_followed_issue(url, repo, issue, floor):
                     return
+                if url in self.state["followed"] and self._should_evict_followed_issue(url, issue, now):
+                    self.state["followed"].pop(url, None)
+                    log(f"evicted closed followed issue: {url}")
+        self.prune_closed_followed(now)
         self.state["follow_since"] = now
         save_state(self.state)
+
+    def _should_evict_followed_issue(self, url: str, issue: Mapping[str, Any], now: float) -> bool:
+        """已关闭满 7 天的跟进单移出 followed；刚关闭不足 7 天的保留以承接尾随评论。"""
+        entry = self.state["followed"].get(url)
+        if not isinstance(entry, dict):
+            return False
+        if issue.get("state") != "closed":
+            entry.pop("closed_since", None)
+            return False
+        closed_raw = issue.get("closed_at") or issue.get("updated_at")
+        closed_ts: float | None = None
+        if isinstance(closed_raw, str) and closed_raw.strip():
+            try:
+                closed_ts = parse_time(closed_raw)
+            except ValueError:
+                closed_ts = None
+        if closed_ts is None:
+            closed_ts = float(entry.setdefault("closed_since", now))
+        return (now - closed_ts) >= FOLLOWED_CLOSED_RETENTION_S
+
+    def prune_closed_followed(self, now: float) -> list[str]:
+        """按小时低频巡检久未更新的 followed 列表，把关闭已满 7 天的老工单清理掉。"""
+        if not self.state["followed"]:
+            return []
+        last_pruned = self.state.get("followed_pruned_at")
+        if last_pruned is None:
+            self.state["followed_pruned_at"] = now
+            return []
+        if (now - float(last_pruned)) < FOLLOWED_PRUNE_INTERVAL_S:
+            return []
+        evicted: list[str] = []
+        for project in self.projects:
+            entries = {
+                int(meta["iid"]): url
+                for url, meta in list(self.state["followed"].items())
+                if isinstance(meta, dict) and meta.get("project") == project and meta.get("iid") is not None
+            }
+            if not entries:
+                continue
+            query = (
+                f"projects/{quote(project, safe='')}/issues?state=closed&per_page=100"
+                + "".join(f"&iids[]={iid}" for iid in sorted(entries))
+            )
+            closed_issues = self.api(query)
+            if not isinstance(closed_issues, list):
+                continue
+            for issue in closed_issues:
+                url = issue.get("web_url") or entries.get(int(issue.get("iid") or -1))
+                if url and url in self.state["followed"] and self._should_evict_followed_issue(url, issue, now):
+                    self.state["followed"].pop(url, None)
+                    evicted.append(url)
+                    log(f"pruned stale closed followed issue: {url}")
+        self.state["followed_pruned_at"] = now
+        return evicted
 
     def poll_followed_issue(self, url: str, repo: str, issue: Mapping[str, Any], floor: float) -> bool:
         notes = self.api(f"projects/{issue['project_id']}/issues/{issue['iid']}/notes?sort=desc&per_page=100")
@@ -928,6 +1046,7 @@ class Inbox:
         for url, origin in list(self.state["origins"].items()):
             self.poll_origin(url, origin)
         self.poll_followed()
+        self.rotate_oversized_idle_schedulers()
 
 
 def parse_dialog(screen: str) -> dict[str, Any] | None:
@@ -1046,7 +1165,7 @@ def watched_scripts(base_dir: Path | None = None) -> tuple[Path, ...]:
         root / name
         for name in (
             "gitlab-inbox.py", "find-scheduler.py", "proactive.py",
-            "retrospect.py", "jev_client.py", "jev_gates.py",
+            "retrospect.py", "jev_client.py", "jev_gates.py", "poll_backoff.py",
         )
     )
 
@@ -1071,44 +1190,10 @@ def reloadable_changes(baseline: Mapping[Path, int], paths: Sequence[Path]) -> l
     return changed
 
 
-MAX_POLL_BACKOFF_S = 300
-FAILURE_HEARTBEAT_EVERY = 10
-
-
-def compute_poll_backoff(base_interval: int, consecutive_failures: int, max_backoff: int = MAX_POLL_BACKOFF_S) -> int:
-    """连续轮询失败时按指数退避放大等待间隔（如 60 -> 120 -> 240 -> 300s），成功立即恢复基础间隔。"""
-    floor = max(int(base_interval), 1)
-    if consecutive_failures <= 0:
-        return floor
-    cap = max(floor, int(max_backoff))
-    return min(floor * (2 ** min(consecutive_failures - 1, 3)), cap)
-
-
-class PollFailureTracker:
-    """抑制断网期间完全相同的错误每轮刷屏，并在网络恢复后打印汇总计数。"""
-
-    def __init__(self, heartbeat_every: int = FAILURE_HEARTBEAT_EVERY) -> None:
-        self.heartbeat_every = max(heartbeat_every, 1)
-        self.consecutive_failures = 0
-        self.last_summary = ""
-
-    def record_failure(self, error: BaseException) -> str | None:
-        summary = " ".join(str(error).split())
-        self.consecutive_failures += 1
-        if self.consecutive_failures == 1 or summary != self.last_summary:
-            self.last_summary = summary
-            return f"poll failed: {error}"
-        if self.consecutive_failures % self.heartbeat_every == 0:
-            return f"poll still failing ({self.consecutive_failures} consecutive rounds): {summary[:240]}"
-        return None
-
-    def record_success(self) -> str | None:
-        if self.consecutive_failures <= 0:
-            return None
-        count = self.consecutive_failures
-        self.consecutive_failures = 0
-        self.last_summary = ""
-        return f"poll recovered after {count} consecutive failure(s)"
+MAX_POLL_BACKOFF_S = PB.MAX_POLL_BACKOFF_S
+FAILURE_HEARTBEAT_EVERY = PB.FAILURE_HEARTBEAT_EVERY
+compute_poll_backoff = PB.compute_poll_backoff
+PollFailureTracker = PB.PollFailureTracker
 
 
 def scout_busy(scout: Any) -> bool:

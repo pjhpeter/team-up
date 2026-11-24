@@ -50,7 +50,7 @@
 
 ### 派活契约
 
-- 派活和回话尽可能精简，把话说清楚就行（2026-11-18 用户要求）。只写本次独有的：要做什么、唯一可写范围、对应版本、交付位置、预算。协议、角色规则、howto 和 STATE 里已有的不复述，写章节或路径；历史结论和指纹放任务目录文件，派活只给路径；内部代号首次出现带一句白话。
+- 派活和回话尽可能精简，把话说清楚就行（2026-11-18 用户要求）。单条 `herdr agent prompt` 命令不超过 2500 字（超长会被记录守卫拦下）：较长背景、验收清单或代码上下文先写入 `<主仓库>/.hwf/tmp/<任务标识>/dispatch-<角色>.md`，派活命令只写本次独有目标、唯一可写范围、对应版本、交付位置、预算与该文件绝对路径。协议、角色规则、howto 和 STATE 里已有的不复述，写章节或路径；内部代号首次出现带一句白话。
 - 只给目标、用户原话、上下文、验收边界和交付位置；不编操作步骤、猜排查路线、指定工具参数或复述成员已有全局规则。用户点名工具原样转达，做错时纠正目标而非编更细教程。
 - 正式任务附角色、完整 issue URL、spec/方案路径、阶段、worktree/分支/HEAD、唯一可写范围、验收条目、评审剩余轮数及交付路径。交付、留证与测试报告路径必须写带 `<主仓库>/.hwf/tmp/<任务标识>/` 前缀的完整绝对路径（如 `.../testing/<轮次>/`、`.../development/<切片>/`、`.../reviews/<阶段>-r<N>.md`），不得简写成相对仓库根的裸 `testing/...`、`evidence/...`、`reviews/...`；严禁在主工作树或 worktree 根目录新建顶层产物目录，也不得改业务仓库 `.gitignore` 遮盖误放目录。临时只读分析附问题原话、链接、证据位置和结尾格式。成员先读主入口与本角色/阶段指向的规则，不通读所有主题。
 - 评审另附 in-scope/out-of-scope、复核项、预算、停止条件，并要求终审先独立列严重项再读 precheck；缺范围契约不得派。用户可见结论的摘要/全文格式按 [communication.md](communication.md)「原文与材料」。
@@ -92,7 +92,7 @@
 - 一个调度者同一时间只负责一个交付，入口只复用无未收尾任务且无未关闭发起 issue 的空闲调度者。误投时用 `task-record.py index-add --queued` 登记新需求（调度者列空），来源 issue 说明，不抢占当前交付。
 - INDEX 只改本任务行，转交由新调度者追加自己的行，最后一行代表负责人；收尾状态前缀为 done/delivered/closed/cancelled。主工作树仅放 `.hwf/tmp` 记录，代码在独立 worktree。共同文件/IndexedDB 库升级冲突由后到任务在 issue @用户说明。
 - 按 Blocked by 推进；并行前落盘各分支/worktree/唯一写入范围/合并顺序。同一 worktree 或同一文件同时一名写者，共享文件归一个任务或串行，不靠并行跳依赖；各评审测试对应各自已审版本。
-- 测试独占服务见 [review-testing.md](review-testing.md) §8。派 test/冒烟前用 `scripts/test-account.py claim --repo <主仓库> --task <任务> --issue <编号> --candidates <账号…>` 统一领取账号，候选按项目账号文件的国内/国际顺序；写入派活与 STATE，test 不自行换号。相同 issue 默认只占 1 个账号复测沿用；只有当前步骤确需双席位协作/权限对照时才临时加领第 2 个，且双席位步骤结束、换号或用户指定停用某账号时，必须当场用 `test-account.py release --task <任务> --issue <编号> --account <账号…>` 单独归还闲置账号，不得一直锁到整单结束。
+- 测试独占服务见 [review-testing.md](review-testing.md) §8。派 test/冒烟前用 `scripts/test-account.py claim --repo <主仓库> --task <任务> --issue <编号> [--candidates <账号…> | --pool-file <池文件>] [--require-tag <标签>] [--exclude-tag <标签>]` 统一领取账号（涉及购买/计费/权限状态时先按 `free`、`paid`、`plus-trial`、`region:cn`、`region:intl` 等套餐标签一步筛出匹配账号，新发现的套餐状态用 `test-account.py tag` 记入本机元数据）；写入派活与 STATE，test 不自行换号。相同 issue 默认只占 1 个账号复测沿用；只有当前步骤确需双席位协作/权限对照时才临时加领第 2 个，且双席位步骤结束、换号或用户指定停用某账号时，必须当场用 `test-account.py release --task <任务> --issue <编号> --account <账号…>` 单独归还闲置账号，不得一直锁到整单结束。
 - 退出码 3 表示全被占：排队、不借用抢占，继续其他工作；成员回报或至多 30 分钟后再领取，STATE 写等待原因。其他任务来协调闲置账号时，核对本任务当前实际在用账号后立即用 `--account` 释放未在用的账号。测试与冒烟全部结束且 issue 关闭/登记不上线时按 issue release，交付收尾前按 task release 全部；已收尾任务漏释放由下次 list/claim 自动回收。被挤下线先暂停回报，用 list 查占用，不抢回账号。
 
 ### 前后端并行开发
@@ -112,7 +112,7 @@
 ### 任务标识与索引
 
 - 有 issue：项目 path 的 `/` 替为 `-` 再接 IID；无 issue：`req-<本机YYYYMMDD>-<原始输入sha1前8位>`，原文逐字算，不裁剪。
-- 初始化读 INDEX 前用 `scripts/clean-tmp.py <仓库根>`：清理最新文件超过 10 天且 INDEX 已收尾、发起 issue 已关闭（或无索引）的 `.hwf/tmp/<任务>` 目录，并按同等安全门禁（无窗格占用、无未提交/未跟踪改动、`.hwf/tmp` 无独有证据、HEAD 已在远端分支）自动回收同仓库过期陈旧 worktree；在途、未关闭发起 issue、INDEX 不删。脚本非零记 STATE 后继续初始化；目录被清也按 GitLab 恢复同一标识。
+- 初始化读 INDEX 前用 `scripts/clean-tmp.py <仓库根>`：清理最新文件超过 10 天且 INDEX 已收尾、发起 issue 已关闭（或无索引）的 `.hwf/tmp/<任务>` 目录，并跨 `~/.herdr/worktrees/` 全部仓库子目录按六重安全门禁（非在途任务、超过阈值未改动、无窗格占用、无未提交/未跟踪改动、`.hwf/tmp` 无独有证据、HEAD 已在远端分支）自动回收过期陈旧 worktree；在途、未关闭发起 issue、INDEX 不删。脚本非零记 STATE 后继续初始化；目录被清也按 GitLab 恢复同一标识。
 - 创建目录后用 `task-record.py index-add` 追加，变化用 index-set，只改自己那行；收尾状态只由 wrapup.py 写。禁止手写/重定向/替换 INDEX。恢复先匹配，不另建 issue、不重置轮次、不覆盖其他任务。
 
 ### STATE.md

@@ -205,6 +205,67 @@ def notify_mode(repo: str, task: str) -> str:
     return VERBOSE if mode.startswith(VERBOSE) else QUIET
 
 
+_WAITING_STAGE_KEYWORDS = ("待上线", "等待用户", "等你处理")
+_ISSUE_URL_IN_TEXT = re.compile(r"https?://[^\s)`'\"]+/-/(?:issues|work_items)/\d+")
+
+
+def _task_origin_issue_url(repo: str, task: str) -> Optional[str]:
+    prog = progress_path(repo, task)
+    if prog.is_file():
+        try:
+            url = str(json.loads(prog.read_text(encoding="utf-8")).get("issue") or "")
+            if url:
+                return url.split("#", 1)[0]
+        except (OSError, ValueError):
+            pass
+    notes_log = state_path(repo, task).with_name("notes.jsonl")
+    if notes_log.is_file():
+        try:
+            for line in reversed(notes_log.read_text(encoding="utf-8").splitlines()):
+                if line.strip():
+                    url = str(json.loads(line).get("issue") or "")
+                    if url:
+                        return url.split("#", 1)[0]
+        except (OSError, ValueError):
+            pass
+    st = state_path(repo, task)
+    if st.is_file():
+        try:
+            m = _ISSUE_URL_IN_TEXT.search(st.read_text(encoding="utf-8"))
+            if m:
+                return m.group(0)
+        except OSError:
+            pass
+    return None
+
+
+def check_waiting_unanswered_note(repo: str, task: str, field: str, value: str) -> Optional[str]:
+    """将任务设为等待用户或待上线前，核对原工单是否存在晚于最近实质回复的未答用户留言。"""
+    clean = " ".join(value.split())
+    entering_wait = (
+        (field == "待用户事项" and clean not in ("", "无", "无。"))
+        or (field == "当前阶段" and any(k in clean for k in _WAITING_STAGE_KEYWORDS))
+    )
+    if not entering_wait:
+        return None
+    # 若本次待用户事项已经附了刚发出的 #note_ 链接，排除该条提示本身前后的误判，仍以远端水位为准。
+    origin_url = _task_origin_issue_url(repo, task)
+    if not origin_url:
+        return None
+    try:
+        issue = _WR.parse_issue(origin_url)
+        unanswered = _WR.unanswered_user_note(issue)
+    except _WR.WrapupError:
+        return None
+    if unanswered is None:
+        return None
+    uauthor = str((unanswered.get("author") or {}).get("username") or "user")
+    return (
+        f"暂缓进入等待状态：{issue.url}#note_{unanswered['id']}（@{uauthor}）尚未得到实质回复，"
+        "请先用 task-record.py note --kind answer（或对应 todo/delivery-done）回复后再更新等待状态"
+    )
+
+
 def state_set(repo: str, task: str, name: str, value: str) -> None:
     if name not in TOP_FIELDS:
         raise RecordError(f"STATE 顶部没有「{name}」这一项，可用：{'、'.join(TOP_FIELDS)}")
@@ -1275,6 +1336,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             index_set(opts.repo, opts.task, opts.status, opts.scheduler)
             print(f"INDEX 已改为：{opts.status}")
         elif opts.command == "state-set":
+            hold = check_waiting_unanswered_note(opts.repo, opts.task, opts.field, opts.value)
+            if hold:
+                print(hold)
+                return EXIT_HELD
             state_set(opts.repo, opts.task, opts.field, opts.value)
             print(f"STATE 顶部「{opts.field}」已更新")
         elif opts.command == "state-compact":

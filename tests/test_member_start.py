@@ -23,6 +23,7 @@ profiles:
   scheduler: {kind: omp, args: ["--approval-mode", "yolo"]}
   arch: {kind: claude, args: ["--model", "claude-opus-5-5", "--effort", "medium"]}
   dev: {kind: omp, args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low"]}
+  test: {kind: omp, args: ["--model", "jc-gpt/gpt-6.1-sol", "--thinking", "low"]}
   nomodel: {kind: omp, args: ["--thinking", "medium"]}
 """
 
@@ -323,6 +324,22 @@ class ClaimTest(Case):
         reg = MS.read_registry()
         self.assertEqual(set(reg.keys()), {"w1:pD1"})
         self.assertEqual(reg["w1:pD1"].get("issue"), "#453")
+
+    def test_claim_also_prunes_duplicate_idle_panes_of_sibling_roles(self) -> None:
+        fake = FakeHerdr([
+            SCHED,
+            agent("i453-arch", "w1:pA1", status="idle"),
+            agent("i453-arch-2", "w1:pA2", status="done"),
+            agent("i453-test", "w1:pT1", kind="omp", status="idle"),
+            agent("i453-test-2", "w1:pT2", kind="omp", status="done"),
+            agent("i453-test-3", "w1:pT3", kind="omp", status="working"),
+        ])
+        out = self.run_claim(fake, "dev")
+        self.assertEqual((out["action"], out["name"]), ("created", "i453-dev"))
+        # 顺带把同 issue 其他角色堆积的多余空闲副本收敛到每角色最多 1 个候补，working 的不碰。
+        self.assertEqual(sorted(out["pruned_idle"]), ["i453-arch-2", "i453-test-2"])
+        remaining_names = {a["name"] for a in fake.agents}
+        self.assertEqual(remaining_names, {"delivery-scheduler-w1-ps", "i453-arch", "i453-test", "i453-test-3", "i453-dev"})
 
 
 if __name__ == "__main__":

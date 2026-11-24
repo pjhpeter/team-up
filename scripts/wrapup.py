@@ -131,6 +131,83 @@ def owner_row(repo: str, task: str) -> Any:
     return rows[-1]  # 同一任务被接手时会追加新行，最后一行是现在的负责人
 
 
+_SUBSTANTIVE_AGENT_KIND_RE = re.compile(r"<!--\s*hwf-kind:(answer|todo|risk|delivery-done|step-done)\s*-->")
+_ANY_KIND_TAG_RE = re.compile(r"<!--\s*hwf-kind:([a-z-]+)\s*-->")
+_PURE_INBOX_COMMANDS = frozenset({
+    "/status", "/new", "/clear", "/免打扰", "/quiet", "/详尽", "/verbose",
+})
+_INBOX_AUTO_RECEIPT_PREFIXES = (
+    "已收到，已转交目标 issue",
+    "已收到目标 issue",
+    "开始跑交付流程",
+    "**收尾回执**",
+)
+_INBOX_AUTO_RECEIPT_SNIPPETS = (
+    "已切到免打扰模式",
+    "已切到详尽模式",
+    "已清空调度者上下文",
+    "这个 issue 已经在交付流程中了",
+    "现在没有对应的交付",
+)
+
+
+def _is_pure_inbox_command(body: str, me: str) -> bool:
+    lines = body.rstrip().rsplit("\n", 1)
+    if len(lines) == 2 and lines[-1].strip() in ("_（来自飞书）_", "_（来自飞书秘书）_"):
+        body = lines[0]
+    words = [w for w in body.split() if w.lower() != f"@{me}".lower()]
+    return len(words) == 1 and words[0].lower() in _PURE_INBOX_COMMANDS
+
+
+def _is_substantive_agent_note(body: str) -> bool:
+    if _SUBSTANTIVE_AGENT_KIND_RE.search(body):
+        return True
+    if _ANY_KIND_TAG_RE.search(body):
+        # record / stage 只做存档备忘，不充当对用户提问或修改意见的实质答复。
+        return False
+    stripped = body.strip()
+    if not stripped:
+        return False
+    if any(stripped.startswith(p) for p in _INBOX_AUTO_RECEIPT_PREFIXES):
+        return False
+    if any(s in stripped for s in _INBOX_AUTO_RECEIPT_SNIPPETS):
+        return False
+    return True
+
+
+def unanswered_user_note(issue: Issue, *, exclude_note_ids: Sequence[int] = ()) -> Optional[dict[str, Any]]:
+    """对比本单最新一条用户非系统留言与最近一条 Agent 实质回复（answer/todo/risk/delivery-done 等），返回漏回留言。"""
+    user_info = glab_api(issue.host, "GET", "user")
+    me = str((user_info or {}).get("username") or "") if isinstance(user_info, dict) else ""
+    if not me:
+        return None
+    notes = glab_api(issue.host, "GET", f"projects/{quote(issue.project, safe='')}/issues/{issue.iid}/notes?sort=desc&per_page=20")
+    if not isinstance(notes, list) or not notes:
+        return None
+    excluded = {int(nid) for nid in exclude_note_ids}
+    latest_user: Optional[dict[str, Any]] = None
+    latest_agent_id = 0
+    for item in sorted(notes, key=lambda n: int(n.get("id") or 0), reverse=True):
+        nid = int(item.get("id") or 0)
+        if nid <= 0 or item.get("system"):
+            continue
+        author = str((item.get("author") or {}).get("username") or "")
+        body = str(item.get("body") or "")
+        if not author:
+            continue
+        if author == me:
+            if nid > latest_agent_id and _is_substantive_agent_note(body):
+                latest_agent_id = nid
+            continue
+        if nid in excluded or _is_pure_inbox_command(body, me):
+            continue
+        if latest_user is None:
+            latest_user = item
+    if latest_user is not None and int(latest_user["id"]) > latest_agent_id:
+        return latest_user
+    return None
+
+
 def check_close_request(issue: Issue, link: str) -> str:
     """--close-request 必须是本 issue 下由真人（不是本 Agent 账号）发的评论；返回发评论的人。"""
     match = re.fullmatch(r"(?P<issue>.+)#note_(?P<note>\d+)", link.strip())
@@ -427,14 +504,25 @@ def _load_task_state_text(main_repo: Optional[str], task: str) -> str:
     return "\n".join(chunks)
 
 
-def _recorded_in_state(wt_path: str, state_text: str) -> bool:
-    """跨仓库兄弟目录（如 ~/code/member 的 issue-499-fix）仅在本任务 STATE.md 明确登记过路径时才认领。"""
+def _recorded_in_state(
+    wt_path: str,
+    state_text: str,
+    wt_repo: str = "",
+    branches: Sequence[str] = (),
+) -> bool:
+    """跨仓库兄弟目录（如 drawing-board/issue-484-sync）在 STATE 登记了路径，或同时登记了仓库名与目录名/分支名时认领。"""
     if not state_text:
         return False
     real_wt = os.path.realpath(wt_path)
     p = Path(real_wt)
     tail = f"{p.parent.name}/{p.name}"
-    return real_wt in state_text or wt_path in state_text or f"worktrees/{tail}" in state_text
+    if real_wt in state_text or wt_path in state_text or tail in state_text:
+        return True
+    repo_names = {n for n in (Path(wt_repo).name if wt_repo else "", p.parent.name) if n}
+    if any(rn in state_text for rn in repo_names):
+        if p.name in state_text or any(b and b in state_text for b in branches):
+            return True
+    return False
 
 
 def task_worktrees(task: str, main_repo: Optional[str] = None, iid: Optional[str] = None) -> list[Worktree]:
@@ -468,7 +556,11 @@ def task_worktrees(task: str, main_repo: Optional[str] = None, iid: Optional[str
             print(f"跳过不是 git worktree 的目录 {top}：{error}")
             continue
         wt_repo = entries[0][0]  # git worktree list 第一项总是主工作树
-        if require_repo_match and not (_belongs_to_repo_tree(wt_repo, main_repo) or _recorded_in_state(top, state_text)):
+        top_branches = [b for p_entry, _h, b, _bare in entries if b and (p_entry == top or p_entry.startswith(top + os.sep))]
+        if require_repo_match and not (
+            _belongs_to_repo_tree(wt_repo, main_repo)
+            or _recorded_in_state(top, state_text, wt_repo, top_branches)
+        ):
             continue
         accepted_tops.append(top)
         entries_by_top.append((top, wt_repo, entries))
@@ -677,6 +769,18 @@ def wrapup(opts: argparse.Namespace) -> int:
     tag = "【预演】" if opts.dry_run else ""
     problems: list[str] = []
     requester = check_close_request(issue, opts.close_request) if opts.close_request else ""
+    is_silent_cancel = bool(getattr(opts, "no_issue_note", False) and opts.status.strip().lower().startswith("cancelled"))
+    if not is_silent_cancel:
+        close_note_ids: list[int] = []
+        if opts.close_request and (m_close := re.search(r"#note_(\d+)$", opts.close_request.strip())):
+            close_note_ids.append(int(m_close.group(1)))
+        unanswered = unanswered_user_note(issue, exclude_note_ids=close_note_ids)
+        if unanswered is not None:
+            uauthor = str((unanswered.get("author") or {}).get("username") or "user")
+            raise WrapupError(
+                f"未回复用户留言：{issue.url}#note_{unanswered['id']}（@{uauthor}）晚于最近一条实质回复，"
+                "请先用 task-record.py note --kind answer 简短回复后再执行收尾"
+            )
 
     worktrees = task_worktrees(opts.task, repo, issue.iid)
     paths = [wt.path for wt in worktrees if not wt.bare]

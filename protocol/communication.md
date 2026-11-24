@@ -36,7 +36,7 @@
 
 新 issue 评论只用 `scripts/task-record.py note`，参数以 `--help` 为准；不直接 glab issue note/API 创建。类别：todo、risk、answer、step-done、delivery-done、stage、record；脚本在评论末尾附隐藏 `hwf-kind` 标记供秘书分流，record 仅作登记/存档备案（不 `@用户`、不伪装进度）。
 
-- 脚本按 STATE 模式过滤，免打扰 stage 返回 3，内容只记 STATE；`step-done`、`delivery-done`（及宣告最终验收通过的交卷评论）强制核验折叠区外的「验收标准逐条对账表」，缺表、藏进 `<details>`、编号跳漏、无故仅贴截图或缺播放器/时间段/`/-/project/<ID>/uploads/...` 直链均返回 3 拦下；正文完全重复也不发。成功须回读，免打扰下仅用户可见通知（todo、risk、answer、delivery-done）更新 STATE「最近用户通知」。编辑已有评论、MR 评论和 wrapup 收尾回执不走此入口。
+- 脚本按 STATE 模式过滤，免打扰 stage 返回 3，内容只记 STATE；`step-done`、`delivery-done`（及宣告最终验收通过的交卷评论）强制核验折叠区外的「验收标准逐条对账表」，缺表、藏进 `<details>`、编号跳漏、无故仅贴截图或缺播放器/时间段/`/-/project/<ID>/uploads/...` 直链均返回 3 拦下；正文完全重复也不发。用 `state-set` 将任务切为等待用户或 `待上线` 时，脚本同步核对原 issue 是否存在晚于最近实质回复的未答用户留言，若有则返回 3 提示先补 `answer`。成功须回读，免打扰下仅用户可见通知（todo、risk、answer、delivery-done）更新 STATE「最近用户通知」。编辑已有评论、MR 评论和 wrapup 收尾回执不走此入口。
 - 让用户批准后由 Agent 执行的动作，先用 note 的 `--will merge=<MR>`、`push=<项目>@<分支>`、`tag=<项目>@<tag>` 声明全部动作；只请用户自己操作用 `--will none`。先检查 MR 状态/冲突/合并权限和保护规则，做不了不发授权请求（退出3），改成请用户自己执行并写顺序；查不明权限按脚本提示如实注明。只查用 preflight。
 - 两种模式的 ntfy 一样：按全局 07-completion，只在需要用户处理与整项完成时，由调度者发到 Herdr 专用频道，核验2xx；发送不等于授权。单阶段与步骤存档不发。
 - 飞书由桥转达 GitLab 评论，不由调度者重复发私聊。免打扰下秘书只将 todo、risk、answer、delivery-done（以及含异常残留的收尾回执）推到私聊主窗口，自动剥离隐藏标记；详尽模式全部转达。私聊绑定只在秘书主窗口通知，原话题保留历史/回复；群绑定继续在群内，秘书另行私聊。带「来自飞书秘书」尾注的用户评论照常处理，秘书已转交后只发实质内容。

@@ -307,6 +307,48 @@ def pick_idle(members: Sequence[dict[str, Any]], exclude: Sequence[str], tag: st
     return idle[0] if idle else None
 
 
+def _sibling_role_duplicate_groups(
+    all_agents: Sequence[dict[str, Any]],
+    active_profile: str,
+    scheduler: dict[str, Any],
+    registry: dict[str, Any],
+    exclude: Sequence[str],
+    tag: str,
+    cwd: str,
+) -> list[tuple[str, str, list[dict[str, Any]]]]:
+    """扫描同一调度者、同一 issue 名下其他角色的空闲成员：若某角色攒了 >=2 个纯空闲窗格，保留最优 1 个并回收其余副本。"""
+    tabs = team_tabs(scheduler, registry)
+    by_role: dict[str, list[dict[str, Any]]] = {}
+    prefix = f"{tag}-"
+    for ag in all_agents:
+        name = str(ag.get("name") or "")
+        pid = str(ag.get("pane_id") or "")
+        if not pid or not name.startswith(prefix):
+            continue
+        if ag.get("agent_status") not in ("idle", "done") or name in exclude:
+            continue
+        reg_entry = registry.get(pid) or {}
+        owner = reg_entry.get("scheduler")
+        if owner != scheduler["name"] and not (owner is None and ag.get("tab_id") in tabs):
+            continue
+        role = str(reg_entry.get("profile") or "") or re.sub(r"-\d+$", "", name[len(prefix):])
+        if not role or role == active_profile or not is_role(ag, role):
+            continue
+        by_role.setdefault(role, []).append(ag)
+
+    groups: list[tuple[str, str, list[dict[str, Any]]]] = []
+    for role, role_members in sorted(by_role.items()):
+        if len(role_members) < 2:
+            continue
+        enriched: list[dict[str, Any]] = []
+        for m in role_members:
+            current_cwd = pane_cwd(str(m["pane_id"]))
+            enriched.append(dict(m, _same_cwd=same_dir(current_cwd, cwd)))
+        enriched.sort(key=lambda m: _idle_sort_key(m, tag, bool(m.get("_same_cwd"))))
+        groups.append((f"{tag}-{role}", str(enriched[0]["pane_id"]), enriched[1:]))
+    return groups
+
+
 def prune_duplicate_idle(extras: Sequence[dict[str, Any]], base: str, kept_pane: str, scheduler_pane: str,
                          panes: Sequence[dict[str, Any]]) -> tuple[list[str], list[str]]:
     """回收同 issue、同角色且未被 exclude 的多余空闲副本（含不同目录旧窗格），保留每个 workspace 至少一个窗格。"""
@@ -469,15 +511,26 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
                                check=False)
             raise
 
+    sibling_dups = _sibling_role_duplicate_groups(all_agents, profile_name, scheduler, registry, exclude, tag, cwd)
     pruned_panes: list[str] = []
     pruned_names: list[str] = []
     live_panes: Optional[set[str]] = None
-    if len(idle_candidates) > 1 or registry:
+    if len(idle_candidates) > 1 or sibling_dups or registry:
         panes_snapshot = herdr("pane", "list")["result"]["panes"]
         if len(idle_candidates) > 1 and member is not None:
-            pruned_panes, pruned_names = prune_duplicate_idle(
+            p_ids, p_names = prune_duplicate_idle(
                 idle_candidates[1:], base, pane["pane_id"], scheduler["pane_id"], panes_snapshot
             )
+            pruned_panes.extend(p_ids)
+            pruned_names.extend(p_names)
+            panes_snapshot = [p for p in panes_snapshot if p.get("pane_id") not in set(p_ids)]
+        for other_base, kept_other_pane, extras in sibling_dups:
+            p_ids, p_names = prune_duplicate_idle(
+                extras, other_base, kept_other_pane, scheduler["pane_id"], panes_snapshot
+            )
+            pruned_panes.extend(p_ids)
+            pruned_names.extend(p_names)
+            panes_snapshot = [p for p in panes_snapshot if p.get("pane_id") not in set(p_ids)]
         live_panes = {str(p.get("pane_id")) for p in panes_snapshot if p.get("pane_id")} - set(pruned_panes)
 
     record(pane, scheduler["name"], profile_name, drop_panes=pruned_panes, live_panes=live_panes, issue=issue)

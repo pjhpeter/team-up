@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 import importlib.util
+import io
 import os
 from pathlib import Path
 import sys
@@ -38,8 +40,13 @@ class FakeGlab:
         self.level = 30
         self.protected_tags: Any = []
         self.posted: list[str] = []
+        self.issue_notes: list[dict[str, Any]] = []
 
     def __call__(self, host: str, method: str, path: str, *fields: str) -> Any:
+        if path == "user":
+            return {"username": "pjhagent"}
+        if "/notes?" in path:
+            return list(self.issue_notes)
         if method == "POST":
             self.posted.append(fields[0].split("=", 1)[1])
             return {"id": 900 + len(self.posted)}
@@ -441,8 +448,13 @@ class ProgressGlab:
     def __init__(self) -> None:
         self.description = OLD_DESCRIPTION
         self.puts = 0
+        self.issue_notes: list[dict[str, Any]] = []
 
     def __call__(self, host: str, method: str, path: str, *fields: str) -> Any:
+        if path == "user":
+            return {"username": "pjhagent"}
+        if "/notes?" in path:
+            return list(self.issue_notes)
         if "merge_base" in path:
             sha = path.split("refs[]=")[1].split("&")[0]
             return {"id": sha if sha == SHIPPED else "c" * 40}
@@ -714,6 +726,50 @@ class ContentGuardTests(Case):
         self.assertEqual(code2, TR.EXIT_HELD)
         self.assertIn("先说结论，再说细节", msg2)
         self.assertEqual(self.glab.posted, [])
+
+    def test_state_set_waiting_user_holds_when_origin_issue_has_unanswered_user_note(self) -> None:
+        # 先发一条 stage 评论写入 notes.jsonl，登记原 issue URL。
+        TR.state_set(self.repo, TASK, "通知模式", "详尽")
+        code0, _ = self.note("stage", "进入集成验证")
+        self.assertEqual(code0, TR.EXIT_OK)
+
+        # 用户追问晚于最近实质回复（仅有一条 stage 不算答复用户）：切等待态返回 EXIT_HELD(3)。
+        self.glab.issue_notes = [
+            {"id": 910, "author": {"username": "pjhagent"}, "system": False, "body": "内部阶段\n<!-- hwf-kind:stage -->"},
+            {"id": 909, "author": {"username": "pengjh"}, "system": False, "body": "这个开关会影响存量画布吗？"},
+            {"id": 905, "author": {"username": "pjhagent"}, "system": False, "body": "前期确认\n<!-- hwf-kind:todo -->"},
+        ]
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc_wait = TR.main([
+                "state-set", "--repo", self.repo, "--task", TASK,
+                "--field", "待用户事项", "--value", "请合并 release MR",
+            ])
+            rc_stage = TR.main([
+                "state-set", "--repo", self.repo, "--task", TASK,
+                "--field", "当前阶段", "--value", "状态:待上线",
+            ])
+        self.assertEqual(rc_wait, TR.EXIT_HELD)
+        self.assertEqual(rc_stage, TR.EXIT_HELD)
+        self.assertIn("尚未得到实质回复", out.getvalue())
+
+        # 非等待用户的状态推进不受阻拦。
+        self.assertEqual(
+            TR.main(["state-set", "--repo", self.repo, "--task", TASK, "--field", "当前阶段", "--value", "开发中"]),
+            TR.EXIT_OK,
+        )
+
+        # 补发 answer 实质答复后，切等待态正常放行。
+        self.glab.issue_notes.insert(
+            0, {"id": 911, "author": {"username": "pjhagent"}, "system": False, "body": "不影响存量画布。\n<!-- hwf-kind:answer -->"}
+        )
+        self.assertEqual(
+            TR.main([
+                "state-set", "--repo", self.repo, "--task", TASK,
+                "--field", "待用户事项", "--value", "请合并 release MR",
+            ]),
+            TR.EXIT_OK,
+        )
 
 
 if __name__ == "__main__":

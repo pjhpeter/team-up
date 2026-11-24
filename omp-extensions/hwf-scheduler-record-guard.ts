@@ -17,7 +17,13 @@ const ISSUE_NOTE = /\bglab\s+issue\s+(note|comment)\b/;
 const ISSUE_NOTES_API = /\bglab\s+api\b[^|;&]*\/issues\/[^/\s]+\/notes(?![\/\w])/;
 const API_WRITE = /(-X|--method)[=\s]+["']?POST|\s(-f|-F|--field|--raw-field)[=\s]/i;
 const BARE_WAIT = /\bherdr\s+agent\s+wait\s+(?!--help)\S/;
+const AGENT_PROMPT = /\bherdr\s+agent\s+prompt\s+(?!--help)\S/;
+const MAX_PROMPT_CHARS = 2500;
 const WAIT_REASON = "等成员不用 herdr agent wait（2026-11-19 #484：成员断网后 herdr 仍报 working，干等了约 2 小时没人发现）。改用：python3 ~/.hwf/scripts/member-wait.py <成员> [--until …] --repo <主仓库> --task <任务标识>，用 bash async: true 后台运行；它每次最多等 10 分钟，会看屏幕判断卡住，并自动更新 issue 正文。";
+
+function promptLengthReason(len) {
+  return `单条派活命令长达 ${len} 字（上限 ${MAX_PROMPT_CHARS} 字）：万字长派活会撑爆调度者与成员上下文。请把长背景、验收清单或代码位置写进 <主仓库>/.hwf/tmp/<任务标识>/dispatch-<角色>.md，herdr agent prompt 里只写本次目标、可写范围和该文件的绝对路径（见 ~/.hwf/protocol/scheduling.md「派活契约」）。`;
+}
 
 // 返回拦截理由；不该拦返回 null。
 export function violation(toolName, input) {
@@ -27,6 +33,7 @@ export function violation(toolName, input) {
     if (INDEX_WRITE.test(command)) return indexReason();
     if (ISSUE_NOTE.test(command) || (ISSUE_NOTES_API.test(command) && API_WRITE.test(command))) return noteReason();
     if (BARE_WAIT.test(command)) return WAIT_REASON;
+    if (AGENT_PROMPT.test(command) && command.length > MAX_PROMPT_CHARS) return promptLengthReason(command.length);
     return null;
   }
   if (toolName === "write" || toolName === "edit") {

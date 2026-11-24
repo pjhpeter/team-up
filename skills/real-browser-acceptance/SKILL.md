@@ -17,7 +17,7 @@ description: 在真实浏览器或 Electron 窗口按验收点做端到端自动
 ### 1. 读已有经验与固定证据目录
 
 - 开测前读本任务的 `<任务目录>/test/howto.md`（登录、入口、造数、坑），以及项目的 `<主仓库>/.hwf/test-data.md`（可复用测试数据；主仓库是 `git rev-parse --git-common-dir` 的上一级）。文件不存在就在收尾时新建。
-- **证据目录固定前缀**：本轮全部本地录屏、截图、报告、终端日志及临时 `browser-profile`，在团队流程中一律写入 `<主仓库>/.hwf/tmp/<任务标识>/testing/<轮次>/`（绝对路径）；非团队单次测试写 `<仓库根目录>/.tmp/testing/<轮次>/`。派活若写了相对路径（如 `testing/xxx`），必须解析到 `<主仓库>/.hwf/tmp/<任务标识>/testing/xxx`，**严禁**在仓库根目录或 worktree 根目录直接新建 `testing/`、`evidence/`、`test/` 等顶层目录，也严禁修改仓库 `.gitignore` 遮盖放错位置的测试产物。
+- **证据目录固定前缀与大包禁令**：本轮全部本地录屏、截图、报告、终端日志及临时 `browser-profile`，在团队流程中一律写入 `<主仓库>/.hwf/tmp/<任务标识>/testing/<轮次>/`（绝对路径）；非团队单次测试写 `<仓库根目录>/.tmp/testing/<轮次>/`。派活若写了相对路径（如 `testing/xxx`），必须解析到 `<主仓库>/.hwf/tmp/<任务标识>/testing/xxx`，**严禁**在仓库根目录或 worktree 根目录直接新建 `testing/`、`evidence/`、`test/` 等顶层目录，也严禁修改仓库 `.gitignore` 遮盖放错位置的测试产物。证据目录只保留文本报告、JSON/哈希摘要、截图与压缩 `.mp4` 录屏；需要拆检 `app.asar`、`.dmg`、`.pkg`、`.app` 或流水线大归档包时，一律解压到 `/tmp/hwf-inspect-<编号>/`，提取摘要后在本轮清理步骤立即删除 `/tmp/hwf-inspect-<编号>/`。
 
 ### 2. 启动专属服务（仅本地验收）
 
@@ -39,7 +39,7 @@ description: 在真实浏览器或 Electron 窗口按验收点做端到端自动
 
 **自己解决的问题**：浏览器目录、登录、遮罩和弹窗、端口占用、找页面入口、造测试数据。先查 howto 里的已知做法，再换办法；同一问题最多换 2 种办法，仍失败才标阻塞，并报告每种办法和现场。
 
-- **本机测试账号自动登录**：按派活分配的测试账号，从项目约定的本机测试账号凭据文件（如 `~/.agents/secrets/` 下的测试账号清单或 `howto.md` 指明的位置）读取对应密码或测试邮箱验证码，自行输入完成登录（网页表单用 `ego-browser`，Electron 独立客户端窗口用 `Computer Use`）。录屏在登录进入目标界面后再开启（验收登录页本身时只录登录窗口，绝不打开或录制凭据文件，报告和日志不打印明文密码）。测试专用账号在自动化验收中输入密码属于正常自理操作：**严禁**未经自动登录尝试就直接停在登录页叫用户手动登录，也**严禁**在测试后以“自动化输入过密码”为由要求用户轮换测试账号密码；仅当无可用测试账号、触发无法自助收码的真人专属验证/硬件鉴权，或自动登录排障后仍失败时，才报「登录窗口已就绪」交用户接手。
+- **本机测试账号自动登录与脱敏入口**：按派活分配的测试账号，可直接通过 `HWF_TEST_ACCOUNT=<账号> python3 ~/.hwf/scripts/test-browser.py <worktree> --url <被测地址> --mode ego --space-name <空间名> [--clear-origin] --out <本轮证据目录>`（或独立 Chrome profile 模式）自动从环境变量、本机凭据文件（`~/.agents/secrets/look-ai-test-accounts.md`）或 macOS 钥匙串（`hwf-test-account`）读取密码完成脱敏登录（输出仅含掩码账号，命令行参数不暴露明文账号密码；Electron 独立客户端窗口用 `Computer Use`）。涉及套餐或计费状态（如免费号、试用期、已付费）时，通过 `test-account.py pool` / `claim --require-tag` / `tag` 核对并记录套餐标签。录屏在登录进入目标界面后再开启（验收登录页本身时只录登录窗口，绝不打开或录制凭据文件，报告和日志不打印明文密码）。测试专用账号在自动化验收中输入密码属于正常自理操作：**严禁**未经自动登录尝试就直接停在登录页叫用户手动登录，也**严禁**在测试后以“自动化输入过密码”为由要求用户轮换测试账号密码；仅当无可用测试账号、触发无法自助收码的真人专属验证/硬件鉴权，或自动登录排障后仍失败时，才报「登录窗口已就绪」交用户接手。
 - **Ego Lite 测试站点单站切换账号**：在默认浏览器资料新建本轮 `TaskSpace` 打开非生产测试站点（本地专属端口或 `smoke` 测试域名，如 `develop.bootingai.net`、`app.develop.lookai.app`）时，若自动带入非本轮分配账号的登录态，不向用户索要空白浏览器资料或 `profileId`，按两步自行切换：
   1. **核对同站点并发**：本地专属端口按 `origin` 天然隔离可直接切换；共享测试域名先查 `listTaskSpaces()` 中其他活跃空间的标签页 URL（团队任务同时查 `python3 ~/.hwf/scripts/test-account.py list` 是否有其他在途任务正持有同站点账号），确认没有其他任务正在使用同一测试域名。若同一测试域名正被其他在途任务使用，报并发占用等待，不清对方会话。
   2. **仅清当前测试站点登录态**：在该测试页执行 `localStorage.clear(); sessionStorage.clear()`，调用 `Storage.clearDataForOrigin`（`origin` 仅传当前测试站，`storageTypes: "cookies,local_storage"`），并用 `Network.getAllCookies` 过滤出 `domain`（去前导点后）等于当前测试站 hostname 或其专属测试子域（如 `develop.bootingai.net`、`app.develop.lookai.app`、`develop.lookai.app`）的 Cookie 逐条 `Network.deleteCookies`，刷新后登录本轮账号。**严禁**调用 `Network.clearBrowserCookies`、`Network.clearBrowserCache` 或无 `browserContextId` 的 `Storage.clearCookies`，严禁删除一级根域、生产域名（如 `look-ai.cn`、`lookfashion.ai`）或其他子域（如 `git.bootingai.net`、`admin.lookai.cc`）的 Cookie。
@@ -95,7 +95,7 @@ python3 ~/.hwf/scripts/upload-media.py create --repo <主仓库路径> --file <�
 
    脚本按「cwd 在 worktree 内且在监听端口」认领整棵服务进程树（含 `pnpm exec` 包装进程），不碰 Agent 和其他 worktree。只关 pane 或按 Ctrl-C 不够；omp 命名服务另用 `write proc://<名称>/kill` 清掉记录。部署后验收不启动本地服务，只清理本机浏览器、测试客户端和辅助进程，不关闭远端服务。
 2. 确认本轮所有 `test-record.py start` 都已执行 `stop` 收尾，结束自己创建的浏览器会话或本轮启动的 Electron 客户端窗口，记录清理结果；不关用户窗口，不清共用资料。
-3. 若本轮创建了 `<证据目录>/browser-profile`，删除它并在报告里确认；不上传含登录凭据的目录。
+3. 若本轮创建了 `<证据目录>/browser-profile` 或拆包检验临时目录 `/tmp/hwf-inspect-<编号>/`，删除它们并在报告里确认；不上传含登录凭据的目录，也不在 `.hwf/tmp/` 残留解包目录。
 4. 只关本 issue 的进程，不关别人的服务。
 
 ### 7. 补经验

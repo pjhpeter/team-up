@@ -57,6 +57,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import jev_client as JC
+import jev_gates as JG
 
 JEV_GO_AUTH_MIN = 0.90
 JEV_DEBUG_FLOW_MIN = 0.80
@@ -539,10 +540,26 @@ class Inbox:
                     ),
                 },
             )
-            if res.noul("go_authorized") < JEV_GO_AUTH_MIN:
+            go_min = JG.threshold_of("inbox_natural_go_min", JEV_GO_AUTH_MIN)
+            dbg_min = JG.threshold_of("inbox_debug_flow_min", JEV_DEBUG_FLOW_MIN)
+            go_prob = res.noul("go_authorized")
+            if go_prob < go_min:
+                JG.record_gate_event(
+                    "gate3_inbox_go",
+                    "stay_chat",
+                    rules_evaluated=["go_authorized"],
+                    near_misses={"go_authorized": go_prob} if (go_min - 0.15) <= go_prob < go_min else None,
+                )
                 return None
             flow, _, probs = res.choice("flow")
-            return "debug" if flow == "debug" and probs.get("debug", 0.0) >= JEV_DEBUG_FLOW_MIN else "standard"
+            chosen = "debug" if flow == "debug" and probs.get("debug", 0.0) >= dbg_min else "standard"
+            JG.record_gate_event(
+                "gate3_inbox_go",
+                f"go_{chosen}",
+                rules_evaluated=["go_authorized"],
+                rules_triggered={"go_authorized": go_prob},
+            )
+            return chosen
         except JC.JevUnavailableError:
             return None
 
@@ -1026,7 +1043,11 @@ def save_state(state: Mapping[str, Any]) -> None:
 def watched_scripts(base_dir: Path | None = None) -> tuple[Path, ...]:
     root = base_dir or Path(__file__).resolve().parent
     return tuple(
-        root / name for name in ("gitlab-inbox.py", "find-scheduler.py", "proactive.py", "retrospect.py", "jev_client.py")
+        root / name
+        for name in (
+            "gitlab-inbox.py", "find-scheduler.py", "proactive.py",
+            "retrospect.py", "jev_client.py", "jev_gates.py",
+        )
     )
 
 

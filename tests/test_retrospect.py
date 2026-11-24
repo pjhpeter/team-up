@@ -1,6 +1,7 @@
 import importlib.util
 import json
 from datetime import datetime
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -211,6 +212,9 @@ class RetrospectTests(unittest.TestCase):
             json.dumps({"at": "2026-11-23 10:00:00", "kind": "answer"}) + "\n"
             + json.dumps({"at": "2026-11-23 11:00:00", "kind": "todo"}) + "\n"
         )
+        fixture_ts = ts_of(2026, 11, 23, 15, 0)
+        for fp in (tdir / "STATE.md", tdir / "reviews" / "rev1.md", tdir / "testing" / "r1" / "rec.mp4", tdir / "notes.jsonl"):
+            os.utime(fp, (fixture_ts, fixture_ts))
 
         self.files.feishu_events_log.write_text(
             "2026-11-23T11:00:00 created frontend/web-v1#501 from om_1 by pengjh\n"
@@ -243,9 +247,134 @@ class RetrospectTests(unittest.TestCase):
         self.assertEqual(digest["gitlab_inbox"]["log_summary"]["poll_timeouts"], 1)
         self.assertEqual(digest["gitlab_inbox"]["log_summary"]["prompt_rejected"], 1)
 
-    def test_inbox_watched_scripts_includes_retrospect(self) -> None:
+    def test_inbox_watched_scripts_includes_retrospect_and_jev_gates(self) -> None:
         names = [p.name for p in inbox_mod.watched_scripts()]
         self.assertIn("retrospect.py", names)
+        self.assertIn("jev_gates.py", names)
+
+    def test_execute_review_auto_evolves_jev_gates_locks_redlines_and_renders_report(self) -> None:
+        import shutil
+        shutil.copy2(Path(__file__).resolve().parents[1] / "jev-gates.json", self.root / "jev-gates.json")
+        self.files.feishu_state.write_text(json.dumps({"secretary": {"chat_id": "oc_sec_1"}}))
+
+        now = ts_of(2026, 11, 24, 12, 5)
+        since = ts_of(2026, 11, 20, 12, 0)
+        tdir = self.repo_dir / ".hwf" / "tmp" / "frontend-web-v1-520"
+        (tdir / "reviews").mkdir(parents=True)
+        rev_md = tdir / "reviews" / "r1.md"
+        rev_md.write_text("结论：需修改 — 新增硬编码 localhost:3000 调试地址未清理\n", encoding="utf-8")
+        fixture_ts = ts_of(2026, 11, 23, 16, 0)
+        os.utime(rev_md, (fixture_ts, fixture_ts))
+
+        model_payload = json.dumps(
+            {
+                "headline": "本周期关卡拦截稳定，已将重复出现的调试地址硬编码沉淀为关卡 4 自动检查项。",
+                "problem_plain": "开发提交代码时两次把本地 localhost 调试地址写死在前端生产配置里，到人工评审才打回。",
+                "solution_plain": "在审前铁律预检清单自动增加本地调试地址检查项，提审前直接提醒改掉。",
+                "why_plain": "省掉来回派评审员抓同类低级疏漏的时间。",
+                "items": [
+                    {
+                        "priority": "P2",
+                        "area": "Jev关卡",
+                        "title": "审前预检补齐调试地址硬编码检查",
+                        "symptom_and_evidence": "本周期任务 520 等 2 次评审均因硬编码 localhost 退回",
+                        "root_cause": "jev-gates.json 尚未收录硬编码 localhost 生产配置检查",
+                        "action": "已通过本轮 gate_updates 自动加入 gate4_semantic_lint 清单",
+                        "effort": "小",
+                    }
+                ],
+                "gate_updates": [
+                    {
+                        "op": "add_rule",
+                        "target": "gate4_semantic_lint",
+                        "rule_id": "hardcoded_localhost_prod",
+                        "threshold": 0.82,
+                        "evidence_count": 2,
+                        "title_zh": "生产代码硬编码 localhost 调试地址",
+                        "fix_hint_zh": "改读环境变量或运行时配置，不要在生产代码中写死 localhost/127.0.0.1。",
+                        "instructions_en": "Inspect added lines in production code (ignore tests/dev configs). Does it hardcode localhost or 127.0.0.1 as a production endpoint?",
+                        "true_en": "Hardcodes localhost/127.0.0.1 in production endpoint logic.",
+                        "false_en": "Uses config/env fallback or appears only in tests/local dev config.",
+                        "reason": "本周期 2 次代码评审因硬编码 localhost 调试地址打回",
+                    },
+                    {
+                        "op": "tune_threshold",
+                        "target": "thresholds",
+                        "rule_id": "proactive_same_as_min",
+                        "new_threshold": 0.78,
+                        "reason": "收紧飞书同话题归并阈值，减少相邻不同话题误并",
+                    },
+                    {
+                        "op": "retire_rule",
+                        "target": "gate4_semantic_lint",
+                        "rule_id": "feature_flag",
+                        "reason": "测试试图淘汰受保护红线规则",
+                    },
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+        feishu_msgs: list[str] = []
+        git_cmds: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            exe = Path(cmd[0]).name
+            if exe == "droid":
+                return subprocess.CompletedProcess(cmd, 0, stdout=model_payload, stderr="")
+            if exe == "lark-cli":
+                feishu_msgs.append(kwargs.get("input", ""))
+                return subprocess.CompletedProcess(cmd, 0, stdout='{"ok": true, "data": {"message_id": "om_2"}}', stderr="")
+            if exe == "git":
+                git_cmds.append(list(cmd))
+                if "diff" in cmd and "--cached" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+                if "rev-parse" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="a1b2c3d\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="")
+
+        retro = retro_mod.Retrospect(
+            self.cfg,
+            files=self.files,
+            run=fake_run,
+            now=lambda: now,
+            hwf_home=self.root,
+            send_ntfy_fn=lambda t, b: True,
+        )
+        res = retro.execute_review(
+            since,
+            now,
+            slot_id="2026-11-24-12:00",
+            notify=True,
+            verify_gates_fn=lambda _: (True, "ok"),
+        )
+
+        evo = res["gate_evolution"]
+        self.assertEqual(len(evo["applied"]), 2)
+        self.assertEqual(len(evo["rejected"]), 1)
+        self.assertEqual(evo["rejected"][0]["rule_id"], "feature_flag")
+        self.assertTrue(evo["git"]["committed"])
+        self.assertEqual(evo["git"]["sha"], "a1b2c3d")
+        self.assertTrue(any("push" in c and "origin" in c for c in git_cmds))
+        self.assertTrue(any("push" in c and "github" in c for c in git_cmds))
+
+        updated_cfg = json.loads((self.root / "jev-gates.json").read_text(encoding="utf-8"))
+        g4_ids = {r["rule_id"] for r in updated_cfg["gate4_semantic_lint"]}
+        self.assertIn("hardcoded_localhost_prod", g4_ids)
+        self.assertIn("feature_flag", g4_ids)
+        self.assertAlmostEqual(updated_cfg["thresholds"]["proactive_same_as_min"]["value"], 0.78)
+
+        self.assertEqual(len(feishu_msgs), 1)
+        self.assertIn("Jev 关卡本轮已自动更新并过单测", feishu_msgs[0])
+        self.assertIn("hardcoded_localhost_prod", feishu_msgs[0])
+
+        html_doc = self.files.latest_report.read_text(encoding="utf-8")
+        self.assertIn("Jev 关卡本轮自动演进记录", html_doc)
+        self.assertIn("hardcoded_localhost_prod", html_doc)
+        self.assertIn("护栏拦截", html_doc)
+        svg_part = html_doc.split("<svg", 1)[1].split("</svg>", 1)[0]
+        self.assertNotIn("#", svg_part.replace("url(#arrow)", ""))
 
 
 if __name__ == "__main__":

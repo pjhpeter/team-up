@@ -40,6 +40,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import jev_client as JC
+import jev_gates as JG
 
 MAX_WAIT_S, POLL_S, ERROR_GRACE_S, JEV_QUIET_S, QUIET_S, REPEAT_S = 600, 30, 300, 180, 900, 3600
 JEV_STALL_PROB_MIN = 0.80
@@ -152,8 +153,21 @@ def diagnose_quiet_with_jev(tail: str, client: Optional[JC.JevClient] = None) ->
         return "", ""
 
     prob = probs.get(selected, 0.0)
-    if prob < JEV_STALL_PROB_MIN or selected == "normal_running":
+    stall_min = JG.threshold_of("member_wait_stall_min", JEV_STALL_PROB_MIN)
+    if prob < stall_min or selected == "normal_running":
+        JG.record_gate_event(
+            "gate3_member_wait",
+            "normal",
+            rules_evaluated=["stall_kind"],
+            near_misses={selected: prob} if selected != "normal_running" and (stall_min - 0.15) <= prob < stall_min else None,
+        )
         return "normal", ""
+    JG.record_gate_event(
+        "gate3_member_wait",
+        selected,
+        rules_evaluated=["stall_kind"],
+        rules_triggered={selected: prob},
+    )
     if selected == "interactive_prompt":
         return "user_immediate", f"屏幕停在交互确认或输入提示（Jev 置信度 {prob:.0%}）"
     if selected == "auth_or_quota":

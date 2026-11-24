@@ -33,6 +33,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import jev_client as JC
+import jev_gates as JG
 
 ALLOWED_EXTENSIONS = frozenset({".mp4", ".webm", ".png", ".jpg", ".jpeg", ".webp", ".gif"})
 IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
@@ -124,10 +125,23 @@ def _extract_video_keyframe(video_path: Path, out_png: Path) -> bool:
     return False
 
 
-def inspect_media_with_jev(file: Path, alt: Optional[str], jev: Optional[JC.JevClient]) -> None:
-    """上传前用 Jev 视觉能力拦截纯白屏/崩溃废片与明文密码/密钥外泄；不可用或无法解码时优雅跳过。"""
+def inspect_media_with_jev(
+    file: Path,
+    alt: Optional[str],
+    jev: Optional[JC.JevClient],
+    *,
+    hwf_home: Path = JG.HWF_HOME,
+    state_dir: Optional[Path] = None,
+) -> None:
+    """上传前按 jev-gates.json 的 gate5_media_guard 规则库做视觉把关；不可用或无法解码时优雅跳过。"""
     if jev is None:
         return
+    rules = JG.active_rules("gate5_media_guard", hwf_home)
+    if not rules:
+        return
+    # 受保护红线规则优先判定，避免凭据泄露与白屏同时命中时只报白屏提示
+    rules.sort(key=lambda r: (not bool(r.get("protected")), str(r.get("rule_id"))))
+
     ext = file.suffix.lower()
     with tempfile.TemporaryDirectory(prefix="hwf-media-jev-") as tmp:
         if ext in IMAGE_EXTENSIONS:
@@ -141,51 +155,55 @@ def inspect_media_with_jev(file: Path, alt: Optional[str], jev: Optional[JC.JevC
 
         label = (alt or file.stem).strip()
         allow_error_screen = bool(INTENTIONAL_ERROR_ALT_RE.search(label))
+        questions = {
+            str(r["rule_id"]): JC.Noul(
+                instructions=str(r["instructions_en"]),
+                criteria={"true": str(r["true_en"]), "false": str(r["false_en"])},
+            )
+            for r in rules
+        }
         try:
             res = jev.decide(
                 state={"file_name": file.name, "evidence_caption": label},
                 images=[frame],
-                questions={
-                    "blank_or_crash": JC.Noul(
-                        instructions=(
-                            "Inspect the attached UI acceptance screenshot/video frame. "
-                            "Is it a completely blank/solid screen (all white/black) or an unrendered browser crash/connection-refused page "
-                            "(`ERR_CONNECTION_REFUSED`, `502 Bad Gateway`, `Cannot GET /`) with no usable app UI?"
-                        ),
-                        criteria={
-                            "true": "Pure blank/solid-color screen or browser/server crash page instead of real application UI.",
-                            "false": "Shows rendered application UI, terminal output, dialog, form, or meaningful test content.",
-                        },
-                    ),
-                    "credential_exposed": JC.Noul(
-                        instructions=(
-                            "Does the attached image visibly expose plaintext passwords, API secret keys, bearer tokens, "
-                            "private keys, or a credential list file (ignore masked dots `••••••`, normal usernames/emails, and public URLs)?"
-                        ),
-                        criteria={
-                            "true": "Plaintext password, API secret/token, private key, or credential sheet is readable on screen.",
-                            "false": "No plaintext secrets or passwords visible (masked password fields and normal UI data are safe).",
-                        },
-                    ),
-                },
+                questions=questions,
                 timeout_s=10.0,
             )
         except JC.JevUnavailableError:
             return
 
-        cred_prob = res.noul("credential_exposed")
-        if cred_prob >= JEV_CREDENTIAL_BLOCK_PROB:
-            raise MediaUploadError(
-                "evidence_guard",
-                f"检测到画面疑似暴露明文密码或密钥（置信度 {cred_prob:.0%}），已拒绝上传：{file.name}；请遮挡或避开凭据后重录",
+        eval_ids = [str(r["rule_id"]) for r in rules]
+        exempted: dict[str, float] = {}
+        near: dict[str, float] = {}
+        for r in rules:
+            rid = str(r["rule_id"])
+            prob = res.noul(rid)
+            cutoff = float(r.get("threshold", JEV_BLANK_BLOCK_PROB))
+            if prob < cutoff:
+                if prob >= cutoff - 0.15:
+                    near[rid] = prob
+                continue
+            if allow_error_screen and bool(r.get("allow_on_error_alt", False)):
+                exempted[rid] = prob
+                continue
+            JG.record_gate_event(
+                "gate5_media_guard",
+                "blocked",
+                rules_evaluated=eval_ids,
+                rules_triggered={rid: prob},
+                state_dir=state_dir,
             )
-        blank_prob = res.noul("blank_or_crash")
-        if not allow_error_screen and blank_prob >= JEV_BLANK_BLOCK_PROB:
-            raise MediaUploadError(
-                "evidence_guard",
-                f"检测到画面疑似纯空白页或未就绪崩溃页（置信度 {blank_prob:.0%}），已拒绝上传：{file.name}；"
-                "请确认页面渲染完成后重录（若本条专门验收报错/空态，请在 --alt 中注明「错误/空态」）",
-            )
+            msg = str(r["error_zh"]).format(prob=prob, file_name=file.name)
+            raise MediaUploadError("evidence_guard", msg)
+
+        JG.record_gate_event(
+            "gate5_media_guard",
+            "exempted" if exempted else "clean",
+            rules_evaluated=eval_ids,
+            rules_triggered=exempted or None,
+            near_misses=near or None,
+            state_dir=state_dir,
+        )
 
 
 class MediaUploader:

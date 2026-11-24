@@ -105,6 +105,7 @@ def _load(name: str, file: str) -> Any:
 _FS: Any = None
 _INTENT = _load("hwf_task_intent", "task_intent.py")
 _JC = _load("jev_client", "jev_client.py")
+_JG = _load("jev_gates", "jev_gates.py")
 
 JEV_RELAY_PROB_MIN = 0.80
 JEV_AUTH_NOW_MIN = 0.85
@@ -421,7 +422,17 @@ class Secretary:
                     )
                 },
             )
-            return res.noul("attention") >= JEV_QUIET_FORWARD_MIN
+            prob = res.noul("attention")
+            cutoff = _JG.threshold_of("secretary_quiet_attention_min", JEV_QUIET_FORWARD_MIN, self.home)
+            forward = prob >= cutoff
+            _JG.record_gate_event(
+                "gate2_quiet_filter",
+                "forward" if forward else "archive",
+                rules_evaluated=["attention"],
+                rules_triggered={"attention": prob} if forward else None,
+                near_misses={"attention": prob} if (cutoff - 0.12) <= prob < cutoff else None,
+            )
+            return forward
         except _JC.JevUnavailableError:
             return True
 
@@ -742,13 +753,39 @@ class Secretary:
         except _JC.JevUnavailableError:
             return None
 
-        if act != "relay" or act_probs.get("relay", 0.0) < JEV_RELAY_PROB_MIN:
+        relay_min = _JG.threshold_of("secretary_fast_relay_min", JEV_RELAY_PROB_MIN, self.home)
+        auth_min = _JG.threshold_of("secretary_auth_now_min", JEV_AUTH_NOW_MIN, self.home)
+        relay_prob = act_probs.get("relay", 0.0)
+        if act != "relay" or relay_prob < relay_min:
+            _JG.record_gate_event(
+                "gate2_secretary_relay",
+                "fallback_omp",
+                rules_evaluated=["fast_relay"],
+                near_misses={"fast_relay": relay_prob} if (relay_min - 0.15) <= relay_prob < relay_min else None,
+                meta={"action": act},
+            )
             return None
-        if not tgt.isdigit() or tgt_probs.get(tgt, 0.0) < JEV_RELAY_PROB_MIN:
+        tgt_prob = tgt_probs.get(tgt, 0.0)
+        if not tgt.isdigit() or tgt_prob < relay_min:
+            _JG.record_gate_event(
+                "gate2_secretary_relay",
+                "fallback_omp",
+                rules_evaluated=["fast_relay"],
+                near_misses={"target": tgt_prob} if tgt.isdigit() and (relay_min - 0.15) <= tgt_prob < relay_min else None,
+                meta={"action": "target_uncertain"},
+            )
             return None
-        if mode in ("deliver", "debug") and (auth_p < JEV_AUTH_NOW_MIN or mode_conf < 0.70):
+        if mode in ("deliver", "debug") and (auth_p < auth_min or mode_conf < 0.70):
             mode = "analyze"
-        return _INTENT.build_verified_relay_intent(text, int(tgt), mode, candidates, linked_issue, recent)
+        built = _INTENT.build_verified_relay_intent(text, int(tgt), mode, candidates, linked_issue, recent)
+        _JG.record_gate_event(
+            "gate2_secretary_relay",
+            "fast_relay" if built is not None else "rejected_by_validator",
+            rules_evaluated=["fast_relay"],
+            rules_triggered={"fast_relay": min(relay_prob, tgt_prob)} if built is not None else None,
+            meta={"mode": mode},
+        )
+        return built
 
     def ask_model(self, material: str) -> Optional[str]:
         self.intent_error = None

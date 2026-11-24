@@ -78,6 +78,7 @@ def _load(name: str, filename: str) -> Any:
 _WR = _load("wrapup", "wrapup.py")
 _FS = _WR._FS
 _JC = _load("jev_client", "jev_client.py")
+_JG = _load("jev_gates", "jev_gates.py")
 
 SECRET_TOKEN_RE = re.compile(
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
@@ -1107,41 +1108,34 @@ def note_content_guard_problems(
     *,
     kind: str,
     jev: Optional[Any] = None,
+    hwf_home: Path = _JG.HWF_HOME,
+    state_dir: Optional[Path] = None,
 ) -> list[str]:
-    """出门前拦截明文凭据外泄，并对发给用户的长评论核验是否满足『先说结论，再说细节』。"""
+    """出门前按确定性正则 + jev-gates.json 的 gate5_note_guard 规则库拦截明文凭据外泄与结论沉底。"""
     if SECRET_TOKEN_RE.search(body):
+        _JG.record_gate_event(
+            "gate5_note_guard", "regex_blocked", meta={"kind": kind}, state_dir=state_dir,
+        )
         return ["评论正文命中高危私钥/Token 格式（如 glpat-/sk-/PRIVATE KEY），已拦截发送；请脱敏后再发"]
-    if kind not in QUIET_NOTIFY_KINDS:
+
+    outer = _strip_folded_and_fences(body).strip()
+    rules = [
+        r
+        for r in _JG.active_rules("gate5_note_guard", hwf_home)
+        if kind in (r.get("kinds") or list(QUIET_NOTIFY_KINDS))
+        and len(outer) >= int(r.get("min_outer_chars") or 0)
+    ]
+    if not rules:
         return []
 
     client = jev if jev is not None else _JC.default_client()
-    outer = _strip_folded_and_fences(body).strip()
-    check_structure = len(outer) >= LONG_OUTER_NOTE_CHARS
-    questions: dict[str, Any] = {
-        "secret_exposed": _JC.Noul(
-            instructions=(
-                "Does this outgoing GitLab issue comment expose a real plaintext password, API secret key, "
-                "access token, session cookie, or private key? "
-                "(Ignore git commit SHAs, `/uploads/<hex>/...` URLs, issue/MR links, and normal usernames.)"
-            ),
-            criteria={
-                "true": "Contains a real plaintext password, API key/token, cookie, or private key.",
-                "false": "Safe engineering/product text, URLs, commit SHAs, or masked placeholders.",
-            },
-        ),
-    }
-    if check_structure:
-        questions["missing_top_conclusion"] = _JC.Noul(
-            instructions=(
-                "Read `visible_summary` (the outer comment text shown directly to a non-technical user before any `<details>` fold). "
-                "Does it bury the main conclusion or required user decision at the bottom after long chronological debugging/investigation logs, "
-                "instead of stating the conclusion or required action upfront in the opening 1-2 sentences?"
-            ),
-            criteria={
-                "true": "Starts with long step-by-step investigation/process logs and hides the conclusion or user action at the end.",
-                "false": "States the conclusion, answer, or required user action clearly right at the top (even if followed by structured tables/points).",
-            },
+    questions = {
+        str(r["rule_id"]): _JC.Noul(
+            instructions=str(r["instructions_en"]),
+            criteria={"true": str(r["true_en"]), "false": str(r["false_en"])},
         )
+        for r in rules
+    }
     try:
         res = client.decide(
             state={"comment_kind": kind, "visible_summary": outer[:4000], "full_body": body[:6000]},
@@ -1150,15 +1144,29 @@ def note_content_guard_problems(
     except _JC.JevUnavailableError:
         return []
 
+    eval_ids = [str(r["rule_id"]) for r in rules]
+    triggered: dict[str, float] = {}
+    near: dict[str, float] = {}
     problems: list[str] = []
-    sec_prob = res.noul("secret_exposed")
-    if sec_prob >= JEV_NOTE_SECRET_PROB:
-        problems.append(f"Jev 检测到评论疑似包含明文密码或敏感密钥（置信度 {sec_prob:.0%}），请移除凭据后再发")
-    if check_structure and res.noul("missing_top_conclusion") >= JEV_NOTE_CONCLUSION_PROB:
-        problems.append(
-            "长评论未按「先说结论，再说细节」开头亮出结果或待用户决定事项；"
-            "请把结论/待办提炼到前两句，将排查经过移入 `<details>` 折叠区后再发"
-        )
+    for r in rules:
+        rid = str(r["rule_id"])
+        prob = res.noul(rid)
+        cutoff = float(r.get("threshold", JEV_NOTE_CONCLUSION_PROB))
+        if prob >= cutoff:
+            triggered[rid] = prob
+            problems.append(str(r["error_zh"]).format(prob=prob))
+        elif prob >= cutoff - 0.15:
+            near[rid] = prob
+
+    _JG.record_gate_event(
+        "gate5_note_guard",
+        "blocked" if problems else "clean",
+        rules_evaluated=eval_ids,
+        rules_triggered=triggered or None,
+        near_misses=near or None,
+        meta={"kind": kind},
+        state_dir=state_dir,
+    )
     return problems
 
 

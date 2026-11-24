@@ -1,0 +1,279 @@
+{
+  "version": 1,
+  "updated_at": "2026-11-24T11:30:00+08:00",
+  "thresholds": {
+    "proactive_hit_min": {
+      "value": 0.2,
+      "min": 0.1,
+      "max": 0.45,
+      "protected": false,
+      "description": "关卡1：主动观察规则候选命中最低概率"
+    },
+    "proactive_same_as_min": {
+      "value": 0.75,
+      "min": 0.6,
+      "max": 0.92,
+      "protected": false,
+      "description": "关卡1：飞书观察群判定为旧事件延续的最低概率"
+    },
+    "secretary_fast_relay_min": {
+      "value": 0.8,
+      "min": 0.7,
+      "max": 0.95,
+      "protected": false,
+      "description": "关卡2：飞书秘书单任务直转最低概率"
+    },
+    "secretary_auth_now_min": {
+      "value": 0.85,
+      "min": 0.8,
+      "max": 0.96,
+      "protected": true,
+      "description": "关卡2：飞书秘书判定立即开工授权的最低概率（红线护栏）"
+    },
+    "secretary_quiet_attention_min": {
+      "value": 0.5,
+      "min": 0.35,
+      "max": 0.8,
+      "protected": false,
+      "description": "关卡2：免打扰下漏标评论判定需推飞书私聊的最低概率"
+    },
+    "inbox_natural_go_min": {
+      "value": 0.9,
+      "min": 0.85,
+      "max": 0.97,
+      "protected": true,
+      "description": "关卡3：对话模式识别自然语言开工指令最低概率（红线护栏）"
+    },
+    "inbox_debug_flow_min": {
+      "value": 0.8,
+      "min": 0.65,
+      "max": 0.95,
+      "protected": false,
+      "description": "关卡3：自然语言开工识别为 debug 模式的最低概率"
+    },
+    "member_wait_stall_min": {
+      "value": 0.8,
+      "min": 0.7,
+      "max": 0.95,
+      "protected": false,
+      "description": "关卡3：成员屏幕静默 3 分钟判定隐藏交互/断连/鉴权异常最低概率"
+    }
+  },
+  "gate4_semantic_lint": [
+    {
+      "rule_id": "feature_flag",
+      "enabled": true,
+      "protected": true,
+      "severity": "critical",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "新增未授权灰度或功能开关",
+      "fix_hint_zh": "删除灰度/开关分支，默认直接按最终行为全量实现（除非需求明确授权兼容开关）。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in production code/config of this git diff (ignore `-` lines and unit tests). Does the diff introduce a feature flag, gray-release toggle, A/B experiment switch, or config/env toggle to gate new behavior?",
+      "true_en": "Adds a feature flag, rollout percentage, gray switch, or env/config toggle gating old vs new behavior.",
+      "false_en": "Direct implementation, normal business config, error fallback on missing external service, or test-only code."
+    },
+    {
+      "rule_id": "secret_exposed",
+      "enabled": true,
+      "protected": true,
+      "severity": "critical",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "硬编码真实密钥或凭据",
+      "fix_hint_zh": "立即移除硬编码密钥/密码/私钥，改从 macOS Keychain 或本机忽略配置读取，并轮换已暴露凭据。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in non-test files of this git diff. Does the diff hardcode a real API key, secret token, private key PEM block, or plaintext password/credential?",
+      "true_en": "Contains a real-looking secret key, bearer token, private key, or hardcoded account password in non-test files.",
+      "false_en": "Reads secrets from Keychain/env/config files, uses obvious dummy placeholders in tests (e.g. 'test-key'), or has no secrets."
+    },
+    {
+      "rule_id": "remote_exec",
+      "enabled": true,
+      "protected": true,
+      "severity": "critical",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "在远程服务器执行命令",
+      "fix_hint_zh": "移除 ssh/scp/rsync 远端命令或 kubectl exec / 远端 docker 调用，改走 CI/CD 或把命令交用户执行。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in executable code/scripts of this git diff (ignore documentation/prose rules and tests). Does the code execute commands on a remote server via `ssh`, `scp`, `rsync`, `kubectl exec`, remote `docker -H`, or cloud run-command APIs?",
+      "true_en": "Added production script/code invokes ssh, scp, rsync to remote host, kubectl exec, or remote command execution.",
+      "false_en": "Local commands, git/glab/curl/HTTPS API calls, CI config, or lint/rule definitions merely mentioning ssh."
+    },
+    {
+      "rule_id": "main_automerge",
+      "enabled": true,
+      "protected": true,
+      "severity": "critical",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "对 main 分支开启自动合并",
+      "fix_hint_zh": "禁止对 main 目标分支设置 auto_merge / merge_when_pipeline_succeeds / glab mr merge --auto。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in code/scripts of this git diff (ignore lint rules and tests). Does the code enable auto-merge (`auto_merge=true`, `merge_when_pipeline_succeeds`, `glab mr merge --auto`) targeting `main`?",
+      "true_en": "Enables automatic merge or merge-when-pipeline-succeeds on a merge request targeting main.",
+      "false_en": "Manual/immediate merge after checks, MRs targeting non-main branches, or rule text forbidding auto-merge."
+    },
+    {
+      "rule_id": "non_english_runtime_log",
+      "enabled": true,
+      "protected": false,
+      "severity": "advisory",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "开发者运行日志使用了非英文",
+      "fix_hint_zh": "将 console.*/logger.*/logging.*/log(...) 等开发者运行日志改为英文；面向用户的文案、评论和报错保持中文。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in production code of this git diff (ignore tests, comments, docstrings, UI strings, issue/chat messages, and user-facing CLI errors). Does production code emit Chinese text inside developer runtime logging calls (`log(...)`, `logger.*`, `logging.*`, `console.log/warn/error`)?",
+      "true_en": "Added developer runtime log statements output Chinese characters.",
+      "false_en": "Runtime logs are in English, or Chinese text only appears in comments, UI text, user-facing messages/errors, or tests."
+    },
+    {
+      "rule_id": "root_test_artifacts",
+      "enabled": true,
+      "protected": false,
+      "severity": "advisory",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "在仓库根目录落盘临时测试截图或录屏",
+      "fix_hint_zh": "改写到 tempfile 临时目录或受控任务目录，不在仓库根目录遗留 .png/.mp4 调试文件。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in this git diff. Does code or a test write temporary screenshots, videos, or debug dumps directly into the repository root directory?",
+      "true_en": "Writes `.png`, `.jpg`, `.mp4`, `.mov`, or debug dump files directly to repo root relative paths.",
+      "false_en": "Uses tempfile/tmp directories, dedicated state/artifact folders, or writes no root artifacts."
+    },
+    {
+      "rule_id": "weakened_tests",
+      "enabled": true,
+      "protected": false,
+      "severity": "advisory",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "删改或跳过既有测试断言以求过测",
+      "fix_hint_zh": "核对是否未经批准删除回归断言、添加 skip 或放宽通过标准。",
+      "instructions_en": "Inspect test file changes in this git diff. Does the diff delete existing regression assertions, mark existing tests as skipped (`.skip`, `@unittest.skip`), or weaken expected thresholds just to make failing tests pass?",
+      "true_en": "Skips existing tests, deletes meaningful assertions without replacement, or loosens assertions to hide a bug.",
+      "false_en": "Adds new tests, updates fixtures to match an intentional spec change, or leaves existing assertions intact."
+    },
+    {
+      "rule_id": "filler_comments",
+      "enabled": true,
+      "protected": false,
+      "severity": "advisory",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "新增冗长废话注释或英文代码注释",
+      "fix_hint_zh": "代码注释统一用精炼中文短句，只写原因、边界与风险，删掉复述代码字面动作的空话注释。",
+      "instructions_en": "Inspect ONLY newly added `+` code comments in production files of this git diff (ignore Jev English prompt strings). Does the diff add verbose tutorial-style comments, restate obvious code mechanics ('increment i', 'initialize variable'), or write code comments in English instead of concise Chinese?",
+      "true_en": "Adds English code comments or long filler comments that merely restate what the next line obviously does.",
+      "false_en": "Uses concise Chinese comments explaining non-obvious why/constraints, or has self-explanatory code without filler comments."
+    },
+    {
+      "rule_id": "legacy_upload_url",
+      "enabled": true,
+      "protected": false,
+      "severity": "advisory",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "手拼旧版 GitLab 上传附件路径",
+      "fix_hint_zh": "使用 upload-media.py 返回的 markdown（/uploads/...）与 web_url（/-/project/<id>/uploads/...），禁止手拼 /<ns>/<proj>/uploads/。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in code/scripts of this git diff (ignore warning docs and tests). Does the code manually construct GitLab attachment URLs using `/<namespace>/<project>/uploads/...` instead of `/-/project/<id>/uploads/...`?",
+      "true_en": "Manually constructs `<host>/<namespace>/<project>/uploads/...` URLs that 404 on GitLab.",
+      "false_en": "Uses `/-/project/<id>/uploads/...`, relative `/uploads/...`, `upload-media.py`, or unrelated URLs."
+    },
+    {
+      "rule_id": "bypass_task_record",
+      "enabled": true,
+      "protected": false,
+      "severity": "advisory",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "绕过 task-record.py 直接裸发 GitLab 评论",
+      "fix_hint_zh": "任务进度、待办与交付评论统一经 scripts/task-record.py note 发送，保证免打扰与状态同步。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in workflow/helper scripts of this git diff (excluding `task-record.py`, `gitlab-inbox.py`, and tests). Does new code invoke `glab issue note` or POST directly to GitLab `/issues/<iid>/notes` bypassing `task-record.py`?",
+      "true_en": "Added code outside task-record.py/gitlab-inbox.py posts issue comments directly via glab/API.",
+      "false_en": "Uses task-record.py, modifies task-record.py/gitlab-inbox.py itself, or does not post GitLab issue comments."
+    },
+    {
+      "rule_id": "silent_exception_swallow",
+      "enabled": true,
+      "protected": false,
+      "severity": "advisory",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "在主路径静默吞掉未知异常",
+      "fix_hint_zh": "收窄捕获的异常类型，补充降级日志或显式错误返回，避免空 except/catch 掩盖故障。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in production code of this git diff. Does the code catch broad `Exception` / bare `except:` / empty `catch {}` on a core business path and silently ignore it without logging, fallback explanation, or re-raising?",
+      "true_en": "Broad bare catch/except silently swallows unexpected runtime bugs on a core path with no rationale.",
+      "false_en": "Catches specific expected errors (e.g. JevUnavailableError, OSError on optional cache), logs/degrades intentionally, or propagates errors."
+    },
+    {
+      "rule_id": "degraded_browser_acceptance",
+      "enabled": true,
+      "protected": false,
+      "severity": "advisory",
+      "threshold": 0.8,
+      "created_at": "2026-11-24",
+      "title_zh": "将真实窗口验收降级为无头模拟或纯静态截图",
+      "fix_hint_zh": "前端/Electron 真机验收必须保留真实窗口操作与 .mp4 过程录屏，不用 jsdom 或静态截图顶替。",
+      "instructions_en": "Inspect ONLY newly added `+` lines in frontend acceptance or workflow files of this git diff. Does the diff replace required real-browser/Electron video acceptance with jsdom, curl/static HTML scraping, or screenshot-only checks?",
+      "true_en": "Substitutes real browser/Electron video acceptance with jsdom, headless scraping, or static screenshots.",
+      "false_en": "Normal unit tests, backend scripts, or preserves real-browser/Electron `.mp4` acceptance."
+    }
+  ],
+  "gate5_media_guard": [
+    {
+      "rule_id": "credential_exposed",
+      "enabled": true,
+      "protected": true,
+      "threshold": 0.75,
+      "allow_on_error_alt": false,
+      "created_at": "2026-11-24",
+      "title_zh": "画面暴露明文密码或密钥",
+      "error_zh": "检测到画面疑似暴露明文密码或密钥（置信度 {prob:.0%}），已拒绝上传：{file_name}；请遮挡或避开凭据后重录",
+      "instructions_en": "Does the attached image visibly expose plaintext passwords, API secret keys, bearer tokens, private keys, or a credential list file (ignore masked dots `••••••`, normal usernames/emails, and public URLs)?",
+      "true_en": "Plaintext password, API secret/token, private key, or credential sheet is readable on screen.",
+      "false_en": "No plaintext secrets or passwords visible (masked password fields and normal UI data are safe)."
+    },
+    {
+      "rule_id": "blank_or_crash",
+      "enabled": true,
+      "protected": false,
+      "threshold": 0.88,
+      "allow_on_error_alt": true,
+      "created_at": "2026-11-24",
+      "title_zh": "画面为纯空白页或未就绪崩溃页",
+      "error_zh": "检测到画面疑似纯空白页或未就绪崩溃页（置信度 {prob:.0%}），已拒绝上传：{file_name}；请确认页面渲染完成后重录（若本条专门验收报错/空态，请在 --alt 中注明「错误/空态」）",
+      "instructions_en": "Inspect the attached UI acceptance screenshot/video frame. Is it a completely blank/solid screen (all white/black) or an unrendered browser crash/connection-refused page (`ERR_CONNECTION_REFUSED`, `502 Bad Gateway`, `Cannot GET /`) with no usable app UI?",
+      "true_en": "Pure blank/solid-color screen or browser/server crash page instead of real application UI.",
+      "false_en": "Shows rendered application UI, terminal output, dialog, form, or meaningful test content."
+    }
+  ],
+  "gate5_note_guard": [
+    {
+      "rule_id": "secret_exposed",
+      "enabled": true,
+      "protected": true,
+      "threshold": 0.75,
+      "min_outer_chars": 0,
+      "kinds": ["todo", "risk", "answer", "delivery-done"],
+      "created_at": "2026-11-24",
+      "title_zh": "评论正文暴露明文密码或密钥",
+      "error_zh": "Jev 检测到评论疑似包含明文密码或敏感密钥（置信度 {prob:.0%}），请移除凭据后再发",
+      "instructions_en": "Does this outgoing GitLab issue comment expose a real plaintext password, API secret key, access token, session cookie, or private key? (Ignore git commit SHAs, `/uploads/<hex>/...` URLs, issue/MR links, and normal usernames.)",
+      "true_en": "Contains a real plaintext password, API key/token, cookie, or private key.",
+      "false_en": "Safe engineering/product text, URLs, commit SHAs, or masked placeholders."
+    },
+    {
+      "rule_id": "missing_top_conclusion",
+      "enabled": true,
+      "protected": false,
+      "threshold": 0.85,
+      "min_outer_chars": 350,
+      "kinds": ["todo", "risk", "answer", "delivery-done"],
+      "created_at": "2026-11-24",
+      "title_zh": "长评论未在开头亮出结论或待办",
+      "error_zh": "长评论未按「先说结论，再说细节」开头亮出结果或待用户决定事项；请把结论/待办提炼到前两句，将排查经过移入 `<details>` 折叠区后再发",
+      "instructions_en": "Read `visible_summary` (the outer comment text shown directly to a non-technical user before any `<details>` fold). Does it bury the main conclusion or required user decision at the bottom after long chronological debugging/investigation logs, instead of stating the conclusion or required action upfront in the opening 1-2 sentences?",
+      "true_en": "Starts with long step-by-step investigation/process logs and hides the conclusion or user action at the end.",
+      "false_en": "States the conclusion, answer, or required user action clearly right at the top (even if followed by structured tables/points)."
+    }
+  ],
+  "retired_rules": []
+}

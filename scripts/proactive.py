@@ -43,6 +43,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import jev_client as JC
+import jev_gates as JG
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 RULES_PATH = HWF_HOME / "proactive-rules.md"
@@ -249,7 +250,9 @@ class Scout:
     def __init__(self, config: Mapping[str, Any], *, files: Optional[Files] = None, run: Runner = subprocess.run,
                  now: Callable[[], float] = time.time, rules_path: Path = RULES_PATH,
                  jev: Optional[JC.JevClient] = None) -> None:
-        self.cfg = {**DEFAULTS, **dict(config.get("proactive") or {})}
+        proactive_overrides = dict(config.get("proactive") or {})
+        self._explicit_proactive_keys = set(proactive_overrides)
+        self.cfg = {**DEFAULTS, **proactive_overrides}
         self.host: str = config["host"]
         projects = config.get("projects") or []
         self.projects: list[str] = list(projects) if not isinstance(projects, dict) else list(projects.keys())
@@ -562,8 +565,25 @@ class Scout:
             log(f"jev prescreen unavailable for {event['key']}, falling back to omp: {exc}")
             return None, 0
 
-        threshold = float(self.cfg["jev_hit_threshold"])
+        threshold = (
+            float(self.cfg["jev_hit_threshold"])
+            if "jev_hit_threshold" in self._explicit_proactive_keys
+            else JG.threshold_of("proactive_hit_min", float(self.cfg["jev_hit_threshold"]))
+        )
+        same_as_min = (
+            float(self.cfg["jev_same_as_prob"])
+            if "jev_same_as_prob" in self._explicit_proactive_keys
+            else JG.threshold_of("proactive_same_as_min", float(self.cfg["jev_same_as_prob"]))
+        )
+        eval_ids = [r["id"] for r in rules]
+        trig = {rid: p for rid, p in probs.items() if p >= threshold}
+        near = {rid: p for rid, p in probs.items() if (threshold - 0.08) <= p < threshold}
+
         if all(p < threshold for p in probs.values()):
+            JG.record_gate_event(
+                "gate1_proactive", "filtered_ignore",
+                rules_evaluated=eval_ids, near_misses=near, meta={"kind": event["kind"]},
+            )
             return {
                 "verdict": "ignore",
                 "rules": [
@@ -575,9 +595,14 @@ class Scout:
                 "same_as": "",
             }, res.input_tokens
 
-        if same_selected != "none" and same_prob >= float(self.cfg["jev_same_as_prob"]):
+        if same_selected != "none" and same_prob >= same_as_min:
             matched = next((rec for rec in prior_records if rec["id"] == same_selected), None)
             if matched is not None:
+                JG.record_gate_event(
+                    "gate1_proactive", "same_as",
+                    rules_evaluated=eval_ids, rules_triggered=trig,
+                    meta={"kind": event["kind"], "same_prob": round(same_prob, 4)},
+                )
                 return {
                     "verdict": "would_accept",
                     "rules": [
@@ -593,6 +618,10 @@ class Scout:
                     "same_as": same_selected,
                 }, res.input_tokens
 
+        JG.record_gate_event(
+            "gate1_proactive", "escalate_omp",
+            rules_evaluated=eval_ids, rules_triggered=trig, near_misses=near, meta={"kind": event["kind"]},
+        )
         return None, res.input_tokens
 
     def ask_model(self, prompt: str, images: Sequence[str] = ()) -> str:

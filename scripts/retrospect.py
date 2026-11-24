@@ -29,6 +29,11 @@ from urllib.parse import quote
 import urllib.request
 import webbrowser
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import jev_gates as JG
+
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 INBOX_CONFIG_PATH = HWF_HOME / "gitlab-inbox.config.json"
 INBOX_LOCAL_PATH = HWF_HOME / "gitlab-inbox.local.json"
@@ -49,7 +54,11 @@ DEFAULTS: dict[str, Any] = {
     "retry_backoff_s": 900,
     "ntfy_topic": "pjh-herdr-task",
     "feishu_notify": True,
+    "auto_evolve_gates": True,
+    "git_sync_gates": True,
 }
+
+BOUNCE_HINT_RE = re.compile(r"需修改|阻断|不通过|打回|退回|失败|违规|漏|critical|advisory", re.I)
 
 LOG_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2})")
 CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.I)
@@ -205,12 +214,31 @@ def _parse_state_top(state_md: str) -> dict[str, str]:
     return info
 
 
+def _extract_bounce_lines(md_path: Path, prefix: str, limit: int = 3) -> list[str]:
+    """抽取评审或测试报告里命中的打回/问题摘要行，供周期复盘归纳新增 Gate ④/⑤ 规则而免去逐个翻文件。"""
+    try:
+        raw = md_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    hits: list[str] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s or len(s) < 6 or s.startswith("<!--"):
+            continue
+        if BOUNCE_HINT_RE.search(s):
+            hits.append(f"{prefix}: {s[:200]}")
+            if len(hits) >= limit:
+                break
+    return hits
+
+
 def _collect_task_dir(task_dir: Path, since_ts: float, now_ts: float) -> Optional[dict[str, Any]]:
     hour_buckets: set[str] = set()
     mtimes_in_window: list[float] = []
     reviews_in_win = 0
     testing_rounds: set[str] = set()
     dev_files_in_win = 0
+    bounce_samples: list[str] = []
 
     for root, _, filenames in os.walk(task_dir):
         rel_root = Path(root).relative_to(task_dir)
@@ -228,11 +256,15 @@ def _collect_task_dir(task_dir: Path, since_ts: float, now_ts: float) -> Optiona
                 hour_buckets.add(datetime.fromtimestamp(mt).strftime("%Y-%m-%d %H"))
                 if parts and parts[0] == "reviews":
                     reviews_in_win += 1
+                    if fp.suffix.lower() == ".md" and len(bounce_samples) < 4:
+                        bounce_samples.extend(_extract_bounce_lines(fp, f"{task_dir.name}/reviews/{fn}", 2))
                 elif parts and parts[0] == "testing":
                     if len(parts) >= 2:
                         testing_rounds.add(parts[1])
                     else:
                         testing_rounds.add(fn)
+                    if fp.suffix.lower() == ".md" and len(bounce_samples) < 4:
+                        bounce_samples.extend(_extract_bounce_lines(fp, f"{task_dir.name}/testing/{fn}", 2))
                 elif parts and parts[0] == "development":
                     dev_files_in_win += 1
 
@@ -280,6 +312,7 @@ def _collect_task_dir(task_dir: Path, since_ts: float, now_ts: float) -> Optiona
         "reviews_touched": reviews_in_win,
         "testing_rounds_touched": len(testing_rounds),
         "dev_artifacts_touched": dev_files_in_win,
+        "bounce_samples": bounce_samples[:4],
     }
 
 
@@ -720,6 +753,12 @@ def collect_digest(
     )
     omp_sessions = _collect_omp_sessions(omp_dir, since_ts)
     hygiene = _collect_pane_and_worktree_hygiene(files, run, wt_dir, omp_dir)
+    jev_summary = JG.summarize_gate_telemetry(files.dir, hwf_home, since_ts, now_ts)
+    review_bounce_samples = [
+        line
+        for t in active_tasks
+        for line in (t.get("bounce_samples") or [])
+    ][:15]
 
     return {
         "window": {
@@ -733,12 +772,14 @@ def collect_digest(
         "delivery": {
             "active_tasks_count": len(active_tasks),
             "active_tasks": active_tasks,
+            "review_test_bounce_samples": review_bounce_samples,
             "gitlab_issues_checked": gitlab_issues,
             "scheduler_omp_sessions": omp_sessions,
             "watch_guard_events_count": len(watch_guard_lines),
             "watch_guard_samples": watch_guard_lines[-10:],
             "hygiene": hygiene,
         },
+        "jev_gates": jev_summary,
         "feishu_bridge": {
             "log_summary": _summarize_feishu_logs(feishu_lines),
             "secretary_chat_ready": bool(sec_state.get("chat_id")),
@@ -767,7 +808,7 @@ def collect_digest(
 
 # ---------- Droid (gemini-4-carbon, high) 深度分析 ----------
 
-ANALYSIS_PROMPT_TEMPLATE = """你是研发交付体系的周期复盘架构师。请阅读当前目录下的 `digest-input.json`（周期：{since_label} 至 {until_label}），对「交付流程」「飞书桥（含秘书）」「收件箱（含主动接活）」三块过程历史数据做深度体检，找出真正值得改的优化点。
+ANALYSIS_PROMPT_TEMPLATE = """你是研发交付体系的周期复盘架构师。请阅读当前目录下的 `digest-input.json`（周期：{since_label} 至 {until_label}），对「交付流程」「飞书桥（含秘书）」「收件箱（含主动接活）」「Jev关卡（`jev_gates`）」四块过程历史数据做深度体检，找出真正值得改的优化点，并在数据达标时给出可自动生效的 `gate_updates` 关卡演进指令。
 
 硬性工具预算（必须严格遵守，防止超时）：
 - 整个会话**最多只允许调用 3 次 `Script`**（总文件读取不超过 10 个片段），必须在 3 分钟内收口输出最终 JSON！
@@ -780,7 +821,12 @@ ANALYSIS_PROMPT_TEMPLATE = """你是研发交付体系的周期复盘架构师�
 2. 每条优化点必须有本周期真实数字、issue 编号、日志样本或具体代码行号/条款位置支撑；没有把握的猜测不写。若本周期整体平稳无实质问题，`items` 允许为空数组 `[]`。
 3. 精选最有价值的 0～7 条，按优先级 `P1`（高频报错/漏报/明显拖慢交付）→ `P2`（中等摩擦/资源残留）→ `P3`（顺手改进）排序。
 4. 所有文字必须说通俗大白话（普通人一眼能懂，不堆砌黑话）：说清发生了什么、为什么卡或报错、具体改哪个文件/哪条规则怎么改、改完有什么好处。
-5. 严禁修改任何文件、严禁调用 TodoWrite；最终回复只输出一个合法 JSON 对象，不要包含任何额外解释文字。
+5. Jev 关卡受保护自动演进规则（写入顶层 `gate_updates`，由外层引擎核验单测后自动落盘 `jev-gates.json`；数据不足时填 `[]`）：
+   - **安全铁锁**：严禁淘汰任何 `protected: true` 的规则，严禁调松 `protected: true` 的授权/安全门槛！
+   - `tune_threshold`：仅当 `jev_gates.window_by_gate` 擦边 `near_miss_counts` 或 `proactive_marks_in_window`（`wrong` 误报 / `should` 漏报）有明确量化证据时微调（单步 0.02～0.08）：`{{"op": "tune_threshold", "target": "thresholds"|"gate4_semantic_lint"|"gate5_media_guard"|"gate5_note_guard", "rule_id": "<阈值名或rule_id>", "new_threshold": 0.84, "reason": "大白话数据理由"}}`。
+   - `add_rule`：仅当 `delivery.review_test_bounce_samples` 或本周期任务记录中**同类低级违规重复出现 ≥2 次（`evidence_count >= 2`）**、且 `jev_gates.rules_30d` 尚未覆盖、且不在 `recent_retired_rule_ids` 内时新增（每轮最多 2 条，阈值 0.78～0.88，英文判定词必须精准区分正反例）：`{{"op": "add_rule", "target": "gate4_semantic_lint"|"gate5_media_guard"|"gate5_note_guard", "rule_id": "snake_case_id", "threshold": 0.82, "evidence_count": 2, "title_zh": "...", "fix_hint_zh": "gate4必填", "error_zh": "gate5必填(可用{{prob:.0%}}/{{file_name}})", "instructions_en": "...", "true_en": "...", "false_en": "...", "reason": "具体哪2次评审/验收踩坑"}}`。
+   - `retire_rule`：仅对 `protected: false` 规则，且满足以下任一客观标准时淘汰：(a) `jev_gates.retirement_candidates` 已列出（满 30 天、评估 ≥30 次且 0 命中）；(b) 30 天评估 ≥10 次且豁免占比 ≥50%；(c) 上线满 14 天且已被确定性脚本完全替代（填 `"superseded_by_script": "scripts/xxx.py"`）：`{{"op": "retire_rule", "target": "gate4_semantic_lint"|..., "rule_id": "...", "superseded_by_script": "", "reason": "大白话淘汰依据"}}`。
+6. 严禁修改任何文件、严禁调用 TodoWrite；最终回复只输出一个合法 JSON 对象，不要包含任何额外解释文字。
 
 JSON 结构要求：
 {{
@@ -798,9 +844,10 @@ JSON 结构要求：
       "action": "具体可执行改法（改哪里、怎么改、预期效果）",
       "effort": "小"
     }}
-  ]
+  ],
+  "gate_updates": []
 }}
-其中 `priority` 只能是 `"P1"` / `"P2"` / `"P3"`，`area` 只能是 `"交付流程"` / `"飞书桥"` / `"收件箱"`，`effort` 只能是 `"小"` / `"中"` / `"大"`。
+其中 `priority` 只能是 `"P1"` / `"P2"` / `"P3"`，`area` 只能是 `"交付流程"` / `"飞书桥"` / `"收件箱"` / `"Jev关卡"`，`effort` 只能是 `"小"` / `"中"` / `"大"`。
 """
 
 
@@ -827,7 +874,7 @@ def parse_analysis_json(raw_output: str) -> dict[str, Any]:
     if not isinstance(raw_items, list):
         raise RetrospectError("模型结果 items 必须是数组")
 
-    valid_areas = {"交付流程", "飞书桥", "收件箱"}
+    valid_areas = {"交付流程", "飞书桥", "收件箱", "Jev关卡"}
     valid_prios = {"P1", "P2", "P3"}
     valid_efforts = {"小", "中", "大"}
     cleaned: list[dict[str, str]] = []
@@ -861,29 +908,57 @@ def parse_analysis_json(raw_output: str) -> dict[str, Any]:
 
     prio_rank = {"P1": 0, "P2": 1, "P3": 2}
     cleaned.sort(key=lambda x: prio_rank.get(x["priority"], 9))
+    raw_gate_updates = data.get("gate_updates")
+    gate_updates = [dict(u) for u in raw_gate_updates[:8] if isinstance(u, Mapping)] if isinstance(raw_gate_updates, list) else []
     return {
         "headline": str(data["headline"]).strip(),
         "problem_plain": str(data["problem_plain"]).strip(),
         "solution_plain": str(data["solution_plain"]).strip(),
         "why_plain": str(data["why_plain"]).strip(),
         "items": cleaned,
+        "gate_updates": gate_updates,
     }
 
 
 # ---------- HTML 单文件报告与飞书/ntfy 格式化 ----------
 
-def render_html_report(digest: Mapping[str, Any], analysis: Mapping[str, Any], generated_at: float) -> str:
+GATE_TABLE_LABELS = {
+    "gate4_semantic_lint": "关卡4 审前铁律预检",
+    "gate5_media_guard": "关卡5 录屏与截图把关",
+    "gate5_note_guard": "关卡5 评论出门把关",
+}
+
+
+def render_html_report(
+    digest: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    generated_at: float,
+    *,
+    gate_evolution: Optional[Mapping[str, Any]] = None,
+) -> str:
     e = html.escape
     win = digest["window"]
     items: Sequence[Mapping[str, str]] = analysis["items"]
+    evo = gate_evolution or {"applied": [], "rejected": []}
+    applied_list = list(evo.get("applied") or [])
+    rejected_list = list(evo.get("rejected") or [])
 
-    area_counts = {"飞书桥": 0, "收件箱": 0, "交付流程": 0}
+    area_counts = {"飞书桥": 0, "收件箱": 0, "交付流程": 0, "Jev关卡": 0}
     for it in items:
         area_counts[it["area"]] = area_counts.get(it["area"], 0) + 1
 
     def node_status(area: str) -> str:
         cnt = area_counts.get(area, 0)
         return f"待优化 {cnt} 项" if cnt else "运行平稳"
+
+    jev_data = digest.get("jev_gates") or {}
+    win_gates = jev_data.get("window_by_gate") or {}
+    total_jev_calls = sum(int(v.get("total") or 0) for v in win_gates.values() if isinstance(v, Mapping))
+    jev_status_text = (
+        f"本轮已自动更新 {len(applied_list)} 项规则"
+        if applied_list
+        else (f"待优化 {area_counts['Jev关卡']} 项" if area_counts["Jev关卡"] else f"本周期把关 {total_jev_calls} 次 · 运行平稳")
+    )
 
     if items:
         item_rows = "".join(
@@ -899,6 +974,54 @@ def render_html_report(digest: Mapping[str, Any], analysis: Mapping[str, Any], g
         )
     else:
         item_rows = "<tr><td colspan='6' class='empty'>本周期各项运行平稳，未发现需要折腾的新优化点。</td></tr>"
+
+    evo_rows_parts: list[str] = []
+    git_meta = evo.get("git") or {}
+    git_badge = f"（已提交 {e(str(git_meta.get('sha') or ''))}）" if git_meta.get("committed") else ""
+    for a in applied_list:
+        evo_rows_parts.append(
+            f"<tr>"
+            f"<td><span class='tag p-p3'>已自动生效</span></td>"
+            f"<td><code>{e(str(a.get('op') or ''))}</code></td>"
+            f"<td><b>{e(str(a.get('summary') or ''))}</b>{git_badge}</td>"
+            f"<td>{e(str(a.get('reason') or '—'))}</td>"
+            f"</tr>"
+        )
+    for r in rejected_list:
+        target_name = f"{r.get('target', '')}.{r.get('rule_id') or r.get('key') or ''}".strip(".")
+        evo_rows_parts.append(
+            f"<tr>"
+            f"<td><span class='tag p-p2'>护栏拦截</span></td>"
+            f"<td><code>{e(str(r.get('op') or ''))}</code></td>"
+            f"<td><code>{e(target_name or '—')}</code></td>"
+            f"<td>{e(str(r.get('reason') or ''))}</td>"
+            f"</tr>"
+        )
+    gate_evo_rows = "".join(evo_rows_parts) or (
+        "<tr><td colspan='4' class='empty'>本周期关卡参数与规则清单稳定，无自动新增、调优或淘汰动作。</td></tr>"
+    )
+
+    rules_30d = jev_data.get("rules_30d") or {}
+    rule_health_parts: list[str] = []
+    for table_key, table_label in GATE_TABLE_LABELS.items():
+        for st in rules_30d.get(table_key) or []:
+            if st.get("protected"):
+                badge = "<span class='tag p-p1'>红线锁死</span>"
+            elif st.get("retirement_eligible"):
+                badge = "<span class='tag p-p2'>零命中待淘汰</span>"
+            else:
+                badge = "<span class='tag'>常规运行</span>"
+            rule_health_parts.append(
+                f"<tr>"
+                f"<td>{e(table_label)}</td>"
+                f"<td><code>{e(str(st.get('rule_id')))}</code> · {e(str(st.get('title_zh')))}</td>"
+                f"<td>{badge}</td>"
+                f"<td>{st.get('threshold')}</td>"
+                f"<td>{st.get('evals_30d', 0)} 次</td>"
+                f"<td>拦截 {st.get('hits_30d', 0)} · 豁免 {st.get('exempts_30d', 0)} · 擦边 {st.get('near_misses_30d', 0)}</td>"
+                f"</tr>"
+            )
+    gate_rule_rows = "".join(rule_health_parts) or "<tr><td colspan='6' class='empty'>暂无规则清单数据</td></tr>"
 
     tasks = digest["delivery"]["active_tasks"]
     task_rows = "".join(
@@ -919,6 +1042,11 @@ def render_html_report(digest: Mapping[str, Any], analysis: Mapping[str, Any], g
     inblog = inb["log_summary"]
     hyg = digest["delivery"]["hygiene"]
 
+    jev_win_brief = " · ".join(
+        f"{g}: {info.get('total', 0)}({json.dumps(info.get('outcomes', {}), ensure_ascii=False)})"
+        for g, info in sorted(win_gates.items())
+    ) or "本周期尚无新触发记录"
+
     sys_rows = "".join([
         f"<tr><td>飞书桥与秘书</td>"
         f"<td>建单 {fblog['created_issues']} · 关联 {fblog['bound_issues']} · 绑定话题 {fb['active_threads_count']}</td>"
@@ -932,6 +1060,10 @@ def render_html_report(digest: Mapping[str, Any], analysis: Mapping[str, Any], g
         f"<td>活跃任务 {digest['delivery']['active_tasks_count']} · 活跃调度会话 {len(digest['delivery']['scheduler_omp_sessions'])}</td>"
         f"<td>漏挂等待被拦日志 {digest['delivery']['watch_guard_events_count']} 行</td>"
         f"<td>存活成员窗格 {hyg['live_member_panes']}（空闲 {hyg['idle_member_panes']}，同角重复空闲 {e(json.dumps(hyg['duplicate_idle_same_role'], ensure_ascii=False))}）· worktree {hyg['worktree_count']} 个</td></tr>",
+        f"<tr><td>Jev 五道决策关卡</td>"
+        f"<td>本周期调用共 {total_jev_calls} 次</td>"
+        f"<td>待淘汰零命中规则 {len(jev_data.get('retirement_candidates') or [])} 条 · 历史已淘汰 {jev_data.get('retired_rules_count', 0)} 条</td>"
+        f"<td>{e(jev_win_brief)}</td></tr>",
     ])
 
     return HTML_TEMPLATE.format(
@@ -944,8 +1076,11 @@ def render_html_report(digest: Mapping[str, Any], analysis: Mapping[str, Any], g
         fb_status=e(node_status("飞书桥")),
         inbox_status=e(node_status("收件箱")),
         delivery_status=e(node_status("交付流程")),
+        jev_status=e(jev_status_text.replace("#", "")),
         item_count=len(items),
         item_rows=item_rows,
+        gate_evo_rows=gate_evo_rows,
+        gate_rule_rows=gate_rule_rows,
         sys_rows=sys_rows,
         task_rows=task_rows,
     )
@@ -1022,33 +1157,37 @@ code {{ font: 12px ui-monospace, Menlo, monospace; background: var(--tag-bg); pa
 
   <h2>链路环节健康分布</h2>
   <div class="box flow-wrap">
-    <svg class="flow" viewBox="0 0 920 110" role="img" aria-label="飞书桥、GitLab、收件箱与交付团队协作链路">
+    <svg class="flow" viewBox="0 0 920 172" role="img" aria-label="飞书桥、GitLab、收件箱、交付团队与 Jev 五道关卡协作链路">
       <defs>
         <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
           <path d="M 0 1 L 10 5 L 0 9 z" fill="currentColor"/>
         </marker>
       </defs>
-      <rect x="10" y="18" width="190" height="74" rx="10" fill="none" stroke="var(--line)" stroke-width="1.5"/>
-      <text x="105" y="46" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">1. 飞书桥与秘书</text>
-      <text x="105" y="70" text-anchor="middle" fill="var(--muted)" font-size="12">{fb_status}</text>
+      <rect x="10" y="14" width="190" height="74" rx="10" fill="none" stroke="var(--line)" stroke-width="1.5"/>
+      <text x="105" y="42" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">1. 飞书桥与秘书</text>
+      <text x="105" y="66" text-anchor="middle" fill="var(--muted)" font-size="12">{fb_status}</text>
 
-      <line x1="204" y1="55" x2="246" y2="55" stroke="var(--muted)" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <line x1="204" y1="51" x2="246" y2="51" stroke="var(--muted)" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
 
-      <rect x="250" y="18" width="170" height="74" rx="10" fill="none" stroke="var(--line)" stroke-width="1.5"/>
-      <text x="335" y="46" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">2. GitLab 平台</text>
-      <text x="335" y="70" text-anchor="middle" fill="var(--muted)" font-size="12">唯一任务与证据源</text>
+      <rect x="250" y="14" width="170" height="74" rx="10" fill="none" stroke="var(--line)" stroke-width="1.5"/>
+      <text x="335" y="42" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">2. GitLab 平台</text>
+      <text x="335" y="66" text-anchor="middle" fill="var(--muted)" font-size="12">唯一任务与证据源</text>
 
-      <line x1="424" y1="55" x2="466" y2="55" stroke="var(--muted)" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <line x1="424" y1="51" x2="466" y2="51" stroke="var(--muted)" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
 
-      <rect x="470" y="18" width="195" height="74" rx="10" fill="none" stroke="var(--line)" stroke-width="1.5"/>
-      <text x="567" y="46" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">3. 收件箱与主动接活</text>
-      <text x="567" y="70" text-anchor="middle" fill="var(--muted)" font-size="12">{inbox_status}</text>
+      <rect x="470" y="14" width="195" height="74" rx="10" fill="none" stroke="var(--line)" stroke-width="1.5"/>
+      <text x="567" y="42" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">3. 收件箱与主动接活</text>
+      <text x="567" y="66" text-anchor="middle" fill="var(--muted)" font-size="12">{inbox_status}</text>
 
-      <line x1="669" y1="55" x2="711" y2="55" stroke="var(--muted)" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
+      <line x1="669" y1="51" x2="711" y2="51" stroke="var(--muted)" stroke-width="1.5" marker-start="url(#arrow)" marker-end="url(#arrow)"/>
 
-      <rect x="715" y="18" width="195" height="74" rx="10" fill="none" stroke="var(--line)" stroke-width="1.5"/>
-      <text x="812" y="46" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">4. 调度者与成员团队</text>
-      <text x="812" y="70" text-anchor="middle" fill="var(--muted)" font-size="12">{delivery_status}</text>
+      <rect x="715" y="14" width="195" height="74" rx="10" fill="none" stroke="var(--line)" stroke-width="1.5"/>
+      <text x="812" y="42" text-anchor="middle" fill="currentColor" font-size="14" font-weight="600">4. 调度者与成员团队</text>
+      <text x="812" y="66" text-anchor="middle" fill="var(--muted)" font-size="12">{delivery_status}</text>
+
+      <rect x="10" y="104" width="900" height="54" rx="10" fill="none" stroke="var(--line)" stroke-dasharray="5 4" stroke-width="1.5"/>
+      <text x="460" y="128" text-anchor="middle" fill="currentColor" font-size="13" font-weight="600">5. TypeSafe Jev 五道决策关卡护栏（红线锁死 · 常规项数据达标并过单测自动演进）</text>
+      <text x="460" y="147" text-anchor="middle" fill="var(--muted)" font-size="12">{jev_status}</text>
     </svg>
   </div>
 
@@ -1067,7 +1206,35 @@ code {{ font: 12px ui-monospace, Menlo, monospace; background: var(--tag-bg); pa
     <tbody>{item_rows}</tbody>
   </table>
 
-  <h2>三大环节过程指标对照</h2>
+  <h2>Jev 关卡本轮自动演进记录</h2>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:110px">状态</th>
+        <th style="width:130px">动作</th>
+        <th style="width:36%">变更内容</th>
+        <th>数据依据 / 拦截原因</th>
+      </tr>
+    </thead>
+    <tbody>{gate_evo_rows}</tbody>
+  </table>
+
+  <h2>关卡 4 与关卡 5 规则清单近 30 天表现</h2>
+  <table>
+    <thead>
+      <tr>
+        <th style="width:160px">所属关卡</th>
+        <th>规则项</th>
+        <th style="width:120px">护栏属性</th>
+        <th style="width:70px">阈值</th>
+        <th style="width:90px">30天评估</th>
+        <th style="width:210px">30天命中与擦边</th>
+      </tr>
+    </thead>
+    <tbody>{gate_rule_rows}</tbody>
+  </table>
+
+  <h2>四大环节过程指标对照</h2>
   <table>
     <thead>
       <tr>
@@ -1100,16 +1267,25 @@ code {{ font: 12px ui-monospace, Menlo, monospace; background: var(--tag-bg); pa
 """
 
 
-def format_feishu_markdown(digest: Mapping[str, Any], analysis: Mapping[str, Any], report_path: Path) -> str:
+def format_feishu_markdown(
+    digest: Mapping[str, Any],
+    analysis: Mapping[str, Any],
+    report_path: Path,
+    *,
+    gate_evolution: Optional[Mapping[str, Any]] = None,
+) -> str:
     win = digest["window"]
     items: Sequence[Mapping[str, str]] = analysis["items"]
+    evo = gate_evolution or {}
+    applied = list(evo.get("applied") or [])
+    rejected = list(evo.get("rejected") or [])
     lines = [
         f"**周期复盘（{win['since_label']} ~ {win['until_label']}）**",
         analysis["headline"],
         "",
     ]
     if not items:
-        lines.append("本周期交付流程、飞书桥与收件箱运行平稳，未发现需要改动的新优化点。")
+        lines.append("本周期交付流程、飞书桥、收件箱与 Jev 关卡运行平稳，未发现需要人工改动的新优化点。")
     else:
         lines.append(f"共找出 **{len(items)}** 个可优化点（按优先级排序）：")
         for idx, it in enumerate(items, 1):
@@ -1118,6 +1294,14 @@ def format_feishu_markdown(digest: Mapping[str, Any], analysis: Mapping[str, Any
                 f"   - 现象：{it['symptom_and_evidence']}\n"
                 f"   - 建议：{it['action']}"
             )
+    if applied:
+        git_meta = evo.get("git") or {}
+        git_note = f"（已提交 `{git_meta.get('sha')}`）" if git_meta.get("committed") else ""
+        lines.append(f"\n**Jev 关卡本轮已自动更新并过单测{git_note}：**")
+        for a in applied:
+            lines.append(f"- {a.get('summary')}：{a.get('reason')}")
+    if rejected:
+        lines.append(f"- 另有 {len(rejected)} 项关卡提议因触碰红线护栏或未达客观门槛已自动拦截（详见 HTML 报告）。")
     lines.append(f"\n详细图文报告（本机双击打开）：{report_path}")
     return "\n".join(lines)
 
@@ -1229,6 +1413,8 @@ class Retrospect:
         *,
         slot_id: str = "",
         notify: bool = True,
+        apply_gates: Optional[bool] = None,
+        verify_gates_fn: Optional[Callable[[Path], tuple[bool, str]]] = None,
     ) -> dict[str, Any]:
         digest = collect_digest(
             self.raw_config, self.files, since_ts, now_ts, run=self.run, hwf_home=self.hwf_home
@@ -1248,10 +1434,28 @@ class Retrospect:
         raw = self.ask_droid(prompt_path)
         analysis = parse_analysis_json(raw)
 
+        should_evolve = bool(self.cfg.get("auto_evolve_gates", True)) if apply_gates is None else apply_gates
+        if should_evolve and analysis.get("gate_updates"):
+            gate_evolution = JG.apply_gate_updates(
+                analysis["gate_updates"],
+                digest["jev_gates"],
+                hwf_home=self.hwf_home,
+                state_dir=self.files.dir,
+                now_ts=now_ts,
+                verify_fn=verify_gates_fn,
+                auto_git_sync=bool(notify and self.cfg.get("git_sync_gates", True)),
+                git_runner=self.run,
+            )
+            # 规则更新生效后刷新 digest 里的 30 天快照，保证当期 HTML 报告反映最新清单
+            if gate_evolution.get("applied"):
+                digest["jev_gates"] = JG.summarize_gate_telemetry(self.files.dir, self.hwf_home, since_ts, now_ts)
+        else:
+            gate_evolution = {"applied": [], "rejected": [], "verified": True, "git": {"committed": False}}
+
         self.files.reports_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d-%H%M")
         report_path = self.files.reports_dir / f"retrospect-{stamp}.html"
-        html_doc = render_html_report(digest, analysis, now_ts)
+        html_doc = render_html_report(digest, analysis, now_ts, gate_evolution=gate_evolution)
         report_path.write_text(html_doc)
         self.files.latest_report.write_text(html_doc)
 
@@ -1263,16 +1467,25 @@ class Retrospect:
             "headline": analysis["headline"],
             "item_count": len(analysis["items"]),
             "items": analysis["items"],
+            "gate_applied_count": len(gate_evolution.get("applied") or []),
+            "gate_evolution": gate_evolution,
             "report_path": str(report_path),
         }
         self.files.append_jsonl(self.files.history, record)
-        log(f"generated report ({len(analysis['items'])} items): {report_path}")
+        log(
+            f"generated report ({len(analysis['items'])} items, "
+            f"{len(gate_evolution.get('applied') or [])} gate updates): {report_path}"
+        )
 
         if notify:
             key = f"retro-{slot_id or stamp}"
-            feishu_md = format_feishu_markdown(digest, analysis, self.files.latest_report)
+            feishu_md = format_feishu_markdown(
+                digest, analysis, self.files.latest_report, gate_evolution=gate_evolution
+            )
+            applied_cnt = len(gate_evolution.get("applied") or [])
+            gate_suffix = f"，自动更新关卡 {applied_cnt} 项" if applied_cnt else ""
             ntfy_body = (
-                f"✅ 完成: 周期复盘已生成（{len(analysis['items'])} 个可优化点） | "
+                f"✅ 完成: 周期复盘已生成（{len(analysis['items'])} 个可优化点{gate_suffix}） | "
                 f"{analysis['headline'][:90]} | 报告: {self.files.latest_report}"
             )
             self.state["pending_notify"] = {
@@ -1285,7 +1498,12 @@ class Retrospect:
             }
             self._flush_pending_notify()
 
-        return {"digest": digest, "analysis": analysis, "report_path": str(report_path)}
+        return {
+            "digest": digest,
+            "analysis": analysis,
+            "gate_evolution": gate_evolution,
+            "report_path": str(report_path),
+        }
 
     def ask_droid(self, prompt_path: Path) -> str:
         droid_bin = find_executable("droid", (Path.home() / ".local" / "bin" / "droid",))
@@ -1405,6 +1623,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p_run = sub.add_parser("run", help="立即执行一次完整复盘分析并产出 HTML 报告")
     p_run.add_argument("--days", type=float, default=3.5, help="回看天数（默认 3.5 天）")
     p_run.add_argument("--no-notify", action="store_true", help="只生成本地 HTML 报告，不推飞书私聊和 ntfy")
+    p_run.add_argument("--no-apply-gates", action="store_true", help="仅评估不自动落盘更新 jev-gates.json")
     p_run.add_argument("--open", action="store_true", help="生成后在默认浏览器打开 HTML 报告")
 
     sub.add_parser("tick", help="按周二/周五 12:00 槽位检查是否到期并执行")
@@ -1433,7 +1652,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.cmd == "run":
         since = now - float(args.days) * 86400.0
-        res = retro.execute_review(since, now, notify=not args.no_notify)
+        res = retro.execute_review(
+            since, now, notify=not args.no_notify, apply_gates=not args.no_apply_gates
+        )
         retro.files.save_state(retro.state)
         if args.open:
             webbrowser.open(Path(res["report_path"]).as_uri())
@@ -1442,6 +1663,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "latest_report": str(retro.files.latest_report),
             "headline": res["analysis"]["headline"],
             "item_count": len(res["analysis"]["items"]),
+            "gate_applied_count": len(res["gate_evolution"].get("applied") or []),
         }, ensure_ascii=False, indent=2))
         return 0
 

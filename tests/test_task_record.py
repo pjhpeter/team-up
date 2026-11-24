@@ -679,5 +679,42 @@ class ReleaseCheckTests(unittest.TestCase):
         self.assertTrue(any("shared.ts" in p for p in report["problems"]))
 
 
+class ContentGuardTests(Case):
+    def test_deterministic_secret_regex_holds_note_offline(self) -> None:
+        tok = "glpat-" + "A9b8C7d6E5f4G3h2J1k0L9m8"
+        code, msg = self.note("answer", f"已排障完成，临时调试令牌 {tok} 供参考")
+        self.assertEqual(code, TR.EXIT_HELD)
+        self.assertIn("高危私钥/Token", msg)
+        self.assertEqual(self.glab.posted, [])
+
+    def test_jev_holds_plaintext_password_and_buried_conclusion_on_long_notes(self) -> None:
+        class FakeNoteJev:
+            def __init__(self, secret: float, buried: float = 0.0) -> None:
+                self.secret, self.buried = secret, buried
+
+            def decide(self, *, questions: Any = None, **_: Any) -> Any:
+                ans: dict[str, Any] = {"secret_exposed": {"type": "noul", "noul": self.secret}}
+                if "missing_top_conclusion" in questions:
+                    ans["missing_top_conclusion"] = {"type": "noul", "noul": self.buried}
+                return TR._JC.JevResult.from_payload({"model": "jev-1.14.0", "answers": ans})
+
+        code1, msg1 = TR.note(
+            self.repo, TASK, ISSUE, "answer",
+            "测试账号 admin@example.com 的密码是 P@ssw0rd2026!，已验证登录。",
+            [], jev=FakeNoteJev(secret=0.92),
+        )
+        self.assertEqual(code1, TR.EXIT_HELD)
+        self.assertIn("明文密码或敏感密钥", msg1)
+
+        long_rambling = "首先我去查了 nginx 日志和网关转发配置，接着对比了三个文件的超时参数，" * 14 + "所以最后请拍板选方案 A。"
+        code2, msg2 = TR.note(
+            self.repo, TASK, ISSUE, "todo", long_rambling, ["none"],
+            jev=FakeNoteJev(secret=0.01, buried=0.93),
+        )
+        self.assertEqual(code2, TR.EXIT_HELD)
+        self.assertIn("先说结论，再说细节", msg2)
+        self.assertEqual(self.glab.posted, [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -144,3 +144,88 @@ def validate_intent(value: object, text: str, candidates: list[dict], linked_iss
                    and evidence in item["title"]}
         return value if not matches or matches == {issue} else None
     return None
+
+
+_QUANTITY_SUFFIX_RE = re.compile(r"^\s*(?:个|条|次|秒|分钟|小时|天|周|月|年|行|页|张|项|处|倍|px|ms|mb|gb|kb|%)", re.I)
+
+
+def build_verified_relay_intent(
+    text: str,
+    issue_iid: int,
+    mode: str,
+    candidates: list[dict],
+    linked_issue: int | None,
+    recent: list[dict],
+) -> dict[str, Any] | None:
+    """为 Jev 高置信单任务转交构造可追溯证据，并复用 validate_intent 做终审；拿不准证据时返回 None 回退重模型。"""
+    stripped = text.strip()
+    if not stripped or issue_iid <= 0 or mode not in {"analyze", "deliver", "debug"}:
+        return None
+
+    reference = ""
+    evidence = ""
+
+    url_match = re.search(rf"https?://[^\s<>()\[\]\"，。；！？]+/-/(?:issues|work_items)/{issue_iid}(?![0-9])", text)
+    if url_match:
+        reference = "explicit"
+        evidence = url_match.group(0)
+    else:
+        for num_match in re.finditer(rf"(?<![0-9A-Za-z_.])#?{issue_iid}(?![0-9A-Za-z_.])", text):
+            token = num_match.group(0)
+            tail = text[num_match.end() :]
+            # 不把无 # 前缀的数量词（如“484个样本”）误认成 issue 编号。
+            if not token.startswith("#") and _QUANTITY_SUFFIX_RE.match(tail):
+                continue
+            reference = "explicit"
+            evidence = token
+            break
+
+    if not reference and linked_issue == issue_iid:
+        reference = "linked"
+        evidence = stripped
+
+    if not reference:
+        recent_ids = {item["iid"] for item in recent if type(item.get("iid")) is int and item["iid"] > 0}
+        if recent_ids == {issue_iid}:
+            reference = "recent"
+            evidence = stripped
+
+    if not reference:
+        target_item = next((c for c in candidates if c.get("iid") == issue_iid), None)
+        title = str((target_item or {}).get("title") or "").strip()
+        if len(title) >= 2:
+            best = ""
+            # 找原话与目标标题唯一共有的最长连续实词片段（>=2 字），与其他候选冲突则放弃快转。
+            for length in range(min(len(title), 24), 1, -1):
+                found_unique = ""
+                for start in range(0, len(title) - length + 1):
+                    sub = title[start : start + length].strip()
+                    if len(sub) < 2 or sub not in text:
+                        continue
+                    owners = {
+                        c["iid"]
+                        for c in candidates
+                        if type(c.get("iid")) is int and isinstance(c.get("title"), str) and sub in c["title"]
+                    }
+                    if owners == {issue_iid}:
+                        found_unique = sub
+                        break
+                if found_unique:
+                    best = found_unique
+                    break
+            if best:
+                reference = "name"
+                evidence = best
+
+    if not reference:
+        return None
+
+    decision: dict[str, Any] = {
+        "action": "relay",
+        "issue": issue_iid,
+        "mode": mode,
+        "reply": "",
+        "reference": reference,
+        "evidence": evidence,
+    }
+    return validate_intent(decision, text, candidates, linked_issue, recent)

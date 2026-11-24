@@ -1351,3 +1351,96 @@ class ClosedChatOriginAndBackoffTest(unittest.TestCase):
         self.assertEqual(tracker.consecutive_failures, 0)
         self.assertIsNone(tracker.record_success())
 
+
+class FakeInboxJev:
+    def __init__(self, go_prob: float = 0.0, flow: str = "standard", flow_prob: float = 0.92, fail: bool = False) -> None:
+        self.go_prob = go_prob
+        self.flow = flow
+        self.flow_prob = flow_prob
+        self.fail = fail
+        self.calls = 0
+
+    def decide(self, *, state: Any = None, questions: Any = None, **_: Any) -> Any:
+        self.calls += 1
+        if self.fail:
+            raise INBOX.JC.JevUnavailableError("offline")
+        other = round(1.0 - self.flow_prob, 4)
+        probs = {"standard": self.flow_prob, "debug": other} if self.flow == "standard" else {"standard": other, "debug": self.flow_prob}
+        return INBOX.JC.JevResult.from_payload({
+            "model": "jev-1.14.0",
+            "answers": {
+                "go_authorized": {"type": "noul", "noul": self.go_prob},
+                "flow": {"type": "choice", "choice": self.flow, "confidence": 0.90, "probabilities": probs},
+            },
+        })
+
+
+class NaturalGoTest(unittest.TestCase):
+    def setUp(self) -> None:
+        tmp = tempfile.mkdtemp(prefix="hwf-inbox-jev-")
+        patcher = patch.object(INBOX, "STATE_PATH", Path(tmp) / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _chat_state(self) -> dict[str, Any]:
+        return {
+            "origins": {
+                URL: {
+                    "project": "frontend/web-v1",
+                    "project_id": 10,
+                    "iid": 7,
+                    "repo": REPO,
+                    "initiator": "pengjh",
+                    "mode": INBOX.CHAT,
+                    "last_note_id": 5,
+                }
+            }
+        }
+
+    def test_watched_scripts_includes_jev_client(self) -> None:
+        names = {p.name for p in INBOX.watched_scripts()}
+        self.assertIn("jev_client.py", names)
+        self.assertIn("gitlab-inbox.py", names)
+
+    def test_high_confidence_natural_go_switches_chat_to_deliver_and_preserves_full_text(self) -> None:
+        state = self._chat_state()
+        world = FakeWorld([], notes=[note(5), note(6, body="方案没问题，按这个开始写代码交付吧")])
+        jev = FakeInboxJev(go_prob=0.95, flow="standard")
+        INBOX.Inbox(CONFIG, state, run=world, jev=jev).poll()
+        self.assertEqual(jev.calls, 1)
+        self.assertEqual(state["origins"][URL]["mode"], INBOX.DELIVER)
+        self.assertEqual(len(world.prompts), 1)
+        self.assertIn("明确开工指令：从对话模式切换到交付流程", world.prompts[0])
+        self.assertIn("按 ~/.hwf/protocol/planning.md 从 §0 复杂度判定开始", world.prompts[0])
+        self.assertIn("用户补充：方案没问题，按这个开始写代码交付吧", world.prompts[0])
+
+    def test_natural_debug_go_switches_to_debug_flow(self) -> None:
+        state = self._chat_state()
+        world = FakeWorld([], notes=[note(5), note(6, body="直接按 debug 模式把这个线上小 bug 修掉")])
+        jev = FakeInboxJev(go_prob=0.94, flow="debug", flow_prob=0.91)
+        INBOX.Inbox(CONFIG, state, run=world, jev=jev).poll()
+        self.assertEqual(state["origins"][URL]["mode"], INBOX.DELIVER)
+        self.assertIn("用户明确要求 debug 模式", world.prompts[0])
+        self.assertIn("用户补充：直接按 debug 模式把这个线上小 bug 修掉", world.prompts[0])
+
+    def test_discussion_or_jev_unavailable_stays_in_chat_mode(self) -> None:
+        for name, jev in (
+            ("below_threshold", FakeInboxJev(go_prob=0.65, flow="standard")),
+            ("unavailable", FakeInboxJev(fail=True)),
+        ):
+            with self.subTest(name):
+                state = self._chat_state()
+                world = FakeWorld([], notes=[note(5), note(6, body="如果改成异步会不会丢消息？先评估下")])
+                INBOX.Inbox(CONFIG, state, run=world, jev=jev).poll()
+                self.assertEqual(state["origins"][URL]["mode"], INBOX.CHAT)
+                self.assertEqual(len(world.prompts), 1)
+                self.assertNotIn("从对话模式切换到交付流程", world.prompts[0])
+
+    def test_deliver_mode_never_queries_jev(self) -> None:
+        state = self._chat_state()
+        state["origins"][URL]["mode"] = INBOX.DELIVER
+        world = FakeWorld([], notes=[note(5), note(6, body="顺便补一条边界用例")])
+        jev = FakeInboxJev(go_prob=0.99)
+        INBOX.Inbox(CONFIG, state, run=world, jev=jev).poll()
+        self.assertEqual(jev.calls, 0)
+

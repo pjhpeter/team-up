@@ -29,8 +29,18 @@ import tempfile
 from typing import Any, Callable, Optional, Sequence
 from urllib.parse import quote, unquote, urlparse
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import jev_client as JC
+
 ALLOWED_EXTENSIONS = frozenset({".mp4", ".webm", ".png", ".jpg", ".jpeg", ".webp", ".gif"})
+IMAGE_EXTENSIONS = frozenset({".png", ".jpg", ".jpeg", ".webp", ".gif"})
+VIDEO_EXTENSIONS = frozenset({".mp4", ".webm"})
 DEFAULT_MAX_MB = 50.0
+JEV_BLANK_BLOCK_PROB = 0.88
+JEV_CREDENTIAL_BLOCK_PROB = 0.75
+INTENTIONAL_ERROR_ALT_RE = re.compile(r"报错|错误|异常|失败|空态|空白|404|500|error|empty|fallback", re.I)
 UPLOAD_PATH_RE = re.compile(r"(/uploads/[0-9a-fA-F]+/[^/?#\s)\"']+)")
 PROJECT_UPLOAD_PREFIX_RE = re.compile(r"^/-/project/(\d+)/uploads/")
 
@@ -96,9 +106,92 @@ def validate_local_media(file: Path, max_mb: float) -> bytes:
     return data
 
 
+def _extract_video_keyframe(video_path: Path, out_png: Path) -> bool:
+    """用本机 ffmpeg 抽取视频代表帧；无 ffmpeg 或测试合成最小字节流无法解码时返回 False 跳过视觉门禁。"""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return False
+    for seek in ("00:00:01", "00:00:00"):
+        proc = subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-ss", seek, "-i", str(video_path),
+             "-frames:v", "1", "-y", str(out_png)],
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+        if proc.returncode == 0 and out_png.is_file() and out_png.stat().st_size > 0:
+            return True
+    return False
+
+
+def inspect_media_with_jev(file: Path, alt: Optional[str], jev: Optional[JC.JevClient]) -> None:
+    """上传前用 Jev 视觉能力拦截纯白屏/崩溃废片与明文密码/密钥外泄；不可用或无法解码时优雅跳过。"""
+    if jev is None:
+        return
+    ext = file.suffix.lower()
+    with tempfile.TemporaryDirectory(prefix="hwf-media-jev-") as tmp:
+        if ext in IMAGE_EXTENSIONS:
+            frame = file
+        elif ext in VIDEO_EXTENSIONS:
+            frame = Path(tmp) / "keyframe.png"
+            if not _extract_video_keyframe(file, frame):
+                return
+        else:
+            return
+
+        label = (alt or file.stem).strip()
+        allow_error_screen = bool(INTENTIONAL_ERROR_ALT_RE.search(label))
+        try:
+            res = jev.decide(
+                state={"file_name": file.name, "evidence_caption": label},
+                images=[frame],
+                questions={
+                    "blank_or_crash": JC.Noul(
+                        instructions=(
+                            "Inspect the attached UI acceptance screenshot/video frame. "
+                            "Is it a completely blank/solid screen (all white/black) or an unrendered browser crash/connection-refused page "
+                            "(`ERR_CONNECTION_REFUSED`, `502 Bad Gateway`, `Cannot GET /`) with no usable app UI?"
+                        ),
+                        criteria={
+                            "true": "Pure blank/solid-color screen or browser/server crash page instead of real application UI.",
+                            "false": "Shows rendered application UI, terminal output, dialog, form, or meaningful test content.",
+                        },
+                    ),
+                    "credential_exposed": JC.Noul(
+                        instructions=(
+                            "Does the attached image visibly expose plaintext passwords, API secret keys, bearer tokens, "
+                            "private keys, or a credential list file (ignore masked dots `••••••`, normal usernames/emails, and public URLs)?"
+                        ),
+                        criteria={
+                            "true": "Plaintext password, API secret/token, private key, or credential sheet is readable on screen.",
+                            "false": "No plaintext secrets or passwords visible (masked password fields and normal UI data are safe).",
+                        },
+                    ),
+                },
+                timeout_s=10.0,
+            )
+        except JC.JevUnavailableError:
+            return
+
+        cred_prob = res.noul("credential_exposed")
+        if cred_prob >= JEV_CREDENTIAL_BLOCK_PROB:
+            raise MediaUploadError(
+                "evidence_guard",
+                f"检测到画面疑似暴露明文密码或密钥（置信度 {cred_prob:.0%}），已拒绝上传：{file.name}；请遮挡或避开凭据后重录",
+            )
+        blank_prob = res.noul("blank_or_crash")
+        if not allow_error_screen and blank_prob >= JEV_BLANK_BLOCK_PROB:
+            raise MediaUploadError(
+                "evidence_guard",
+                f"检测到画面疑似纯空白页或未就绪崩溃页（置信度 {blank_prob:.0%}），已拒绝上传：{file.name}；"
+                "请确认页面渲染完成后重录（若本条专门验收报错/空态，请在 --alt 中注明「错误/空态」）",
+            )
+
+
 class MediaUploader:
-    def __init__(self, repo: Path, run: Runner = subprocess.run) -> None:
+    def __init__(self, repo: Path, run: Runner = subprocess.run, *, jev: Optional[JC.JevClient] = None) -> None:
         self.run = run
+        self.jev = jev if jev is not None else JC.default_client()
         result = run(["git", "-C", str(repo), "remote", "get-url", "origin"], capture_output=True, check=False)
         if result.returncode != 0:
             detail = result.stderr.decode(errors="replace").strip()
@@ -150,6 +243,7 @@ class MediaUploader:
     def create(self, file: Path, alt: Optional[str], max_mb: float) -> dict[str, Any]:
         resolved = file.expanduser().resolve()
         data = validate_local_media(resolved, max_mb=max_mb)
+        inspect_media_with_jev(resolved, alt=alt, jev=self.jev)
         digest = sha256(data)
 
         with tempfile.TemporaryDirectory(prefix="hwf-upload-") as tmp:

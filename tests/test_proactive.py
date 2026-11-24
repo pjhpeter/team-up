@@ -452,6 +452,78 @@ class ScoutTest(unittest.TestCase):
         self.assertTrue(all(c[c.index("-X") + 1] == "GET" for c in glab))
         self.assertFalse(any(c[0] in ("lark-cli", "herdr", "hwf") for c in self.w.calls))
 
+    # ---- Jev 初筛 ----
+
+    def test_jev_prescreen_ignores_low_probability_without_spawning_omp(self) -> None:
+        jev_calls: list[dict] = []
+
+        def fake_transport(url, body, headers, timeout_s):
+            jev_calls.append(json.loads(body.decode("utf-8")))
+            return {
+                "model": "jev-1.14.0",
+                "answers": {
+                    "rule_R2": {"type": "noul", "noul": 0.03},
+                    "rule_R3": {"type": "noul", "noul": 0.08},
+                },
+                "usage": {"input_tokens": 410, "output_tokens": 0},
+            }
+
+        jev = P.JC.JevClient({"api_key": "ts-test"}, transport=fake_transport, sleep_fn=lambda _: None)
+        scout = P.Scout({"host": "g.example", "projects": ["frontend/web-v1"], "label": "herdr-auto"},
+                        files=self.files, run=self.w, now=lambda: self.t, rules_path=self.rules, jev=jev)
+        self.feishu("m1", "中午吃什么", self.t - 400)
+        scout.tick()
+        self.assertEqual(len(jev_calls), 1)
+        self.assertEqual(self.w.prompts, [])
+        rec = self.records()[0]
+        self.assertEqual(rec["verdict"], "ignore")
+        self.assertEqual(rec["tokens"], 410)
+        self.assertIn("Jev 初筛未命中", rec["rules"][0]["why"])
+
+    def test_jev_prescreen_escalates_to_omp_and_shortcircuits_same_as(self) -> None:
+        responses = [
+            {
+                "model": "jev-1.14.0",
+                "answers": {
+                    "rule_R2": {"type": "noul", "noul": 0.82},
+                    "rule_R3": {"type": "noul", "noul": 0.05},
+                },
+                "usage": {"input_tokens": 500, "output_tokens": 0},
+            },
+            {
+                "model": "jev-1.14.0",
+                "answers": {
+                    "rule_R2": {"type": "noul", "noul": 0.76},
+                    "rule_R3": {"type": "noul", "noul": 0.04},
+                    "same_as": {
+                        "type": "choice",
+                        "choice": "O-0001",
+                        "confidence": 0.88,
+                        "probabilities": {"O-0001": 0.91, "none": 0.09},
+                    },
+                },
+                "usage": {"input_tokens": 620, "output_tokens": 0},
+            },
+        ]
+        jev = P.JC.JevClient({"api_key": "ts-test"}, transport=lambda *a: responses.pop(0), sleep_fn=lambda _: None)
+        self.w.judge = hits("R2")
+        scout = P.Scout({"host": "g.example", "projects": ["frontend/web-v1"], "label": "herdr-auto"},
+                        files=self.files, run=self.w, now=lambda: self.t, rules_path=self.rules, jev=jev)
+        self.feishu("m1", "导出 PDF 点了没反应", self.t - 400)
+        scout.tick()
+        self.assertEqual(len(self.w.prompts), 1)
+        self.assertEqual(self.records()[0]["verdict"], "would_accept")
+        self.assertEqual(self.records()[0]["tokens"], 5500)
+
+        self.feishu("m2", "我复现了一下还是卡在进度条", self.t)
+        self.t += 301
+        scout.tick()
+        # 第二批是同话题延续，Jev 直接归并，不再二次拉起 omp
+        self.assertEqual(len(self.w.prompts), 1)
+        self.assertEqual(self.records()[1]["verdict"], "same_as")
+        self.assertEqual(self.records()[1]["same_as"], "O-0001")
+        self.assertEqual(self.records()[1]["tokens"], 620)
+
 
 if __name__ == "__main__":
     unittest.main()

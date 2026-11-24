@@ -125,6 +125,40 @@ class UploadMediaTest(unittest.TestCase):
         self.assertEqual(res["url"], f"/uploads/{UPLOAD_ID}/A1-flow.mp4")
         self.assertEqual(res["web_url"], f"https://git.example.com/-/project/10/uploads/{UPLOAD_ID}/A1-flow.mp4")
 
+    def test_jev_evidence_guard_blocks_blank_and_exposed_credentials_unless_error_alt(self) -> None:
+        png = self.tmp / "shot.png"
+        png.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32)
+        fake = FakeGitLabMedia(png.read_bytes())
+
+        class FakeMediaJev:
+            def __init__(self, blank: float, cred: float) -> None:
+                self.blank, self.cred = blank, cred
+
+            def decide(self, **_: Any) -> Any:
+                return UM.JC.JevResult.from_payload({
+                    "model": "jev-1.14.0",
+                    "answers": {
+                        "blank_or_crash": {"type": "noul", "noul": self.blank},
+                        "credential_exposed": {"type": "noul", "noul": self.cred},
+                    },
+                })
+
+        uploader_cred = UM.MediaUploader(Path("/repo"), run=fake, jev=FakeMediaJev(blank=0.05, cred=0.91))
+        with self.assertRaises(UM.MediaUploadError) as ctx_cred:
+            uploader_cred.create(png, alt="登录页面截图", max_mb=10.0)
+        self.assertEqual(ctx_cred.exception.stage, "evidence_guard")
+        self.assertIn("明文密码或密钥", str(ctx_cred.exception))
+
+        uploader_blank = UM.MediaUploader(Path("/repo"), run=fake, jev=FakeMediaJev(blank=0.95, cred=0.01))
+        with self.assertRaises(UM.MediaUploadError) as ctx_blank:
+            uploader_blank.create(png, alt="首页正常渲染", max_mb=10.0)
+        self.assertEqual(ctx_blank.exception.stage, "evidence_guard")
+        self.assertIn("空白页", str(ctx_blank.exception))
+
+        # 验收条目本身测报错/空态且在 alt 中注明时，不误拦空白/错误页
+        res_allowed = uploader_blank.create(png, alt="AC3 接口异常空态兜底验证", max_mb=10.0)
+        self.assertTrue(res_allowed["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

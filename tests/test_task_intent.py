@@ -391,6 +391,70 @@ class TaskIntentTest(unittest.TestCase):
         self.assertEqual(cmd[cmd.index("--tools") + 1], "read")
         self.assertNotIn("--no-tools", cmd)
 
+    def test_jev_fast_relay_handles_explicit_linked_recent_name_and_downgrades_weak_auth(self) -> None:
+        def make_jev(action: str, target: str, mode: str, auth: float):
+            return SEC._JC.JevClient(
+                {"api_key": "ts-test"},
+                transport=lambda *a: {
+                    "model": "jev-1.14.0",
+                    "answers": {
+                        "action": {
+                            "type": "choice",
+                            "choice": action,
+                            "confidence": 0.92,
+                            "probabilities": {action: 0.95},
+                        },
+                        "target": {
+                            "type": "choice",
+                            "choice": target,
+                            "confidence": 0.93,
+                            "probabilities": {target: 0.96},
+                        },
+                        "mode": {"type": "choice", "choice": mode, "confidence": 0.88, "probabilities": {mode: 0.9}},
+                        "auth_now": {"type": "noul", "noul": auth},
+                    },
+                    "usage": {"input_tokens": 260, "output_tokens": 0},
+                },
+                sleep_fn=lambda _: None,
+            )
+
+        cands = [{"iid": 484, "title": "支持透明背景导出"}, {"iid": 488, "title": "修复登录弹窗报错"}]
+
+        # 显式编号快转，不拉起 omp
+        self.sec.jev = make_jev("relay", "484", "analyze", 0.04)
+        res = self.sec.classify_intent("484 进度怎么样？", candidates=cands)
+        self.assertEqual(res, {"action": "relay", "issue": 484, "mode": "analyze", "reply": "",
+                               "reference": "explicit", "evidence": "484"})
+        self.assertEqual(self.model.calls, [])
+
+        # 引用回复 + 明确授权开工 -> mode=deliver
+        self.sec.jev = make_jev("relay", "484", "deliver", 0.93)
+        res = self.sec.classify_intent("按方案 A 开始实现", candidates=cands, linked_issue=484)
+        self.assertEqual(res, {"action": "relay", "issue": 484, "mode": "deliver", "reply": "",
+                               "reference": "linked", "evidence": "按方案 A 开始实现"})
+
+        # auth_now 不够高时强制降回 analyze，绝不误发开工指令
+        self.sec.jev = make_jev("relay", "488", "debug", 0.40)
+        res = self.sec.classify_intent("为什么还是报错？", "引用：请立即修复", candidates=cands, linked_issue=488)
+        self.assertEqual(res, {"action": "relay", "issue": 488, "mode": "analyze", "reply": "",
+                               "reference": "linked", "evidence": "为什么还是报错？"})
+
+        # 唯一任务名称快转
+        self.sec.jev = make_jev("relay", "484", "analyze", 0.02)
+        res = self.sec.classify_intent("透明背景导出先暂停测试", candidates=cands)
+        self.assertEqual(res, {"action": "relay", "issue": 484, "mode": "analyze", "reply": "",
+                               "reference": "name", "evidence": "透明背景导出"})
+        self.assertEqual(self.model.calls, [])
+
+        # 数量词“484个样本”即便假模型错给 484，证据门禁也会挡下并回退 omp 建单
+        self.sec.jev = make_jev("relay", "484", "deliver", 0.95)
+        expected_create = {"action": "create", "issue": None, "mode": "deliver", "reply": "增加测试样本",
+                           "reference": "new", "evidence": "484个测试样本"}
+        self.model.respond(expected_create)
+        res = self.sec.classify_intent("请增加484个测试样本", candidates=[{"iid": 484, "title": "导出"}])
+        self.assertEqual(res, expected_create)
+        self.assertEqual(len(self.model.calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -50,8 +50,16 @@ import re
 import subprocess
 import sys
 import time
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 from urllib.parse import quote
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import jev_client as JC
+
+JEV_GO_AUTH_MIN = 0.90
+JEV_DEBUG_FLOW_MIN = 0.80
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 CONFIG_PATH = HWF_HOME / "gitlab-inbox.config.json"
@@ -139,7 +147,8 @@ def log(message: str) -> None:
 
 
 class Inbox:
-    def __init__(self, config: Mapping[str, Any], state: dict[str, Any], run: Runner = subprocess.run):
+    def __init__(self, config: Mapping[str, Any], state: dict[str, Any], run: Runner = subprocess.run,
+                 *, jev: Optional[JC.JevClient] = None):
         self.host: str = config["host"]
         self.allowed = set(config["allowed_users"])
         self.label: str = config["label"]
@@ -155,6 +164,9 @@ class Inbox:
         self.sleep: Callable[[float], None] = time.sleep
         self.me: str = ""
         self.labels_seen: dict[str, list[str]] = {}  # 本轮查到的发起 issue 标签，省一次查询
+        self.jev = jev if jev is not None else JC.JevClient(
+            config.get("typesafe") if "typesafe" in config else None
+        )
 
     # ---- 外部命令 ----
 
@@ -359,14 +371,22 @@ class Inbox:
         words = self.words(body)
         return len(words) == 1 and words[0].lower() in commands
 
-    def handle_go(self, url: str, repo: str, note: Mapping[str, Any], where: Mapping[str, Any]) -> bool:
-        """`/go [模式] [补充说明]` 或独立模式指令：切到交付，必要时登记发起 issue。"""
+    def handle_go(self, url: str, repo: str, note: Mapping[str, Any], where: Mapping[str, Any],
+                  *, natural_flow: str | None = None) -> bool:
+        """`/go [模式] [补充说明]`、独立模式指令或 Jev 高把握识别的自然开工指令：切到交付，必要时登记发起 issue。"""
         user = note["author"]["username"]
         words = self.words(note["body"])
-        rest = words[1:] if words[0].lower() in GO_COMMANDS else words
-        used = 2 if len(rest) >= 2 and "".join(rest[:2]).lower() in DEBUG_WORDS else int(bool(rest) and rest[0].lower() in DEBUG_WORDS)
-        debug = used > 0
-        extra = " ".join(rest[used:])
+        if natural_flow in ("standard", "debug"):
+            debug = natural_flow == "debug"
+            rest = words
+            extra = " ".join(words)
+            trigger_label = "明确开工指令"
+        else:
+            rest = words[1:] if words[0].lower() in GO_COMMANDS else words
+            used = 2 if len(rest) >= 2 and "".join(rest[:2]).lower() in DEBUG_WORDS else int(bool(rest) and rest[0].lower() in DEBUG_WORDS)
+            debug = used > 0
+            extra = " ".join(rest[used:])
+            trigger_label = "/go" if words[0].lower() in GO_COMMANDS else "独立模式指令"
         origin = self.state["origins"].get(url)
         if origin is not None and self.mode_of(url) == DELIVER:
             forwarded = bool(rest) and self.deliver(repo, url, self.message(url, note, True), DELIVER) is not None
@@ -376,7 +396,7 @@ class Inbox:
                 "保留本地单元测试先行和实现前核验；不跑本地浏览器/Electron 验收，develop 部署后做真实自动化验收，通过后提交 MR 到 release-<根编号>。"
                 "不做复杂度判定、方案评审、整项代码评审、arch 终审或 main 合并；按此流程"
                 if debug else "按 ~/.hwf/protocol/planning.md 从 §0 复杂度判定开始")
-        go = (f"[GitLab 收件箱] 用户在 {url}#note_{note['id']} 发出 {'/go' if words[0].lower() in GO_COMMANDS else '独立模式指令'}：从对话模式切换到交付流程，"
+        go = (f"[GitLab 收件箱] 用户在 {url}#note_{note['id']} 发出 {trigger_label}：从对话模式切换到交付流程，"
               f"{flow}交付这个 issue（发起人 @{user}）。"
               + (f"\n用户补充：{extra}" if extra else ""))
         if origin is None and where.get("state", "opened") != "opened":
@@ -478,12 +498,53 @@ class Inbox:
             return self.handle_reset(url, origin, note)
         if self.is_command(note["body"], frozenset(NOTIFY_COMMANDS)):
             return self.handle_notify(url, repo, note, where)
+        if words and not words[0].startswith("/") and self.mode_of(url) == CHAT:
+            natural_flow = self._detect_natural_go_flow(" ".join(words))
+            if natural_flow is not None:
+                self.resume_stage(url, where)
+                return self.handle_go(url, repo, note, where, natural_flow=natural_flow)
         resumed = self.resume_stage(url, where)
         receipt = self.deliver(repo, url, self.message(url, note, origin is not None) + resumed, self.mode_of(url))
         if receipt is None:
             return False
         self.comment(where, receipt)
         return True
+
+    def _detect_natural_go_flow(self, clean_body: str) -> str | None:
+        """仅在对话模式下判断评论是否明确下达开工指令（noul >= 0.90）；拿不准或不可用时一律保持对话模式。"""
+        if self.jev is None or not clean_body.strip():
+            return None
+        try:
+            res = self.jev.decide(
+                state={"comment_body": clean_body[:2000]},
+                questions={
+                    "go_authorized": JC.Noul(
+                        instructions=(
+                            "On a GitLab issue currently in read-only discussion (CHAT) mode, does `comment_body` "
+                            "explicitly tell the coding team to start implementing code or fixing the bug NOW "
+                            "(including instructions like 'fix it in debug mode', 'go ahead with option A', 'start coding'), "
+                            "rather than asking questions, requesting read-only investigation, or hesitating?"
+                        ),
+                        criteria={
+                            "true": "Direct go-ahead to implement code or fix the bug now (standard or debug mode).",
+                            "false": "Questions, discussion, read-only analysis request, hesitation, or no clear instruction to modify code now.",
+                        },
+                    ),
+                    "flow": JC.Choice(
+                        "If code changes are authorized, which workflow is requested?",
+                        {
+                            "standard": "Normal feature or engineering delivery without mentioning debug/minimal mode.",
+                            "debug": "Explicitly mentions debug mode or minimal bug-fix mode.",
+                        },
+                    ),
+                },
+            )
+            if res.noul("go_authorized") < JEV_GO_AUTH_MIN:
+                return None
+            flow, _, probs = res.choice("flow")
+            return "debug" if flow == "debug" and probs.get("debug", 0.0) >= JEV_DEBUG_FLOW_MIN else "standard"
+        except JC.JevUnavailableError:
+            return None
 
     def message(self, url: str, note: Mapping[str, Any], origin: bool) -> str:
         if origin:
@@ -964,7 +1025,9 @@ def save_state(state: Mapping[str, Any]) -> None:
 
 def watched_scripts(base_dir: Path | None = None) -> tuple[Path, ...]:
     root = base_dir or Path(__file__).resolve().parent
-    return tuple(root / name for name in ("gitlab-inbox.py", "find-scheduler.py", "proactive.py", "retrospect.py"))
+    return tuple(
+        root / name for name in ("gitlab-inbox.py", "find-scheduler.py", "proactive.py", "retrospect.py", "jev_client.py")
+    )
 
 
 def snapshot_mtimes(paths: Sequence[Path]) -> dict[Path, int]:

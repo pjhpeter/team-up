@@ -19,5 +19,12 @@
     "minute": 0,
     "model": "gemini-4-carbon",
     "reasoning_effort": "high"
+  },
+  "typesafe": {
+    "model": "jev-1.14.0",
+    "api_key_keychain": {
+      "service": "typesafe-jev-api",
+      "account": "default"
+    }
   }
 }

@@ -104,6 +104,11 @@ def _load(name: str, file: str) -> Any:
 
 _FS: Any = None
 _INTENT = _load("hwf_task_intent", "task_intent.py")
+_JC = _load("jev_client", "jev_client.py")
+
+JEV_RELAY_PROB_MIN = 0.80
+JEV_AUTH_NOW_MIN = 0.85
+JEV_QUIET_FORWARD_MIN = 0.50
 
 
 def _ts(value: Any) -> float:
@@ -138,6 +143,10 @@ class Secretary:
         cfg = dict(DEFAULT_MODEL)
         cfg.update(bridge.cfg.get("secretary") or {})
         self.cfg = cfg
+        bridge_cfg = getattr(bridge, "cfg", None) or {}
+        self.jev = getattr(bridge, "jev", None) or _JC.JevClient(
+            bridge_cfg.get("typesafe") if "typesafe" in bridge_cfg else None
+        )
         self.intent_error: str | None = None
 
     def merge_link_forms(self) -> None:
@@ -373,10 +382,48 @@ class Secretary:
             return False
         if body.startswith("**收尾回执**") and "**残留**" not in body:
             return False
+        if body.startswith("**收尾回执**"):
+            return True
         summary = FOLDED.sub("", body).strip()
         if QUIET_ARCHIVE_NOTE.match(summary) and not USER_ACTION_HINT.search(summary):
             return False
-        return True
+        if USER_ACTION_HINT.search(summary):
+            return True
+        mention = self.mention_re()
+        if mention and mention.search(summary):
+            return True
+        return self._jev_needs_user_attention(summary)
+
+    def _jev_needs_user_attention(self, summary: str) -> bool:
+        """无 hwf-kind 标签且未命中固定归档模板的 Agent 评论，用 Jev 区分待办/实质答复与内部进度噪音；不可用时默认放行。"""
+        if not summary or self.jev is None:
+            return True
+        try:
+            res = self.jev.decide(
+                state={"agent_comment": summary[:4000]},
+                questions={
+                    "attention": _JC.Noul(
+                        instructions=(
+                            "In quiet notification mode, should `agent_comment` be pushed immediately to the user's "
+                            "private chat instead of staying silently archived in GitLab?"
+                        ),
+                        criteria={
+                            "true": (
+                                "Requires a user decision, confirmation, authorization, credential/action, reports a "
+                                "blocker/risk/residual issue, answers a question the user asked, or announces final "
+                                "delivery/readiness to ship."
+                            ),
+                            "false": (
+                                "Routine internal progress update, intermediate step completion, test/review pass "
+                                "note while overall work continues, or archival artifact link requiring no user action."
+                            ),
+                        },
+                    )
+                },
+            )
+            return res.noul("attention") >= JEV_QUIET_FORWARD_MIN
+        except _JC.JevUnavailableError:
+            return True
 
     def forward(self, url: str, issue: Mapping[str, Any], entry: Mapping[str, Any]) -> None:
         link = f"{url}#note_{entry['id']}"
@@ -584,13 +631,17 @@ class Secretary:
 
     def classify_intent(self, text: str, context: str = "", *, candidates: list[dict] | None = None,
                         linked_issue: int | None = None, recent: list[dict] | None = None) -> dict | None:
-        """一次模型决策动作、目标与授权；代码只核验结构和来源，不再次猜语义。"""
+        """高频明确单任务转交优先由 Jev 毫秒级判定并经 validate_intent 核验；建单/总览/追问/拆批回退 omp。"""
         self.intent_error = None
         # 显式空候选是调用方限制范围，不能回退到秘书的全量登记。
         candidates = list(self.known_tasks().values()) if candidates is None else candidates
         recent = [] if recent is None else recent
         identities = [{key: item[key] for key in ("iid", "title", "project") if key in item}
                       for item in candidates]
+        fast = self._fast_relay_with_jev(text, context, candidates=candidates, identities=identities,
+                                         linked_issue=linked_issue, recent=recent)
+        if fast is not None:
+            return fast
         material = json.dumps({"current_message": text, "context": context, "candidates": identities,
                                "linked_issue": linked_issue, "recent": recent}, ensure_ascii=False)
         response = self.ask_model(material)
@@ -605,6 +656,99 @@ class Secretary:
         result = _INTENT.validate_intent(intent, text, candidates, linked_issue, recent)
         self.intent_error = "invalid_intent" if result is None else None
         return result
+
+    def _fast_relay_with_jev(
+        self,
+        text: str,
+        context: str,
+        *,
+        candidates: list[dict],
+        identities: list[dict],
+        linked_issue: int | None,
+        recent: list[dict],
+    ) -> dict | None:
+        if self.jev is None or not text.strip():
+            return None
+        # 多轮澄清拼接或分段批量续发涉及历史拆句，交由 omp 完整处理。
+        if "同一次待澄清请求的用户原话：\n" in text or "本次转告的逐项状态" in context or "引用的任务无法核实" in context:
+            return None
+
+        target_options: dict[str, str] = {}
+        for item in identities:
+            iid = item.get("iid")
+            if type(iid) is int and iid > 0:
+                target_options[str(iid)] = f"Existing task #{iid}: {item.get('title') or ''}"
+        if type(linked_issue) is int and linked_issue > 0 and str(linked_issue) not in target_options:
+            target_options[str(linked_issue)] = f"Directly replied-to task #{linked_issue}"
+        if not target_options:
+            return None
+        target_options["ambiguous"] = "Multiple tasks match or the reference is ambiguous."
+        target_options["none"] = "No specific existing task (brand-new request, general overview/help, or casual chat)."
+
+        state_obj = {
+            "current_message": text,
+            "linked_issue": linked_issue,
+            "recent_tasks": [{"iid": r.get("iid"), "title": r.get("title", "")} for r in recent],
+            "candidate_tasks": identities,
+            "context_excerpt": context[:2000],
+        }
+        questions = {
+            "action": _JC.Choice(
+                "Classify what the user wants to do in `current_message`.",
+                {
+                    "relay": (
+                        "Send a reply, instruction, pause/resume/constraint, progress/reason question, or go-ahead "
+                        "to ONE specific existing task (questions about a specific task MUST be `relay` to its "
+                        "scheduler, never answered by the secretary)."
+                    ),
+                    "batch": "Send instructions to TWO OR MORE distinct existing tasks in one message.",
+                    "create": "Propose or claim a brand-new feature, bug report, or investigation not tied to an existing task.",
+                    "overview_or_help": "Ask about overall status across all tasks, bot usage, or general chat with no target task.",
+                    "clarify": "Target task or whether this is new vs existing work cannot be determined without asking the user.",
+                },
+            ),
+            "target": _JC.Choice(
+                (
+                    "Which single existing task does `current_message` refer to? Priority: (1) explicit issue number "
+                    "or unique task title in `current_message` (numbers used as counts/quantities like '484 samples' "
+                    "are NOT issue numbers); (2) `linked_issue` when replying without naming another task; (3) the "
+                    "sole task in `recent_tasks` when `current_message` refers to 'that one just now' and "
+                    "`recent_tasks` has length 1."
+                ),
+                target_options,
+            ),
+            "mode": _JC.Choice(
+                "Determine execution mode strictly from `current_message` ITSELF (never from `context_excerpt`).",
+                {
+                    "analyze": "Question, discussion, answer to a choice, pause/stop, continue testing, constraint, or read-only analysis.",
+                    "deliver": "`current_message` explicitly commands starting feature implementation or code changes right now.",
+                    "debug": "`current_message` explicitly commands fixing or debugging a bug right now.",
+                },
+            ),
+            "auth_now": _JC.Noul(
+                "Does `current_message` ITSELF (ignoring `context_excerpt`) explicitly authorize starting code changes or bug fixing right now?",
+                {
+                    "true": "Clear immediate implementation/fix command in `current_message` (e.g. '开始实现', '修一下这个', '按A改代码').",
+                    "false": "Asking progress/why, pausing, continuing verification/testing, discussing, or no explicit coding command.",
+                },
+            ),
+        }
+        try:
+            res = self.jev.decide(state_obj, questions)
+            act, _, act_probs = res.choice("action")
+            tgt, _, tgt_probs = res.choice("target")
+            mode, mode_conf, _ = res.choice("mode")
+            auth_p = res.noul("auth_now")
+        except _JC.JevUnavailableError:
+            return None
+
+        if act != "relay" or act_probs.get("relay", 0.0) < JEV_RELAY_PROB_MIN:
+            return None
+        if not tgt.isdigit() or tgt_probs.get(tgt, 0.0) < JEV_RELAY_PROB_MIN:
+            return None
+        if mode in ("deliver", "debug") and (auth_p < JEV_AUTH_NOW_MIN or mode_conf < 0.70):
+            mode = "analyze"
+        return _INTENT.build_verified_relay_intent(text, int(tgt), mode, candidates, linked_issue, recent)
 
     def ask_model(self, material: str) -> Optional[str]:
         self.intent_error = None

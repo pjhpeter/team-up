@@ -36,7 +36,13 @@ from typing import Any, Callable, Optional
 HERDR = os.environ.get("HERDR_BIN", "herdr")
 STATE_DIR = Path(os.environ.get("HWF_STATE_DIR") or Path.home() / ".hwf/state") / "member-wait"
 NTFY_URL = "https://ntfy.sh/pjh-herdr-task"
-MAX_WAIT_S, POLL_S, ERROR_GRACE_S, QUIET_S, REPEAT_S = 600, 30, 300, 900, 3600
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import jev_client as JC
+
+MAX_WAIT_S, POLL_S, ERROR_GRACE_S, JEV_QUIET_S, QUIET_S, REPEAT_S = 600, 30, 300, 180, 900, 3600
+JEV_STALL_PROB_MIN = 0.80
 EXIT_OK, EXIT_ERROR, EXIT_TIMEOUT, EXIT_STUCK, EXIT_USER = 0, 1, 3, 4, 5
 STATUSES = ("idle", "working", "blocked", "done", "unknown")
 TAIL_LINES = 15
@@ -96,17 +102,65 @@ def state_file(pane: str) -> Path:
     return STATE_DIR / (re.sub(r"[^A-Za-z0-9_-]", "_", pane) + ".json")
 
 
-def remember(pane: str, digest: str, now: float) -> float:
-    """记下屏幕指纹，返回这个画面从什么时候起就没变过。"""
+def remember(pane: str, digest: str, now: float) -> tuple[float, dict[str, Any]]:
+    """记下屏幕指纹，返回（画面静止起点秒数, 持久化状态字典）。同指纹保留 Jev 诊断缓存，避免每 30 秒重复请求。"""
     path = state_file(pane)
     try:
         saved = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         saved = {}
-    since = saved.get("since", now) if saved.get("digest") == digest else now
+    if saved.get("digest") == digest:
+        since = float(saved.get("since", now))
+        record = dict(saved)
+    else:
+        since = now
+        record = {"digest": digest, "since": since}
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"digest": digest, "since": since}), encoding="utf-8")
-    return float(since)
+    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    return since, record
+
+
+def save_pane_state(pane: str, record: dict[str, Any]) -> None:
+    path = state_file(pane)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+
+
+def diagnose_quiet_with_jev(tail: str, client: Optional[JC.JevClient] = None) -> tuple[str, str]:
+    """当成员 working 但屏幕已静默满 3 分钟且未命中固定正则时，用 Jev 识别隐藏的交互确认、鉴权失效或断连。"""
+    jev = client if client is not None else JC.default_client()
+    snippet = "\n".join(tail.split("\n")[-30:])[-4000:]
+    if not snippet.strip():
+        return "", ""
+    try:
+        res = jev.decide(
+            state={"terminal_screen_tail": snippet},
+            questions={
+                "stall_kind": JC.Choice(
+                    "A coding agent pane reports status=working, and its visible terminal screen has not changed for 3 minutes. Classify what the screen shows.",
+                    {
+                        "normal_running": "Normal long-running command, test run, build, compilation, or model thinking with no blocking prompt or fatal error.",
+                        "interactive_prompt": "Blocked on an interactive confirmation (y/N), password/passphrase prompt, login prompt, editor prompt, or human input.",
+                        "auth_or_quota": "Authentication/session failure, proxy/gateway outage, 401/402/403/503 error, or quota/rate-limit exhaustion.",
+                        "network_drop": "Network disconnect, socket/TLS hang, stream dropped, or stuck retry loop.",
+                    },
+                )
+            },
+        )
+        selected, _, probs = res.choice("stall_kind")
+    except JC.JevUnavailableError:
+        return "", ""
+
+    prob = probs.get(selected, 0.0)
+    if prob < JEV_STALL_PROB_MIN or selected == "normal_running":
+        return "normal", ""
+    if selected == "interactive_prompt":
+        return "user_immediate", f"屏幕停在交互确认或输入提示（Jev 置信度 {prob:.0%}）"
+    if selected == "auth_or_quota":
+        return "user", f"屏幕出现鉴权、代理或额度异常（Jev 置信度 {prob:.0%}）"
+    if selected == "network_drop":
+        return "network", f"屏幕处于断网或连接挂死（Jev 置信度 {prob:.0%}）"
+    return "normal", ""
 
 
 def load_record() -> Any:
@@ -156,7 +210,8 @@ def ntfy(title: str, body: str) -> bool:
 
 
 def wait(target: str, until: set[str], repo: Optional[str], task: Optional[str],
-         clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep) -> tuple[int, str]:
+         clock: Callable[[], float] = time.time, sleep: Callable[[float], None] = time.sleep,
+         *, jev: Optional[JC.JevClient] = None) -> tuple[int, str]:
     start = clock()
     last_pane = target
     while True:
@@ -177,10 +232,24 @@ def wait(target: str, until: set[str], repo: Optional[str], task: Optional[str],
                 return EXIT_ERROR, f"{target} 已不存在（会话已退出或窗格已关闭），请用 STATE/herdr pane list 核对产物后处理"
             raise
         kind, reason = diagnose(tail)
-        quiet = now - remember(pane, hashlib.sha256(tail.encode()).hexdigest(), now)
+        since, pane_record = remember(pane, hashlib.sha256(tail.encode()).hexdigest(), now)
+        quiet = now - since
         # 报错字样要停留 5 分钟（画面不再变化）才算卡住：短暂断网成员自己会重连成功。
         if kind and quiet < ERROR_GRACE_S:
             kind = ""
+        if not kind and status == "working" and quiet >= JEV_QUIET_S:
+            if "jev_kind" not in pane_record:
+                j_kind, j_reason = diagnose_quiet_with_jev(tail, jev)
+                if j_kind:
+                    pane_record["jev_kind"] = j_kind
+                    pane_record["jev_reason"] = j_reason
+                    save_pane_state(pane, pane_record)
+            cached_kind = pane_record.get("jev_kind", "")
+            cached_reason = pane_record.get("jev_reason", "")
+            if cached_kind == "user_immediate":
+                kind, reason = "user", cached_reason
+            elif cached_kind in ("user", "network") and quiet >= ERROR_GRACE_S:
+                kind, reason = cached_kind, cached_reason
         if not kind and status == "working" and quiet >= QUIET_S:
             kind, reason = "network", f"working 但屏幕 {int(quiet // 60)} 分钟没有任何变化"
         if kind:

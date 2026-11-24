@@ -77,6 +77,18 @@ def _load(name: str, filename: str) -> Any:
 
 _WR = _load("wrapup", "wrapup.py")
 _FS = _WR._FS
+_JC = _load("jev_client", "jev_client.py")
+
+SECRET_TOKEN_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----"
+    r"|\bglpat-[A-Za-z0-9_-]{20,}\b"
+    r"|\bsk-(?:proj-|live-)?[A-Za-z0-9_-]{20,}\b"
+    r"|\bgh[pousr]_[A-Za-z0-9]{30,}\b"
+    r"|\bxox[baprs]-[A-Za-z0-9-]{20,}\b"
+)
+JEV_NOTE_SECRET_PROB = 0.75
+JEV_NOTE_CONCLUSION_PROB = 0.85
+LONG_OUTER_NOTE_CHARS = 350
 
 EXIT_OK, EXIT_ERROR, EXIT_HELD = 0, 1, 3
 QUIET, VERBOSE = "免打扰", "详尽"
@@ -1090,7 +1102,68 @@ def format_kind_tag(kind: str) -> str:
     return f"<!-- hwf-kind:{kind} -->"
 
 
-def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequence[str]) -> tuple[int, str]:
+def note_content_guard_problems(
+    body: str,
+    *,
+    kind: str,
+    jev: Optional[Any] = None,
+) -> list[str]:
+    """出门前拦截明文凭据外泄，并对发给用户的长评论核验是否满足『先说结论，再说细节』。"""
+    if SECRET_TOKEN_RE.search(body):
+        return ["评论正文命中高危私钥/Token 格式（如 glpat-/sk-/PRIVATE KEY），已拦截发送；请脱敏后再发"]
+    if kind not in QUIET_NOTIFY_KINDS:
+        return []
+
+    client = jev if jev is not None else _JC.default_client()
+    outer = _strip_folded_and_fences(body).strip()
+    check_structure = len(outer) >= LONG_OUTER_NOTE_CHARS
+    questions: dict[str, Any] = {
+        "secret_exposed": _JC.Noul(
+            instructions=(
+                "Does this outgoing GitLab issue comment expose a real plaintext password, API secret key, "
+                "access token, session cookie, or private key? "
+                "(Ignore git commit SHAs, `/uploads/<hex>/...` URLs, issue/MR links, and normal usernames.)"
+            ),
+            criteria={
+                "true": "Contains a real plaintext password, API key/token, cookie, or private key.",
+                "false": "Safe engineering/product text, URLs, commit SHAs, or masked placeholders.",
+            },
+        ),
+    }
+    if check_structure:
+        questions["missing_top_conclusion"] = _JC.Noul(
+            instructions=(
+                "Read `visible_summary` (the outer comment text shown directly to a non-technical user before any `<details>` fold). "
+                "Does it bury the main conclusion or required user decision at the bottom after long chronological debugging/investigation logs, "
+                "instead of stating the conclusion or required action upfront in the opening 1-2 sentences?"
+            ),
+            criteria={
+                "true": "Starts with long step-by-step investigation/process logs and hides the conclusion or user action at the end.",
+                "false": "States the conclusion, answer, or required user action clearly right at the top (even if followed by structured tables/points).",
+            },
+        )
+    try:
+        res = client.decide(
+            state={"comment_kind": kind, "visible_summary": outer[:4000], "full_body": body[:6000]},
+            questions=questions,
+        )
+    except _JC.JevUnavailableError:
+        return []
+
+    problems: list[str] = []
+    sec_prob = res.noul("secret_exposed")
+    if sec_prob >= JEV_NOTE_SECRET_PROB:
+        problems.append(f"Jev 检测到评论疑似包含明文密码或敏感密钥（置信度 {sec_prob:.0%}），请移除凭据后再发")
+    if check_structure and res.noul("missing_top_conclusion") >= JEV_NOTE_CONCLUSION_PROB:
+        problems.append(
+            "长评论未按「先说结论，再说细节」开头亮出结果或待用户决定事项；"
+            "请把结论/待办提炼到前两句，将排查经过移入 `<details>` 折叠区后再发"
+        )
+    return problems
+
+
+def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequence[str],
+         *, jev: Optional[Any] = None) -> tuple[int, str]:
     body = KIND_TAG.sub("", body).strip()
     if not body:
         raise RecordError("评论正文是空的")
@@ -1124,6 +1197,9 @@ def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequ
         ac_problems = acceptance_table_problems(body, kind=kind, repo=repo, task=task)
         if ac_problems:
             return EXIT_HELD, "没发：交卷评论未满足「验收标准逐条对账表」硬门禁：\n- " + "\n- ".join(ac_problems)
+    guard_problems = note_content_guard_problems(body, kind=kind, jev=jev)
+    if guard_problems:
+        return EXIT_HELD, "没发：评论内容未通过出门安全与可读性把关：\n- " + "\n- ".join(guard_problems)
     unknown = [text for verdict, text in results if verdict == "unknown"]
     if unknown:
         body += "\n\n自查没查出来的：\n" + "\n".join(f"- {text}" for text in unknown)

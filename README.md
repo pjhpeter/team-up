@@ -27,11 +27,11 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `herdr/droid-arch.json` | 架构师（droid）的模型与思考档；交互式 droid 只能用 `--settings` 文件指定 |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱、飞书桥、周期复盘（`retrospect.py`）、主动接活（`proactive.py`）、找调度者、按角色领取与跨目录复用成员（`member-start.py`）、阶段中释放空闲成员（`member-release.py`，支持待上线前 `--all-idle`）、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件生成有效 `/-/project/<id>/uploads/...` 直链并回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、长记录自动归档 `STATE-history.md`、按通知模式发评论、拦截交卷评论缺失或折叠藏匿的逐条验收录屏对账表、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删本单与跨仓登记 worktree、发收尾回执、写 INDEX）、清理过期临时目录与干净 worktree（`clean-tmp.py`）、新项目接入等脚本 |
+| `scripts/` | 收件箱（含对话模式自然语言开工识别）、飞书桥、TypeSafe Jev 公共客户端（`jev_client.py`：概率决策、钥匙串读密与图片尺寸自动归一化）、团队铁律语义预检（`semantic-lint.py`：进代码评审前扫描 12 条红线与提示项）、周期复盘（`retrospect.py`）、主动接活（`proactive.py`：Jev 概率初筛 + 大模型研判）、找调度者、按角色领取与跨目录复用成员（`member-start.py`）、成员监听与静默屏幕排障（`member-wait.py`）、阶段中释放空闲成员（`member-release.py`，支持待上线前 `--all-idle`）、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件并做空白废片/明文密码视觉拦截与回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部、长记录自动归档 `STATE-history.md`、按通知模式发评论、拦截敏感凭据外泄与长文未先写结论、拦截交卷评论缺失或折叠藏匿的逐条验收录屏对账表、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：关成员、删本单与跨仓登记 worktree、发收尾回执、写 INDEX）、清理过期临时目录与干净 worktree（`clean-tmp.py`）、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `omp-extensions/` | omp 扩展：调度者手改 INDEX 或直接用 glab 发 issue 评论时拦下，要求改用 `task-record.py`（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
-| `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔；`proactive` 段是主动接活配置，`retrospect` 段是周二/周五中午周期复盘配置 |
+| `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔；`proactive` 段是主动接活配置，`retrospect` 段是周二/周五中午周期复盘配置，`typesafe` 段是 TypeSafe Jev（`jev-1.14.0`）模型与钥匙串服务名配置（未配密钥时各关卡自动回退原确定性规则与大模型流程） |
 | `proactive-rules.md` | 主动接活的规则：什么情况 → 做什么，每条规则单独一档 |
 
 不入库（每台电脑自己的）：`state/`（运行状态）、`gitlab-inbox.local.json`（每个项目在本机的仓库路径，也可覆盖共用配置里的其他值，比如换成你自己的白名单账号）。
@@ -76,7 +76,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | 每小时巡检 | 有变化或异常（等你处理、已待上线但调度者没 @你 请求授权合并、调度者卡住或退出、超过 3 小时没动静）才汇报，没变化不发 |
 | 快速回复 | 对某条转达点「回复」，机器人知道你指的是哪张任务；提问就回答，指令或补充才转交，`/go` 等显式命令仍可直接发 |
 | 替你传话 | 说「告诉 484 和 488，测试环境已恢复，继续工作」，秘书分别在对应 issue 下 @Agent 留言，并合并回报每项结果；不同任务的指令分别转交，不会混发。部分未完成可回复「重试未完成项」，已成功项不会重复发送；发送结果不明时先核对任务评论，不盲目重发 |
-| 回答提问 | 发「进度」看总览，发「帮助」看用法；自然任务走共享识别入口，其余提问按总览、各需求最近评论和最近转达回答。识别复用秘书的模型配置（`feishu-bridge.local.json` 的 `secretary.model`、`thinking`） |
+| 回答提问 | 发「进度」看总览，发「帮助」看用法；目标已确定的单任务回复优先经 Jev 秒级快转直达对应调度者，新建、批量、追问与其余总览提问走秘书模型（`feishu-bridge.local.json` 的 `secretary.model`、`thinking`） |
 
 「需求：…」、`#编号` 和 `/go` 仍是快捷方式，不是必填格式。各需求自己的话题照常保留（默认免打扰），想看某个需求的完整经过去话题里看。自然语言开工不包含上线、合并 main 或其他原本需要单独授权的操作。
 
@@ -86,7 +86,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 ## 主动接活（observe 档）
 
-没人叫 Agent 时，收件箱每 10 分钟看一遍 GitLab 新开的 issue（创建满 2 小时仍没人指派的）和 main / release-* 失败的流水线，再加上飞书「观察群」里的对话，按 `proactive-rules.md` 逐条判断 Agent 本来该不该主动接活。observe 档**只记录、不动手**：对 GitLab 只读，不在飞书说话，不启动调度者。
+没人叫 Agent 时，收件箱每 10 分钟看一遍 GitLab 新开的 issue（创建满 2 小时仍没人指派的）和 main / release-* 失败的流水线，再加上飞书「观察群」里的对话，先经 Jev 概率初筛过滤明显闲聊与已延续话题，命中候选再按 `proactive-rules.md` 交大模型逐条判断 Agent 本来该不该主动接活。observe 档**只记录、不动手**：对 GitLab 只读，不在飞书说话，不启动调度者。
 
 | 要做的事 | 怎么做 |
 | --- | --- |

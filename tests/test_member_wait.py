@@ -165,6 +165,79 @@ class WaitTests(Case):
         self.assertIn("已不存在", text)
         self.assertFalse(MW.state_file("w18:pB2").exists())
 
+    def test_jev_detects_interactive_prompt_at_three_minutes_and_caches_per_digest(self) -> None:
+        calls = 0
+
+        class FakeWaitJev:
+            def decide(self, **_: Any) -> Any:
+                nonlocal calls
+                calls += 1
+                return MW.JC.JevResult.from_payload({
+                    "model": "jev-1.14.0",
+                    "answers": {
+                        "stall_kind": {
+                            "type": "choice",
+                            "choice": "interactive_prompt",
+                            "confidence": 0.90,
+                            "probabilities": {
+                                "normal_running": 0.03,
+                                "interactive_prompt": 0.92,
+                                "auth_or_quota": 0.03,
+                                "network_drop": 0.02,
+                            },
+                        }
+                    },
+                })
+
+        world = World(["working"], ["? Overwrite local config file? (y/N): "])
+        with patch.object(MW, "herdr", world):
+            code, text = MW.wait(
+                "i47-code-review", {"idle", "done"}, self.repo, TASK,
+                self.clock, self.clock.sleep, jev=FakeWaitJev(),
+            )
+        self.assertEqual(code, MW.EXIT_USER)
+        self.assertIn("交互确认", text)
+        self.assertEqual(calls, 1)
+        self.assertLessEqual(self.clock.now - 1_000_000.0, MW.JEV_QUIET_S + MW.POLL_S)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_jev_network_drop_respects_five_minute_grace_without_duplicate_api_calls(self) -> None:
+        calls = 0
+
+        class FakeWaitJev:
+            def decide(self, **_: Any) -> Any:
+                nonlocal calls
+                calls += 1
+                return MW.JC.JevResult.from_payload({
+                    "model": "jev-1.14.0",
+                    "answers": {
+                        "stall_kind": {
+                            "type": "choice",
+                            "choice": "network_drop",
+                            "confidence": 0.88,
+                            "probabilities": {
+                                "normal_running": 0.04,
+                                "interactive_prompt": 0.02,
+                                "auth_or_quota": 0.04,
+                                "network_drop": 0.90,
+                            },
+                        }
+                    },
+                })
+
+        world = World(["working"], ["[transport] upstream socket closed unexpectedly, retrying #14"])
+        with patch.object(MW, "herdr", world):
+            code, text = MW.wait(
+                "i47-code-review", {"idle", "done"}, self.repo, TASK,
+                self.clock, self.clock.sleep, jev=FakeWaitJev(),
+            )
+        self.assertEqual(code, MW.EXIT_STUCK)
+        self.assertIn("断网或连接挂死", text)
+        # 180s 查询一次并缓存到指纹文件，300s 宽限期满直接生效，不每 30s 重复调用 API。
+        self.assertEqual(calls, 1)
+        self.assertGreaterEqual(self.clock.now - 1_000_000.0, MW.ERROR_GRACE_S)
+        self.assertLessEqual(self.clock.now - 1_000_000.0, MW.ERROR_GRACE_S + MW.POLL_S)
+
 
 if __name__ == "__main__":
     unittest.main()

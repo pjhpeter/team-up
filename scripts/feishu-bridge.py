@@ -1431,7 +1431,7 @@ def stop_children(*_: Any) -> None:
 def watched_scripts(base_dir: Optional[Path] = None) -> tuple[Path, ...]:
     root = base_dir or Path(__file__).resolve().parent
     return tuple(root / name for name in (
-        "feishu-bridge.py", "secretary.py", "task_intent.py", "feishu_topics.py", "proactive.py"
+        "feishu-bridge.py", "secretary.py", "task_intent.py", "feishu_topics.py", "proactive.py", "jev_client.py"
     ))
 
 

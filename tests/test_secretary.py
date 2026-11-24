@@ -601,6 +601,24 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("交付收尾", self.forwarded()[-1]["text"])
         self.assertEqual(self.state["secretary"]["issues"], {})
 
+    def test_jev_quiet_fallback_suppresses_untagged_progress_noise_and_forwards_real_answers(self) -> None:
+        answers = [0.06, 0.91]
+        self.sec.jev = SEC._JC.JevClient(
+            {"api_key": "ts-test"},
+            transport=lambda *a: {
+                "model": "jev-1.14.0",
+                "answers": {"attention": {"type": "noul", "noul": answers.pop(0)}},
+                "usage": {},
+            },
+            sleep_fn=lambda _: None,
+        )
+        self.w.agent_note(7, "已切换到独立分支跑完构建，准备进入下一阶段自检。")
+        self.w.agent_note(7, "排查结果：白屏是因为 CDN 缓存未刷新，刷新后已恢复正常。")
+        self.sec.poll()
+        texts = [s["text"] for s in self.forwarded()]
+        self.assertEqual(len(texts), 1)
+        self.assertIn("白屏是因为 CDN 缓存未刷新", texts[0])
+
 
 if __name__ == "__main__":
     unittest.main()

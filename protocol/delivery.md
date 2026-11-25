@@ -84,6 +84,7 @@ scheduler 回收实际输出，核对：
 - 对话模式未开工即关单：若本任务仍处于只读对话模式、未收到开工授权且无在途分支/代码改动/未合并 MR，用户主动关闭发起 issue 即视为结束本次咨询（取消），直接运行 `wrapup.py --status "cancelled（对话模式未开工，用户已关闭 issue）" --no-issue-note` 静默释放成员并更新 INDEX，**禁止在原 issue 发追问评论、发回执评论或发送待办 ntfy**。
 - 已进入交付流程但已关 issue 且缺证、未明确取消：不自动重开、不标已交付，说明缺项，请用户重开继续或明确取消，INDEX 保持 blocked。每轮测试服务仍关闭，空闲成员按 `scheduling.md`「pane 收尾」运行 `member-release.py --issue <编号> --all-idle` 释放，worktree 与证据留到用户决定；关闭事件不触发破坏性清理。
 - 全部完成或用户明确取消才收尾；取消记录未交付项与用户原话。进入等待用户（`state-set 待用户事项` / `状态:待上线`）及运行 `wrapup.py` 收尾前，脚本会自动核对原 issue 最新一条用户非系统留言是否已有晚于它的实质回复（`answer` / `todo` / `risk` / `delivery-done`），漏回时须先补发简短 `answer` 再停下或收尾。发起 issue 按本节「发起 issue 的关闭授权」处理；验收回复不替代 main 合并授权。
+- 大改动、多步骤交卷或长阻塞交接时，可运行 `python3 ~/.hwf/scripts/task-record.py brief-html --repo <主仓库> --task <任务标识> [--open]` 生成本地「30 秒恢复现场 HTML」（含阶段流图、刻意不做范围、风险速查、核心四问卡与快捷回复栏）供用户快速切回上下文；极简/debug 路径不强制加此步骤。
 
 冒烟通过且代码已汇总后，原 issue 中文完成评论（步骤完成用 `--kind step-done`，整项或 debug 交卷用 `--kind delivery-done`）写简短结论摘要、HEAD、develop MR、成功部署作业、汇总或上线 MR/SHA、本步新增待定项数量，并在简短摘要正下方、`<details>` 折叠全文**之外**直接附上**「验收标准逐条对账表」**（该表不计入 15 行文字摘要上限，`task-record.py note` 硬校验通过后才允许发出）：
 

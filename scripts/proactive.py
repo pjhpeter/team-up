@@ -884,6 +884,8 @@ def render_report(files: Files, rules: Sequence[Mapping[str, Any]], state: Mappi
     records = list(reversed(files.read(files.records)))
     marks = latest_marks(files)
     cards = scorecards(files, rules, state, now)
+    rule_ids = [str(r["id"]) for r in rules] or ["R1", "R2", "R3"]
+    rule_options = "".join(f"<option value='{e(rid)}'>{e(rid)}</option>" for rid in rule_ids)
 
     def card(c: Mapping[str, Any]) -> str:
         p = "—" if c["precision"] is None else f"{c['precision']:.0%}"
@@ -896,23 +898,46 @@ def render_report(files: Files, rules: Sequence[Mapping[str, Any]], state: Mappi
                 f"<small>版本 {e(c['version'])} · 建议门槛：已标注 ≥10、准确率 ≥90%、严重误接 0、观察 ≥7 天</small></div>")
 
     def row(rec: Mapping[str, Any]) -> str:
-        m = marks.get(rec["id"])
+        rid = str(rec["id"])
+        m = marks.get(rid)
         hits = " ".join(f"<span class='t amber' title='{e(x['why'])}'>{e(x['id'])}</span>" for x in rec["rules"] if x["hit"])
         mark_html = (f"<span class='t {'green' if m['mark'] == 'ok' else 'red'}'>{MARK_LABEL[m['mark']]}</span> {e(m.get('reason') or '')}"
                      if m else "<span class='t gray'>待标</span>")
-        cmds = ([f"mark {rec['id']} ok", f"mark {rec['id']} wrong 理由"] if rec["verdict"] == "would_accept"
-                else [f"mark {rec['id']} should R? 理由"])
+        is_accept = rec["verdict"] == "would_accept"
+        cmds = ([f"mark {rid} ok", f"mark {rid} wrong 理由"] if is_accept
+                else [f"mark {rid} should R? 理由"])
+        if is_accept:
+            picker = (
+                f"<div class='picker' data-rid='{e(rid)}' data-mode='accept'>"
+                f"<div class='p-btns'>"
+                f"<button type='button' class='p-btn' data-rid='{e(rid)}' data-val='ok'>判对了</button>"
+                f"<button type='button' class='p-btn' data-rid='{e(rid)}' data-val='wrong'>判错了</button>"
+                f"</div>"
+                f"<input type='text' class='p-reason' data-rid='{e(rid)}' placeholder='判错理由（含「严重」算严重误接）'>"
+                f"</div>"
+            )
+        else:
+            picker = (
+                f"<div class='picker' data-rid='{e(rid)}' data-mode='miss'>"
+                f"<div class='p-btns'>"
+                f"<button type='button' class='p-btn' data-rid='{e(rid)}' data-val='should'>标漏接</button>"
+                f"<select class='p-rule' data-rid='{e(rid)}' aria-label='漏接规则'>{rule_options}</select>"
+                f"</div>"
+                f"<input type='text' class='p-reason' data-rid='{e(rid)}' placeholder='漏接理由（可选）'>"
+                f"</div>"
+            )
         flag = f"<div class='flag'>⚠ {e(rec['flag'])}，看看规则写得清不清楚</div>" if rec.get("flag") else ""
         who = f" · {e('、'.join(rec.get('speakers') or []))}" if rec.get("speakers") else ""
         title = f"<a href='{e(rec['url'])}'>{e(rec['title'])}</a>" if rec.get("url") else e(rec["title"])
         why = "；".join(f"{x['id']}：{x['why']}" for x in rec["rules"] if x.get("why"))
-        return (f"<div class='row'><div><code>{e(rec['id'])}</code><small>{e(rec['at'][5:16].replace('T', ' '))}</small></div>"
+        return (f"<div class='row' data-row='{e(rid)}' data-title='{e(str(rec.get('title') or ''))}'>"
+                f"<div><code>{e(rid)}</code><small>{e(rec['at'][5:16].replace('T', ' '))}</small></div>"
                 f"<div><b>{title}</b><small>{e(KIND_LABEL.get(rec['kind'], rec['kind']))}{who}</small>"
                 f"<div>{e(rec.get('summary') or '')}</div>"
                 + (f"<div class='plan'>打算：{e(rec['plan'])}</div>" if rec.get("plan") else "")
                 + (f"<details><summary>逐条理由</summary>{e(why)}</details>" if why else "") + flag +
-                f"</div><div>{hits or '—'}</div><div>{mark_html}<div class='cmd'>"
-                + "".join(f"<code>proactive.py {e(c)}</code>" for c in cmds) + "</div></div></div>")
+                f"</div><div>{hits or '—'}</div><div>{mark_html}{picker}<details class='raw-cmd'><summary>单条命令</summary><div class='cmd'>"
+                + "".join(f"<code>proactive.py {e(c)}</code>" for c in cmds) + "</div></details></div></div>")
 
     groups = {
         "本来会接": [r for r in records if r["verdict"] == "would_accept"],
@@ -926,22 +951,162 @@ def render_report(files: Files, rules: Sequence[Mapping[str, Any]], state: Mappi
         sections.append(f"<details {'open' if i == 0 else ''}><summary><h2>{e(name)}（{len(rows)}）</h2></summary>{body}</details>")
     return REPORT_TEMPLATE.format(when=e(datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M")),
                                   cards="".join(card(c) for c in cards) or "<p class='empty'>没有启用的规则</p>",
-                                  sections="".join(sections))
+                                  sections="".join(sections),
+                                  script=REPORT_SCRIPT)
+
+
+REPORT_SCRIPT = """<script>
+const STORAGE_KEY = "hwf-proactive-marks-draft-v1";
+let picks = {};
+try { picks = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch (_e) { picks = {}; }
+
+function savePicks() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(picks)); } catch (_e) {}
+}
+
+function shQuote(s) {
+  return "'" + String(s).replace(/'/g, "'\\''") + "'";
+}
+
+function buildCommands() {
+  const lines = [];
+  for (const [rid, item] of Object.entries(picks)) {
+    if (!item || !item.kind) continue;
+    const reason = (item.reason || "").trim();
+    if (item.kind === "ok") {
+      lines.push(`python3 ~/.hwf/scripts/proactive.py mark ${rid} ok`);
+    } else if (item.kind === "wrong") {
+      lines.push(`python3 ~/.hwf/scripts/proactive.py mark ${rid} wrong ${shQuote(reason || "误判")}`);
+    } else if (item.kind === "should") {
+      const rule = item.rule || "R2";
+      const extra = reason ? " " + shQuote(reason) : "";
+      lines.push(`python3 ~/.hwf/scripts/proactive.py mark ${rid} should ${rule}${extra}`);
+    }
+  }
+  return lines.join("\\n");
+}
+
+function buildAgentPrompt() {
+  const entries = Object.entries(picks).filter(([, v]) => v && v.kind);
+  if (!entries.length) return "";
+  const lines = ["请帮我执行以下主动接活观察标注（逐条运行 proactive.py mark）："];
+  for (const [rid, item] of entries) {
+    const reason = (item.reason || "").trim();
+    if (item.kind === "ok") lines.push(`- ${rid}：判对了（ok）`);
+    else if (item.kind === "wrong") lines.push(`- ${rid}：判错了（wrong）｜理由：${reason || "误判"}`);
+    else if (item.kind === "should") lines.push(`- ${rid}：漏接（should ${item.rule || "R2"}）${reason ? "｜理由：" + reason : ""}`);
+  }
+  return lines.join("\\n");
+}
+
+function syncUI() {
+  const activeCount = Object.values(picks).filter(v => v && v.kind).length;
+  document.querySelectorAll(".picker").forEach(box => {
+    const rid = box.dataset.rid;
+    const cur = picks[rid] || {};
+    box.querySelectorAll(".p-btn").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.val === cur.kind);
+      btn.classList.toggle("active-bad", btn.dataset.val === cur.kind && cur.kind !== "ok");
+    });
+    const inp = box.querySelector(".p-reason");
+    if (inp && inp.value !== (cur.reason || "")) inp.value = cur.reason || "";
+    const sel = box.querySelector(".p-rule");
+    if (sel && cur.rule && sel.value !== cur.rule) sel.value = cur.rule;
+    const row = box.closest(".row");
+    if (row) row.classList.toggle("picked", Boolean(cur.kind));
+  });
+  document.getElementById("dockStat").innerHTML = activeCount
+    ? `已勾选 <b>${activeCount}</b> 条待标注`
+    : "在每条右侧点选「判对了 / 判错了 / 标漏接」，即可一键批量复制";
+  const area = document.getElementById("previewArea");
+  area.value = buildCommands() || "（尚未勾选任何记录）";
+}
+
+function showToast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { el.textContent = ""; }, 3000);
+}
+
+async function copyText(text, okMsg) {
+  if (!text) { showToast("请先勾选至少一条记录"); return; }
+  const area = document.getElementById("previewArea");
+  area.value = text;
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); showToast(okMsg); return; } catch (_e) {}
+  }
+  document.getElementById("previewWrap").classList.add("open");
+  area.focus();
+  area.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (_e) {}
+  showToast(ok ? okMsg : "已展开文本框，请按 Cmd+C 复制");
+}
+
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".p-btn");
+  if (btn) {
+    const rid = btn.dataset.rid;
+    const val = btn.dataset.val;
+    const cur = picks[rid] || {};
+    if (cur.kind === val) {
+      delete picks[rid];
+    } else {
+      const sel = document.querySelector(`.p-rule[data-rid="${rid}"]`);
+      picks[rid] = { kind: val, reason: cur.reason || "", rule: sel ? sel.value : (cur.rule || "R2") };
+    }
+    savePicks();
+    syncUI();
+    return;
+  }
+  if (ev.target.id === "btnCopyCmd") { copyText(buildCommands(), "已复制批量终端命令"); return; }
+  if (ev.target.id === "btnCopyPrompt") { copyText(buildAgentPrompt(), "已复制标注指令，粘回会话即可"); return; }
+  if (ev.target.id === "btnClear") { picks = {}; savePicks(); syncUI(); showToast("已清空勾选"); return; }
+  if (ev.target.id === "btnPreview") { document.getElementById("previewWrap").classList.toggle("open"); }
+});
+
+document.addEventListener("input", (ev) => {
+  const inp = ev.target.closest(".p-reason");
+  if (!inp) return;
+  const rid = inp.dataset.rid;
+  const box = inp.closest(".picker");
+  const cur = picks[rid] || { kind: box && box.dataset.mode === "accept" ? "wrong" : "should" };
+  cur.reason = inp.value;
+  const sel = box && box.querySelector(".p-rule");
+  if (sel) cur.rule = sel.value;
+  picks[rid] = cur;
+  savePicks();
+  syncUI();
+});
+
+document.addEventListener("change", (ev) => {
+  const sel = ev.target.closest(".p-rule");
+  if (!sel) return;
+  const rid = sel.dataset.rid;
+  picks[rid] = Object.assign({ kind: "should", reason: "" }, picks[rid] || {}, { rule: sel.value });
+  savePicks();
+  syncUI();
+});
+
+syncUI();
+</script>"""
 
 
 REPORT_TEMPLATE = """<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>主动接活观察报告</title><style>
-:root{{--bg:#f7f7f5;--card:#fff;--ink:#1f2328;--muted:#5d646d;--line:#d8dbe0;--amber:#a8650a;--amber-bg:#fdf3e1;
+:root{{--bg:#f7f7f5;--card:#fff;--ink:#1f2328;--muted:#5d646d;--line:#d8dbe0;--accent:#0969da;--amber:#a8650a;--amber-bg:#fdf3e1;
 --green:#1f8a4c;--green-bg:#e6f5ec;--red:#c23b3b;--red-bg:#fbeaea;--gray-bg:#eef0f2}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#16181b;--card:#1f2226;--ink:#e6e8eb;--muted:#9aa1a9;--line:#353a40;
+@media (prefers-color-scheme:dark){{:root{{--bg:#16181b;--card:#1f2226;--ink:#e6e8eb;--muted:#9aa1a9;--line:#353a40;--accent:#58a6ff;
 --amber:#e4ac55;--amber-bg:#3a2d16;--green:#5cc98a;--green-bg:#18352a;--red:#ef8080;--red-bg:#3d1f1f;--gray-bg:#2a2e33}}}}
 body{{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif}}
-main{{max-width:1080px;margin:0 auto;padding:24px 16px 60px}}h1{{font-size:22px;margin:0}}h2{{display:inline;font-size:17px}}
+main{{max-width:1080px;margin:0 auto;padding:24px 16px 130px}}h1{{font-size:22px;margin:0}}h2{{display:inline;font-size:17px}}
 .sub{{color:var(--muted);margin:4px 0 16px}}.cards{{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:12px}}
 .card,.row{{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}}
+.row.picked{{border-color:var(--accent)}}
 .nums{{display:grid;grid-template-columns:repeat(6,1fr);gap:6px;margin:8px 0;text-align:center;font-size:12px;color:var(--muted)}}
 .nums i{{display:block;font-style:normal;font-size:18px;color:var(--ink);font-weight:600}}
-.row{{display:grid;grid-template-columns:90px 1fr 110px 230px;gap:12px;margin:8px 0}}
+.row{{display:grid;grid-template-columns:90px 1fr 110px 250px;gap:12px;margin:8px 0}}
 @media (max-width:760px){{.row{{grid-template-columns:1fr}}.nums{{grid-template-columns:repeat(3,1fr)}}}}
 small{{display:block;color:var(--muted);font-size:12px}}.plan{{color:var(--muted)}}.flag{{color:var(--amber);font-size:13px}}
 .t{{display:inline-block;font-size:12px;padding:0 8px;border-radius:99px;font-weight:600}}
@@ -950,9 +1115,31 @@ small{{display:block;color:var(--muted);font-size:12px}}.plan{{color:var(--muted
 code{{font:12px ui-monospace,Menlo,monospace;background:var(--gray-bg);padding:1px 5px;border-radius:4px}}
 .cmd code{{display:block;margin-top:4px;user-select:all;overflow-wrap:anywhere}}summary{{cursor:pointer;margin:18px 0 6px}}
 a{{color:inherit}}.empty{{color:var(--muted)}}details details summary{{margin:4px 0;font-size:12px;color:var(--muted)}}
+.picker{{margin-top:8px;display:flex;flex-direction:column;gap:6px}}
+.p-btns{{display:flex;gap:6px;flex-wrap:wrap;align-items:center}}
+.p-btn,.p-rule,.dock-btn{{border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:7px;padding:4px 9px;font-size:12px;cursor:pointer}}
+.p-btn.active{{background:var(--green);color:#fff;border-color:var(--green);font-weight:600}}
+.p-btn.active-bad{{background:var(--red);color:#fff;border-color:var(--red);font-weight:600}}
+.p-reason{{width:100%;box-sizing:border-box;border:1px solid var(--line);background:var(--bg);color:var(--ink);border-radius:7px;padding:5px 8px;font-size:12px}}
+.raw-cmd summary{{margin:6px 0 0;font-size:12px;color:var(--muted)}}
+.dock{{position:fixed;left:0;right:0;bottom:0;background:var(--card);border-top:1px solid var(--line);box-shadow:0 -4px 18px rgba(0,0,0,.08);padding:10px 16px;z-index:50}}
+.dock-in{{max-width:1080px;margin:0 auto;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:8px}}
+.dock-actions{{display:flex;flex-wrap:wrap;gap:6px;align-items:center}}
+.dock-btn.primary{{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}}
+.toast{{font-size:12px;color:var(--green);font-weight:600}}
+.preview-wrap{{max-width:1080px;margin:8px auto 0;display:none}}.preview-wrap.open{{display:block}}
+.preview-area{{width:100%;box-sizing:border-box;min-height:92px;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--bg);color:var(--ink);font:12px/1.5 ui-monospace,Menlo,monospace}}
 </style></head><body><main><h1>主动接活观察报告</h1>
-<p class="sub">生成于 {when} · observe 档只记录、不动手 · 标注命令在每条右侧，复制到终端运行（前面加 python3 ~/.hwf/scripts/）</p>
-<div class="cards">{cards}</div>{sections}</main></body></html>"""
+<p class="sub">生成于 {when} · observe 档只记录、不动手 · 右侧可直接点选「判对了 / 判错了 / 标漏接」，再点底部一键复制批量命令或发给 Agent</p>
+<div class="cards">{cards}</div>{sections}</main>
+<div class="dock"><div class="dock-in"><div id="dockStat"></div><div class="dock-actions">
+<span class="toast" id="toast" role="status" aria-live="polite"></span>
+<button type="button" class="dock-btn" id="btnClear">清空勾选</button>
+<button type="button" class="dock-btn" id="btnPreview">查看/手动复制</button>
+<button type="button" class="dock-btn" id="btnCopyPrompt">复制给 Agent 执行</button>
+<button type="button" class="dock-btn primary" id="btnCopyCmd">复制终端批量命令</button>
+</div></div><div class="preview-wrap" id="previewWrap"><textarea class="preview-area" id="previewArea" readonly></textarea></div></div>
+{script}</body></html>"""
 
 
 def replay(scout: Scout, rule_id: str, days: int) -> str:

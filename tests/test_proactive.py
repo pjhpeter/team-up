@@ -423,6 +423,10 @@ class ScoutTest(unittest.TestCase):
         page = P.render_report(self.files, rules, self.scout.state, self.t)
         self.assertIn("主动接活观察报告", page)
         self.assertIn(f"proactive.py mark {recs[0]['id']} ok", page)
+        self.assertIn("复制终端批量命令", page)
+        self.assertIn("复制给 Agent 执行", page)
+        self.assertIn("buildCommands", page)
+        self.assertIn("data-val='wrong'", page)
 
     def test_replay_compares_with_marks_without_touching_records(self) -> None:
         self.first_tick()

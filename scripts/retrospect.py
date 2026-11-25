@@ -962,18 +962,26 @@ def render_html_report(
 
     if items:
         item_rows = "".join(
-            f"<tr>"
+            f"<tr data-item-idx='{idx}'>"
             f"<td><b>#{idx}</b> <span class='tag p-{e(it['priority'].lower())}'>{e(it['priority'])}</span></td>"
             f"<td><span class='tag'>{e(it['area'])}</span></td>"
             f"<td><b>{e(it['title'])}</b><div class='muted'>{e(it['symptom_and_evidence'])}</div></td>"
             f"<td>{e(it['root_cause'])}</td>"
             f"<td>{e(it['action'])}</td>"
             f"<td>{e(it['effort'])}</td>"
+            f"<td><div class='pick-cell' data-idx='{idx}'>"
+            f"<div class='pick-btns'>"
+            f"<button type='button' class='pick-btn' data-idx='{idx}' data-act='do'>要做</button>"
+            f"<button type='button' class='pick-btn' data-idx='{idx}' data-act='adjust'>调整</button>"
+            f"<button type='button' class='pick-btn' data-idx='{idx}' data-act='skip'>先不做</button>"
+            f"</div>"
+            f"<input type='text' class='pick-note' data-idx='{idx}' placeholder='可选备注/补充要求'>"
+            f"</div></td>"
             f"</tr>"
             for idx, it in enumerate(items, 1)
         )
     else:
-        item_rows = "<tr><td colspan='6' class='empty'>本周期各项运行平稳，未发现需要折腾的新优化点。</td></tr>"
+        item_rows = "<tr><td colspan='7' class='empty'>本周期各项运行平稳，未发现需要折腾的新优化点。</td></tr>"
 
     evo_rows_parts: list[str] = []
     git_meta = evo.get("git") or {}
@@ -1066,8 +1074,38 @@ def render_html_report(
         f"<td>{e(jev_win_brief)}</td></tr>",
     ])
 
+    period_text = f"{win['since_label']} ~ {win['until_label']}"
+    pick_payload = {
+        "period": period_text,
+        "items": [
+            {
+                "idx": idx,
+                "priority": str(it["priority"]),
+                "area": str(it["area"]),
+                "title": str(it["title"]),
+                "action": str(it["action"]),
+            }
+            for idx, it in enumerate(items, 1)
+        ],
+    }
+    pick_json = json.dumps(pick_payload, ensure_ascii=False).replace("</", "<\\/")
+
+    fq_what = (
+        f"本周期复盘 {digest['delivery']['active_tasks_count']} 个活跃任务与 {total_jev_calls} 次 Jev 关卡调用，"
+        f"自动生效 {len(applied_list)} 项规则变更，提炼 {len(items)} 项待拍板优化点。"
+    )
+    fq_why = f"{analysis['solution_plain']}（原因：{analysis['why_plain']}）"
+    fq_break = (
+        f"安全与授权红线已硬锁死不可自动放宽；本轮护栏拦截 {len(rejected_list)} 项不合规自动提议。"
+        "若强行放开红线、跳过单测回滚或在样本不足时自动淘汰规则，会造成误放行或漏拦。"
+    )
+    fq_learn = (
+        f"本周期最核心信号：{analysis['headline']}"
+        + (f"（最高优：{items[0]['title']}）" if items else "")
+    )
+
     return HTML_TEMPLATE.format(
-        period=f"{e(win['since_label'])} ~ {e(win['until_label'])}",
+        period=e(period_text),
         when=e(fmt_local(generated_at)),
         headline=e(analysis["headline"]),
         problem=e(analysis["problem_plain"]),
@@ -1083,7 +1121,116 @@ def render_html_report(
         gate_rule_rows=gate_rule_rows,
         sys_rows=sys_rows,
         task_rows=task_rows,
+        fq_what=e(fq_what),
+        fq_why=e(fq_why),
+        fq_break=e(fq_break),
+        fq_learn=e(fq_learn),
+        script=RETROSPECT_PICKER_SCRIPT.replace("__PICK_DATA__", pick_json),
     )
+
+
+RETROSPECT_PICKER_SCRIPT = """<script>
+const RETRO_DATA = __PICK_DATA__;
+const STORAGE_KEY = "hwf-retrospect-picks-" + RETRO_DATA.period;
+let picks = {};
+try { picks = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}"); } catch (_e) { picks = {}; }
+
+function savePicks() {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(picks)); } catch (_e) {}
+}
+
+function buildInstruction() {
+  const chosen = [];
+  for (const it of RETRO_DATA.items) {
+    const cur = picks[String(it.idx)];
+    if (!cur || !cur.act || cur.act === "skip") continue;
+    chosen.push({ it, cur });
+  }
+  if (!chosen.length) return "";
+  const lines = [`按本期周期复盘（${RETRO_DATA.period}）勾选结果处理以下优化项：`];
+  for (const { it, cur } of chosen) {
+    const label = cur.act === "do" ? "直接做" : "按备注调整后做";
+    const note = (cur.note || "").trim();
+    lines.push(`- #${it.idx} [${it.priority}/${it.area}] ${it.title}（${label}）｜原建议：${it.action}${note ? "｜补充：" + note : ""}`);
+  }
+  return lines.join("\\n");
+}
+
+function syncPicker() {
+  let doCnt = 0, adjCnt = 0, skipCnt = 0;
+  for (const it of RETRO_DATA.items) {
+    const k = String(it.idx);
+    const cur = picks[k] || {};
+    if (cur.act === "do") doCnt++;
+    else if (cur.act === "adjust") adjCnt++;
+    else if (cur.act === "skip") skipCnt++;
+    const cell = document.querySelector(`.pick-cell[data-idx="${k}"]`);
+    if (!cell) continue;
+    cell.querySelectorAll(".pick-btn").forEach(btn => {
+      btn.classList.toggle("active", btn.dataset.act === cur.act);
+    });
+    const inp = cell.querySelector(".pick-note");
+    if (inp && inp.value !== (cur.note || "")) inp.value = cur.note || "";
+  }
+  document.getElementById("dockStat").innerHTML = RETRO_DATA.items.length
+    ? `复盘挑项：直接做 <b>${doCnt}</b> · 调整后做 <b>${adjCnt}</b> · 先不做 <b>${skipCnt}</b>`
+    : "本周期无可优化待办项";
+  document.getElementById("previewArea").value = buildInstruction() || "（请先勾选「要做」或「调整」的优化项）";
+}
+
+function showToast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { el.textContent = ""; }, 3000);
+}
+
+async function copyInstruction() {
+  const text = buildInstruction();
+  if (!text) { showToast("请先勾选至少一项「要做」或「调整」"); return; }
+  const area = document.getElementById("previewArea");
+  area.value = text;
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); showToast("已复制待办指令，直接粘回会话即可"); return; } catch (_e) {}
+  }
+  document.getElementById("previewWrap").classList.add("open");
+  area.focus();
+  area.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (_e) {}
+  showToast(ok ? "已复制待办指令，直接粘回会话即可" : "已展开文本框，请按 Cmd+C 复制");
+}
+
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".pick-btn");
+  if (btn) {
+    const k = btn.dataset.idx;
+    const act = btn.dataset.act;
+    const cur = picks[k] || { note: "" };
+    picks[k] = cur.act === act ? { act: "", note: cur.note || "" } : { act, note: cur.note || "" };
+    savePicks();
+    syncPicker();
+    return;
+  }
+  if (ev.target.id === "btnCopy") { copyInstruction(); return; }
+  if (ev.target.id === "btnClear") { picks = {}; savePicks(); syncPicker(); showToast("已清空勾选"); return; }
+  if (ev.target.id === "btnPreview") { document.getElementById("previewWrap").classList.toggle("open"); }
+});
+
+document.addEventListener("input", (ev) => {
+  const inp = ev.target.closest(".pick-note");
+  if (!inp) return;
+  const k = inp.dataset.idx;
+  const cur = picks[k] || { act: "adjust" };
+  if (!cur.act || cur.act === "skip") cur.act = "adjust";
+  cur.note = inp.value;
+  picks[k] = cur;
+  savePicks();
+  syncPicker();
+});
+
+syncPicker();
+</script>"""
 
 
 HTML_TEMPLATE = """<!doctype html>
@@ -1118,11 +1265,12 @@ HTML_TEMPLATE = """<!doctype html>
   }}
 }}
 body {{ margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }}
-main {{ max-width: 1120px; margin: 0 auto; padding: 28px 18px 64px; }}
+main {{ max-width: 1120px; margin: 0 auto; padding: 28px 18px 130px; }}
 h1 {{ font-size: 22px; margin: 0 0 4px; }}
 h2 {{ font-size: 17px; margin: 26px 0 10px; }}
 .sub {{ color: var(--muted); margin: 0 0 18px; }}
 .plain-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; margin-bottom: 18px; }}
+.fq-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; margin-top: 8px; }}
 .box {{ background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }}
 .box b {{ display: block; margin-bottom: 4px; }}
 .headline {{ border-left: 4px solid var(--accent); margin-bottom: 14px; }}
@@ -1139,6 +1287,19 @@ tr:last-child td {{ border-bottom: none; }}
 .muted {{ color: var(--muted); font-size: 13px; margin-top: 3px; }}
 .empty {{ color: var(--muted); text-align: center; padding: 18px; }}
 code {{ font: 12px ui-monospace, Menlo, monospace; background: var(--tag-bg); padding: 1px 5px; border-radius: 4px; }}
+.pick-cell {{ display: flex; flex-direction: column; gap: 6px; min-width: 170px; }}
+.pick-btns {{ display: flex; gap: 4px; flex-wrap: wrap; }}
+.pick-btn, .dock-btn {{ cursor: pointer; border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 7px; padding: 3px 8px; font-size: 12px; }}
+.pick-btn.active {{ background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }}
+.pick-note {{ width: 100%; box-sizing: border-box; border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 6px; padding: 4px 7px; font-size: 12px; }}
+.dock {{ position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line); box-shadow: 0 -4px 18px rgba(0,0,0,.08); padding: 10px 16px; z-index: 50; }}
+.dock-in {{ max-width: 1120px; margin: 0 auto; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }}
+.dock-actions {{ display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }}
+.dock-btn.primary {{ background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; padding: 5px 12px; }}
+.toast {{ font-size: 12px; color: var(--accent); font-weight: 600; }}
+.preview-wrap {{ max-width: 1120px; margin: 8px auto 0; display: none; }}
+.preview-wrap.open {{ display: block; }}
+.preview-area {{ width: 100%; box-sizing: border-box; min-height: 92px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--bg); color: var(--ink); font: 12px/1.5 ui-monospace, Menlo, monospace; }}
 </style>
 </head>
 <body>
@@ -1191,16 +1352,17 @@ code {{ font: 12px ui-monospace, Menlo, monospace; background: var(--tag-bg); pa
     </svg>
   </div>
 
-  <h2>可优化点列表（{item_count} 项）</h2>
+  <h2>可优化点列表（{item_count} 项，勾选后底部一键复制给 Agent）</h2>
   <table>
     <thead>
       <tr>
         <th style="width:86px">优先级</th>
         <th style="width:88px">环节</th>
-        <th style="width:32%">问题与本周期证据</th>
-        <th style="width:20%">根因</th>
+        <th style="width:28%">问题与本周期证据</th>
+        <th style="width:18%">根因</th>
         <th>具体建议改法</th>
-        <th style="width:62px">改动量</th>
+        <th style="width:58px">改动量</th>
+        <th style="width:185px">拍板</th>
       </tr>
     </thead>
     <tbody>{item_rows}</tbody>
@@ -1261,7 +1423,30 @@ code {{ font: 12px ui-monospace, Menlo, monospace; background: var(--tag-bg); pa
     </thead>
     <tbody>{task_rows}</tbody>
   </table>
+  <h2>本周期核心四问自检</h2>
+  <div class="fq-grid">
+    <div class="box"><b>1. 做了什么</b>{fq_what}</div>
+    <div class="box"><b>2. 为什么这样取舍</b>{fq_why}</div>
+    <div class="box"><b>3. 什么情况下会坏掉</b>{fq_break}</div>
+    <div class="box"><b>4. 这次踩坑与收获</b>{fq_learn}</div>
+  </div>
 </main>
+
+<div class="dock">
+  <div class="dock-in">
+    <div id="dockStat"></div>
+    <div class="dock-actions">
+      <span class="toast" id="toast" role="status" aria-live="polite"></span>
+      <button type="button" class="dock-btn" id="btnClear">清空勾选</button>
+      <button type="button" class="dock-btn" id="btnPreview">查看/手动复制</button>
+      <button type="button" class="dock-btn primary" id="btnCopy">复制待办指令给 Agent</button>
+    </div>
+  </div>
+  <div class="preview-wrap" id="previewWrap">
+    <textarea class="preview-area" id="previewArea" readonly></textarea>
+  </div>
+</div>
+{script}
 </body>
 </html>
 """

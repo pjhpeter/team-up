@@ -33,6 +33,7 @@ from urllib.parse import quote
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 PATROL_S = 3600
 IDLE_ALERT_S = 3 * 3600  # 在途交付超过这么久没有任何动静，巡检里标出来
+REVIEW_WIP_LIMIT = 3  # 同时等待用户拍板或确认上线的任务达到此阈值时，在总览与巡检顶部发出审核过载提醒
 MSG_MAP_CAP = 500
 RECENT_CAP = 20
 SUMMARY_CAP = 600  # 转达只放开头一段，全文给链接
@@ -450,6 +451,33 @@ class Secretary:
                 del msgs[old]
 
     # ---------- 巡检 ----------
+    @staticmethod
+    def pending_review_count(lines: list[str]) -> int:
+        """统计总览里当前真正等待用户拍板、操作或确认上线的任务数。"""
+        count = 0
+        for line in lines:
+            if "你已回复，等调度者接着处理" in line:
+                continue
+            if (
+                "等你处理" in line
+                or "卡在确认界面" in line
+                or "已待上线，但调度者没 @你" in line
+                or "状态:待上线" in line
+            ):
+                count += 1
+        return count
+
+    @classmethod
+    def review_load_banner(cls, lines: list[str]) -> str:
+        """同时待审任务达到阈值时给出批处理提醒，保护用户注意力且不跳过任何把关红线。"""
+        pending = cls.pending_review_count(lines)
+        if pending < REVIEW_WIP_LIMIT:
+            return ""
+        return (
+            f"⚠️ 当前有 {pending} 个需求同时等你拍板或确认上线（达到审核提醒阈值 {REVIEW_WIP_LIMIT}），"
+            "建议先集中批处理完再开新任务。"
+        )
+
     def patrol(self, force: bool = False) -> Optional[str]:
         """到点（或 force）就看一遍；内容和上次发的不同才发。返回发出的文本。"""
         if not self.chat:
@@ -458,11 +486,13 @@ class Secretary:
             return None
         self.state["last_patrol"] = self.bridge.now()
         lines = self.overview()
-        digest = "\n".join(lines)
+        banner = self.review_load_banner(lines)
+        body_lines = ([banner, *lines] if banner else lines)
+        digest = "\n".join(body_lines)
         if digest == self.state.get("last_digest"):
             return None
         self.state["last_digest"] = digest
-        text = f"**每小时巡检（{time.strftime('%H:%M', time.localtime(self.bridge.now()))}）**\n" + ("\n".join(lines) or "现在没有在跑的需求。")
+        text = f"**每小时巡检（{time.strftime('%H:%M', time.localtime(self.bridge.now()))}）**\n" + (digest or "现在没有在跑的需求。")
         self.say(text, f"sec-patrol-{int(self.bridge.now())}")
         return text
     def overview(self) -> list[str]:

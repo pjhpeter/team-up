@@ -373,6 +373,9 @@ class RetrospectTests(unittest.TestCase):
         self.assertIn("Jev 关卡本轮自动演进记录", html_doc)
         self.assertIn("hardcoded_localhost_prod", html_doc)
         self.assertIn("护栏拦截", html_doc)
+        self.assertIn("复制待办指令给 Agent", html_doc)
+        self.assertIn("本周期核心四问自检", html_doc)
+        self.assertIn("data-act='do'", html_doc)
         svg_part = html_doc.split("<svg", 1)[1].split("</svg>", 1)[0]
         self.assertNotIn("#", svg_part.replace("url(#arrow)", ""))
 

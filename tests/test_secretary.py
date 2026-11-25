@@ -619,6 +619,32 @@ class SecretaryTest(unittest.TestCase):
         self.assertEqual(len(texts), 1)
         self.assertIn("白屏是因为 CDN 缓存未刷新", texts[0])
 
+    def test_patrol_warns_when_pending_reviews_reach_wip_limit(self) -> None:
+        # 2 个待处理：不触发限流提示；3 个待处理（含待上线/等你处理）：触发顶部审核限流提示
+        lines_two = [
+            "- [#1](https://git.example.com/p/-/issues/1) 需求一：状态:等你处理\n  ⚠️ 等你处理",
+            "- [#2](https://git.example.com/p/-/issues/2) 需求二：状态:待上线",
+            "- [#3](https://git.example.com/p/-/issues/3) 需求三：状态:等你处理；你已回复，等调度者接着处理",
+        ]
+        self.assertEqual(self.sec.pending_review_count(lines_two), 2)
+        self.assertEqual(self.sec.review_load_banner(lines_two), "")
+
+        for iid, label in ((7, "状态:等你处理"), (8, "状态:待上线"), (9, "状态:等你处理")):
+            url = f"https://git.example.com/frontend/web-v1/-/issues/{iid}"
+            self.w.issues[iid] = {
+                "iid": iid, "title": f"任务{iid}", "state": "opened", "labels": [label],
+                "notes": [], "events": [],
+            }
+            self.state["secretary"]["issues"][url] = {
+                "project": "frontend/web-v1", "iid": iid, "title": f"任务{iid}",
+                "repo": str(self.home / "repo"), "last_note": 0, "last_agent_at": self.now,
+            }
+        self.now += 3600
+        text = self.sec.patrol()
+        self.assertIsNotNone(text)
+        self.assertIn("同时等你拍板或确认上线", text)
+        self.assertIn("达到审核提醒阈值 3", text)
+
 
 if __name__ == "__main__":
     unittest.main()

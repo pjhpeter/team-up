@@ -771,6 +771,44 @@ class ContentGuardTests(Case):
             TR.EXIT_OK,
         )
 
+    def test_brief_html_renders_recovery_page_with_svg_four_questions_and_reply_dock(self) -> None:
+        st_path = TR.state_path(self.repo, TASK)
+        st_path.parent.mkdir(parents=True, exist_ok=True)
+        st_path.write_text(
+            f"# {TASK} 调度记录\n\n"
+            f"{TR.TOP_OPEN}\n"
+            "- 通知模式：免打扰\n"
+            "- 当前阶段：评审与冒烟验收\n"
+            "- 下一动作：等待用户确认上线顺序\n"
+            "- 待用户事项：请确认是否先上线后端再合并前端 MR\n"
+            "- 最近用户通知：https://git.example.com/frontend/web-v1/-/issues/484#note_10\n"
+            f"{TR.TOP_CLOSE}\n\n"
+            "## 关键决定\n"
+            "- 理由：复用现有上传队列，不另起新协议。\n"
+            "- 刻意不做：暂不重构旧版移动端入口。\n\n"
+            "## 历史与坑\n"
+            "- 回滚方案：如接口不兼容，先回退前端版本并保留新字段向后兼容。\n"
+            "- 这次踩坑与收获：上传前校验写席位，避免无权限用户静默失败。\n",
+            encoding="utf-8",
+        )
+        (st_path.parent / "reviews").mkdir(exist_ok=True)
+        (st_path.parent / "reviews" / "r1.md").write_text("通过\n", encoding="utf-8")
+        out_buf = io.StringIO()
+        with redirect_stdout(out_buf):
+            rc = TR.main(["brief-html", "--repo", self.repo, "--task", TASK])
+        self.assertEqual(rc, TR.EXIT_OK)
+        brief_path = Path(out_buf.getvalue().strip())
+        self.assertTrue(brief_path.is_file())
+        doc = brief_path.read_text(encoding="utf-8")
+        self.assertIn("30 秒恢复现场", doc)
+        self.assertIn("刻意不做：暂不重构旧版移动端入口", doc)
+        self.assertIn("4. 核心四问自检", doc)
+        self.assertIn("一键复制回复指令", doc)
+        self.assertIn("r1.md", doc)
+        # 结构 SVG 遵守透明底主题变量铁线（仅允许 url(#arrow)）
+        svg_part = doc.split("<svg", 1)[1].split("</svg>", 1)[0]
+        self.assertNotIn("#", svg_part.replace("url(#arrow)", ""))
+
 
 if __name__ == "__main__":
     unittest.main()

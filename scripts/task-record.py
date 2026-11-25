@@ -10,6 +10,7 @@
     task-record.py card-check --file <arch 判定落盘文件>
     task-record.py release-check --repo <仓库路径> --release <release-根编号> [--base origin/main] [--develop origin/develop] --commit <步骤源SHA>... [--no-fetch]
     task-record.py progress  --repo <主仓库> --task <任务标识> [--issue <根 issue URL> --steps-file <步骤 JSON>]
+    task-record.py brief-html (--repo <主仓库> --task <任务标识> | --state <STATE.md路径>) [--out <输出路径>] [--open]
 
 为什么有它：
 - 2026-11-15 #483：调度者手写 INDEX 行没加反引号，收件箱找不到负责人，用户的回复晚到约 7 分钟。
@@ -54,10 +55,12 @@ import argparse
 import fcntl
 from fnmatch import fnmatch
 import hashlib
+import html
 import importlib.util
 import json
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 from typing import Any, Optional, Sequence
@@ -1288,6 +1291,392 @@ def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequ
     return EXIT_OK, link
 
 
+# ---------- 30 秒恢复现场 HTML ----------
+
+BRIEF_STAGES = (
+    ("understand", "1. 理解卡与判定", ("理解", "判定", "对话", "澄清", "方案中", "待开始")),
+    ("plan", "2. 方案与用例", ("方案", "用例", "spec", "§1", "§2", "§3", "§4", "§5")),
+    ("dev", "3. 开发红绿", ("开发", "修复", "实现", "红证", "§6", "debug")),
+    ("verify", "4. 评审与验收", ("评审", "测试", "验收", "冒烟", "§7", "§8")),
+    ("ship", "5. 汇总与上线", ("汇总", "待上线", "上线", "交付", "完成", "收尾", "§9")),
+)
+
+
+def _infer_stage_index(stage_text: str) -> int:
+    low = (stage_text or "").lower()
+    # 从后往前匹配，避免「方案路径开发中」误落在前段
+    for idx in range(len(BRIEF_STAGES) - 1, -1, -1):
+        if any(k in low for k in BRIEF_STAGES[idx][2]):
+            return idx
+    return 0
+
+
+def _clean_bullets(lines: Sequence[str], *, limit: int = 12) -> list[str]:
+    out: list[str] = []
+    for raw in lines:
+        s = raw.strip()
+        if not s or s.startswith("<!--") or s.startswith("```"):
+            continue
+        if s.startswith(("- ", "* ")):
+            s = s[2:].strip()
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _extract_field_value(text: str, labels: Sequence[str]) -> str:
+    for label in labels:
+        m = re.search(rf"(?m)^\s*(?:[-*]\s*)?(?:\*\*)?{re.escape(label)}(?:\*\*)?\s*[：:]\s*(.+)$", text)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return ""
+
+
+def _pick_sections(sections: Sequence[tuple[str, list[str]]], keywords: Sequence[str]) -> list[tuple[str, list[str]]]:
+    matched: list[tuple[str, list[str]]] = []
+    for heading, body in sections:
+        title = heading.lstrip("#").strip()
+        if any(k in title for k in keywords):
+            cleaned = _clean_bullets(body, limit=10)
+            if cleaned:
+                matched.append((title, cleaned))
+    return matched
+
+
+def render_brief_html(state_file: Path, *, repo: str = "", task: str = "") -> str:
+    """将 STATE.md 及同目录交付证据渲染为单文件「30 秒恢复现场」交互 HTML。"""
+    if not state_file.is_file():
+        raise RecordError(f"找不到 STATE 文件：{state_file}")
+    raw = state_file.read_text(encoding="utf-8")
+    top = read_top(raw)
+    preamble, sections = _split_h2_sections(raw)
+    title_line = next((ln[2:].strip() for ln in preamble if ln.startswith("# ")), "")
+    task_name = task or state_file.parent.name
+    display_title = title_line or f"{task_name} 恢复现场"
+
+    stage = top.get("当前阶段") or "未写明"
+    next_action = top.get("下一动作") or "未写明"
+    waiting_user = top.get("待用户事项") or "无"
+    notify = top.get("通知模式") or QUIET
+    last_notice = top.get("最近用户通知") or "无"
+    has_waiting = waiting_user.strip() not in ("", "无", "无。")
+
+    # 收集同目录只读补充材料（notes.jsonl / progress.json / reviews/）
+    tdir = state_file.parent
+    recent_notes: list[dict[str, Any]] = []
+    notes_file = tdir / "notes.jsonl"
+    if notes_file.is_file():
+        for line in notes_file.read_text(encoding="utf-8").splitlines()[-8:]:
+            if line.strip():
+                try:
+                    recent_notes.append(json.loads(line))
+                except ValueError:
+                    continue
+    progress_steps: list[dict[str, Any]] = []
+    issue_url = _ISSUE_URL_IN_TEXT.search(raw).group(0) if _ISSUE_URL_IN_TEXT.search(raw) else ""
+    prog_file = tdir / "progress.json"
+    if prog_file.is_file():
+        try:
+            pdata = json.loads(prog_file.read_text(encoding="utf-8"))
+            issue_url = str(pdata.get("issue") or issue_url)
+            progress_steps = list(pdata.get("steps") or [])
+        except (OSError, ValueError):
+            pass
+    reviews_dir = tdir / "reviews"
+    review_files = sorted(p.name for p in reviews_dir.glob("*") if p.is_file())[-8:] if reviews_dir.is_dir() else []
+
+    decisions = _pick_sections(sections, ("关键决定", "范围", "非目标", "授权", "理解卡", "接口约定"))
+    pitfalls = _pick_sections(sections, ("历史与坑", "坑", "风险", "待定", "阻塞", "回滚"))
+    deliverables = _pick_sections(sections, ("来源", "基线", "分支", "汇总", "验收", "上线", "MR"))
+
+    # 透明底结构 SVG（仅用 currentColor 与 CSS 主题变量，不画背景色块）
+    active_idx = _infer_stage_index(stage)
+    svg_nodes: list[str] = []
+    for idx, (_key, label, _kws) in enumerate(BRIEF_STAGES):
+        x = 12 + idx * 184
+        is_cur = idx == active_idx
+        is_done = idx < active_idx
+        stroke = "var(--accent)" if is_cur else ("currentColor" if is_done else "var(--line)")
+        sw = "2.2" if is_cur else "1.4"
+        sub = "当前在这里" if is_cur else ("已走过" if is_done else "待进入")
+        sub_color = "var(--accent)" if is_cur else "var(--muted)"
+        svg_nodes.append(
+            f"<rect x='{x}' y='18' width='152' height='66' rx='10' fill='none' stroke='{stroke}' stroke-width='{sw}'/>"
+            f"<text x='{x + 76}' y='45' text-anchor='middle' fill='currentColor' font-size='13' font-weight='600'>{html.escape(label)}</text>"
+            f"<text x='{x + 76}' y='67' text-anchor='middle' fill='{sub_color}' font-size='11.5'>{html.escape(sub)}</text>"
+        )
+        if idx < len(BRIEF_STAGES) - 1:
+            svg_nodes.append(
+                f"<line x1='{x + 156}' y1='51' x2='{x + 180}' y2='51' stroke='var(--muted)' stroke-width='1.5' marker-end='url(#arrow)'/>"
+            )
+
+    e = html.escape
+
+    def render_section_cards(items: Sequence[tuple[str, list[str]]], empty_hint: str) -> str:
+        if not items:
+            return f"<div class='box muted'>{e(empty_hint)}</div>"
+        parts = []
+        for title, bullets in items:
+            lis = "".join(f"<li>{e(b)}</li>" for b in bullets)
+            parts.append(f"<div class='box'><b>{e(title)}</b><ul>{lis}</ul></div>")
+        return "".join(parts)
+
+    steps_rows = "".join(
+        f"<tr><td>{idx}</td><td>{e(str(st.get('title') or ''))}</td>"
+        f"<td><span class='tag'>{e(str(st.get('status') or '未标'))}</span></td>"
+        f"<td>{e(str(st.get('remaining') or '—'))}</td></tr>"
+        for idx, st in enumerate(progress_steps, 1)
+    ) or "<tr><td colspan='4' class='empty'>单步骤或尚未写入 progress.json</td></tr>"
+
+    notes_rows = "".join(
+        f"<tr><td>{e(str(n.get('at') or ''))}</td>"
+        f"<td><span class='tag'>{e(KINDS.get(str(n.get('kind') or ''), str(n.get('kind') or '')))}</span></td>"
+        f"<td><a href='{e(str(n.get('link') or ''))}' target='_blank' rel='noreferrer'>{e(str(n.get('link') or ''))}</a></td></tr>"
+        for n in reversed(recent_notes)
+    ) or "<tr><td colspan='3' class='empty'>尚无 notes.jsonl 评论记录</td></tr>"
+
+    # 核心四问自动提炼（缺项明标待补，避免黑盒）
+    fq_what = _extract_field_value(raw, ("做了什么", "目标", "需求原文")) or f"当前处于「{stage}」，下一步：{next_action}"
+    fq_why = (
+        _extract_field_value(raw, ("为什么选这个做法", "理由", "关键决定"))
+        or (decisions[0][1][0] if decisions else "待补：建议在 STATE.md 的「关键决定」中写清取舍与刻意不做的范围。")
+    )
+    fq_break = (
+        _extract_field_value(raw, ("什么情况下会坏掉", "回滚方案", "高危边界", "历史与坑"))
+        or (pitfalls[0][1][0] if pitfalls else "待补：建议在 STATE.md 的「历史与坑 / 风险」中写明失效条件与回滚点。")
+    )
+    fq_learn = (
+        _extract_field_value(raw, ("这次踩坑与收获", "踩坑与收获", "收获"))
+        or (f"已有 {len(review_files)} 份评审记录（{', '.join(review_files[-3:])}），收官前可补一句最值得复用的经验。"
+            if review_files else "待收官前补充一句本次最值得复用的经验或避坑点。")
+    )
+
+    reply_payload = {
+        "task": task_name,
+        "issue_url": issue_url,
+        "waiting_user": waiting_user,
+    }
+    reply_json = json.dumps(reply_payload, ensure_ascii=False).replace("</", "<\\/")
+
+    return BRIEF_HTML_TEMPLATE.format(
+        title=e(display_title),
+        task=e(task_name),
+        generated_at=e(time.strftime("%Y-%m-%d %H:%M")),
+        state_path=e(str(state_file)),
+        issue_link=(f"<a href='{e(issue_url)}' target='_blank' rel='noreferrer'>{e(issue_url)}</a>" if issue_url else "未登记"),
+        notify=e(notify),
+        stage=e(stage),
+        next_action=e(next_action),
+        waiting_user=e(waiting_user),
+        waiting_cls=" warn-box" if has_waiting else "",
+        last_notice=e(last_notice),
+        svg_nodes="".join(svg_nodes),
+        decisions_html=render_section_cards(decisions, "STATE.md 暂未记录「关键决定 / 刻意不做」，切回前建议先核对理解卡或 spec。"),
+        pitfalls_html=render_section_cards(pitfalls, "STATE.md 暂未记录专门的「历史与坑 / 风险 / 待定清单」章节。"),
+        deliverables_html=render_section_cards(deliverables, "暂无单独登记的分支 / MR / 交付物摘要。"),
+        steps_rows=steps_rows,
+        notes_rows=notes_rows,
+        reviews_line=e("、".join(review_files) if review_files else "暂无 reviews/ 文件"),
+        fq_what=e(fq_what),
+        fq_why=e(fq_why),
+        fq_break=e(fq_break),
+        fq_learn=e(fq_learn),
+        script=BRIEF_REPLY_SCRIPT.replace("__BRIEF_DATA__", reply_json),
+    )
+
+
+def brief_html(
+    *,
+    repo: Optional[str] = None,
+    task: Optional[str] = None,
+    state_file: Optional[str] = None,
+    out_file: Optional[str] = None,
+    open_browser: bool = False,
+) -> Path:
+    if state_file:
+        st_path = Path(state_file).expanduser()
+    elif repo and task:
+        st_path = state_path(repo, task)
+    else:
+        raise RecordError("brief-html 需要传入 --state，或同时传入 --repo 和 --task")
+    target = Path(out_file).expanduser() if out_file else st_path.with_name("brief.html")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render_brief_html(st_path, repo=repo or "", task=task or ""), encoding="utf-8")
+    if open_browser:
+        subprocess.run(["open", str(target)], check=False)
+    return target
+
+
+BRIEF_REPLY_SCRIPT = """<script>
+const BRIEF = __BRIEF_DATA__;
+let pickedMode = "同意，按当前方案与下一步推进";
+
+function buildReply() {
+  const note = (document.getElementById("replyNote").value || "").trim();
+  const prefix = BRIEF.issue_url ? `针对 ${BRIEF.task}（${BRIEF.issue_url}）：` : `针对 ${BRIEF.task}：`;
+  return note ? `${prefix}${pickedMode}。补充：${note}` : `${prefix}${pickedMode}。`;
+}
+
+function syncReply() {
+  document.querySelectorAll(".r-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.msg === pickedMode);
+  });
+  document.getElementById("previewArea").value = buildReply();
+}
+
+function showToast(msg) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  clearTimeout(showToast._t);
+  showToast._t = setTimeout(() => { el.textContent = ""; }, 3000);
+}
+
+async function copyReply() {
+  const text = buildReply();
+  const area = document.getElementById("previewArea");
+  area.value = text;
+  if (navigator.clipboard && window.isSecureContext) {
+    try { await navigator.clipboard.writeText(text); showToast("已复制回复指令，粘回飞书秘书或 GitLab 即可"); return; } catch (_e) {}
+  }
+  document.getElementById("previewWrap").classList.add("open");
+  area.focus();
+  area.select();
+  let ok = false;
+  try { ok = document.execCommand("copy"); } catch (_e) {}
+  showToast(ok ? "已复制回复指令" : "已展开文本框，请按 Cmd+C 复制");
+}
+
+document.addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".r-btn");
+  if (btn) { pickedMode = btn.dataset.msg; syncReply(); return; }
+  if (ev.target.id === "btnCopy") { copyReply(); return; }
+  if (ev.target.id === "btnPreview") { document.getElementById("previewWrap").classList.toggle("open"); }
+});
+
+document.getElementById("replyNote").addEventListener("input", syncReply);
+syncReply();
+</script>"""
+
+
+BRIEF_HTML_TEMPLATE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} · 30 秒恢复现场</title>
+<style>
+:root {{
+  --bg: #f7f8fa; --card: #ffffff; --ink: #1f2328; --muted: #59636e; --line: #d0d7de;
+  --accent: #0969da; --warn: #9a6700; --tag-bg: #eef1f4;
+}}
+@media (prefers-color-scheme: dark) {{
+  :root {{
+    --bg: #0d1117; --card: #161b22; --ink: #e6edf3; --muted: #8b949e; --line: #30363d;
+    --accent: #58a6ff; --warn: #d29922; --tag-bg: #21262d;
+  }}
+}}
+* {{ box-sizing: border-box; }}
+body {{ margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; }}
+main {{ max-width: 1040px; margin: 0 auto; padding: 24px 16px 136px; }}
+h1 {{ font-size: 22px; margin: 0 0 4px; }}
+h2 {{ font-size: 16.5px; margin: 22px 0 10px; }}
+.sub {{ color: var(--muted); font-size: 13px; margin: 0 0 14px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }}
+.box {{ background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; }}
+.box b {{ display: block; margin-bottom: 4px; }}
+.warn-box {{ border-left: 4px solid var(--warn); }}
+.flow-wrap {{ overflow-x: auto; }}
+svg.flow {{ width: 100%; max-width: 930px; height: auto; display: block; margin: 2px auto; color: var(--ink); }}
+ul {{ margin: 6px 0 0; padding-left: 18px; }}
+li {{ margin: 4px 0; }}
+table {{ width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }}
+th, td {{ text-align: left; vertical-align: top; padding: 8px 10px; border-bottom: 1px solid var(--line); font-size: 13px; }}
+th {{ color: var(--muted); background: var(--tag-bg); }}
+tr:last-child td {{ border-bottom: none; }}
+.tag {{ display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; background: var(--tag-bg); }}
+.muted, .empty {{ color: var(--muted); }}
+.empty {{ text-align: center; padding: 14px; }}
+a {{ color: var(--accent); word-break: break-all; }}
+code {{ font: 12px ui-monospace, Menlo, monospace; background: var(--tag-bg); padding: 1px 5px; border-radius: 4px; }}
+.dock {{ position: fixed; left: 0; right: 0; bottom: 0; background: var(--card); border-top: 1px solid var(--line); box-shadow: 0 -4px 18px rgba(0,0,0,.08); padding: 10px 16px; z-index: 50; }}
+.dock-in {{ max-width: 1040px; margin: 0 auto; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }}
+.r-btns {{ display: flex; flex-wrap: wrap; gap: 6px; }}
+.r-btn, .dock-btn {{ cursor: pointer; border: 1px solid var(--line); background: var(--card); color: var(--ink); border-radius: 7px; padding: 4px 10px; font-size: 12.5px; }}
+.r-btn.active, .dock-btn.primary {{ background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }}
+.r-note {{ flex: 1; min-width: 220px; border: 1px solid var(--line); background: var(--bg); color: var(--ink); border-radius: 7px; padding: 5px 9px; font-size: 12.5px; }}
+.toast {{ font-size: 12px; color: var(--accent); font-weight: 600; }}
+.preview-wrap {{ max-width: 1040px; margin: 8px auto 0; display: none; }}.preview-wrap.open {{ display: block; }}
+.preview-area {{ width: 100%; min-height: 70px; border: 1px solid var(--line); border-radius: 8px; padding: 8px; background: var(--bg); color: var(--ink); font: 12px/1.5 ui-monospace, Menlo, monospace; }}
+</style>
+</head>
+<body>
+<main>
+  <h1>{title} · 30 秒恢复现场</h1>
+  <p class="sub">任务：<code>{task}</code> · 生成于 {generated_at} · 通知模式：{notify} · 工单：{issue_link}<br>源文件：<code>{state_path}</code></p>
+
+  <h2>1. 现在在哪（一眼看清进度与卡点）</h2>
+  <div class="box flow-wrap" style="margin-bottom:12px">
+    <svg class="flow" viewBox="0 0 924 102" role="img" aria-label="任务所处交付阶段流程图">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+          <path d="M 0 1 L 10 5 L 0 9 z" fill="currentColor"/>
+        </marker>
+      </defs>
+      {svg_nodes}
+    </svg>
+  </div>
+  <div class="grid">
+    <div class="box"><b>当前阶段</b>{stage}</div>
+    <div class="box"><b>下一步动作</b>{next_action}</div>
+    <div class="box{waiting_cls}"><b>等你处理</b>{waiting_user}</div>
+    <div class="box"><b>最近用户通知</b>{last_notice}</div>
+  </div>
+
+  <h2>2. 关键决定与刻意没做什么</h2>
+  <div class="grid">{decisions_html}</div>
+
+  <h2>3. 踩坑、风险与证据速查</h2>
+  <div class="grid" style="margin-bottom:12px">{pitfalls_html}{deliverables_html}</div>
+  <div class="box" style="margin-bottom:12px"><b>评审记录文件</b>{reviews_line}</div>
+  <table style="margin-bottom:12px">
+    <thead><tr><th style="width:52px">#</th><th>步骤</th><th style="width:96px">状态</th><th>剩余事项</th></tr></thead>
+    <tbody>{steps_rows}</tbody>
+  </table>
+  <table>
+    <thead><tr><th style="width:150px">时间</th><th style="width:110px">类别</th><th>最近已发 GitLab 评论</th></tr></thead>
+    <tbody>{notes_rows}</tbody>
+  </table>
+
+  <h2>4. 核心四问自检</h2>
+  <div class="grid">
+    <div class="box"><b>做了什么</b>{fq_what}</div>
+    <div class="box"><b>为什么选这个做法</b>{fq_why}</div>
+    <div class="box"><b>什么情况下会坏掉</b>{fq_break}</div>
+    <div class="box"><b>这次踩坑与收获</b>{fq_learn}</div>
+  </div>
+</main>
+
+<div class="dock">
+  <div class="dock-in">
+    <div class="r-btns">
+      <button type="button" class="r-btn" data-msg="同意，按当前方案与下一步推进">同意推进</button>
+      <button type="button" class="r-btn" data-msg="按你的建议处理">按建议执行</button>
+      <button type="button" class="r-btn" data-msg="先暂停，按以下补充调整">先暂停调整</button>
+    </div>
+    <input type="text" class="r-note" id="replyNote" placeholder="可选补充一句给调度者或飞书秘书的话…">
+    <span class="toast" id="toast" role="status" aria-live="polite"></span>
+    <button type="button" class="dock-btn" id="btnPreview">查看文本</button>
+    <button type="button" class="dock-btn primary" id="btnCopy">一键复制回复指令</button>
+  </div>
+  <div class="preview-wrap" id="previewWrap"><textarea class="preview-area" id="previewArea" readonly></textarea></div>
+</div>
+{script}
+</body>
+</html>
+"""
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1328,6 +1717,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     prog = sub.add_parser("progress", parents=[common])
     prog.add_argument("--issue", help="根 issue URL；第一次必填")
     prog.add_argument("--steps-file", help="步骤 JSON；第一次或步骤变化时给")
+    brief = sub.add_parser("brief-html", help="从 STATE.md 生成单文件「30 秒恢复现场」交互 HTML")
+    brief.add_argument("--repo", help="主仓库路径（与 --task 同传）")
+    brief.add_argument("--task", help="任务标识（与 --repo 同传）")
+    brief.add_argument("--state", help="直接指定 STATE.md 路径（替代 --repo/--task）")
+    brief.add_argument("--out", help="输出 HTML 路径，默认写到 STATE.md 同目录的 brief.html")
+    brief.add_argument("--open", action="store_true", help="生成后用系统默认浏览器打开")
     opts = parser.parse_args(argv)
     try:
         if opts.command == "index-add":
@@ -1373,6 +1768,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                    develop=opts.develop, fetch=not opts.no_fetch)
             print(format_release_check(report))
             return EXIT_HELD if report["problems"] else EXIT_OK
+        elif opts.command == "brief-html":
+            out = brief_html(
+                repo=opts.repo,
+                task=opts.task,
+                state_file=opts.state,
+                out_file=opts.out,
+                open_browser=opts.open,
+            )
+            print(str(out))
+            return EXIT_OK
         else:
             results = preflight(opts.will)
             labels = {"ok": "能做", "no": "做不了", "autoclose": "禁止（会自动关单）", "unknown": "无法确认"}

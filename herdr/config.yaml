@@ -4,7 +4,7 @@
 profiles:
   scheduler:
     kind: omp
-    args: ["--config", "/Users/pengjiahui/.hwf/scheduler-omp.yml", "--approval-mode", "yolo"]
+    args: ["--config", "~/.hwf/scheduler-omp.yml", "--approval-mode", "yolo"]
   arch:
     kind: agy
     args: ["--model", "gemini-4-neon-xhigh", "--effort", "xhigh", "--mode", "auto", "--dangerously-skip-permissions"]

@@ -57,6 +57,25 @@ def _expand_hwf_path(raw: str, hwf_home: Path) -> str:
     return os.path.expanduser(text)
 
 
+def _format_hwf_path(raw: str, hwf_home: Path, *, portable: bool) -> str:
+    """格式化写入配置的路径。
+
+    portable=True 时保留 ~/.hwf/... 形式（不写入当前用户的绝对 HOME 路径），
+    确保入库的 herdr/config.yaml 在不同电脑与 GitLab CI 容器路径下完全一致；
+    portable=False 时展开为当前 hwf_home 下的绝对路径供运行时直接传给子进程。
+    """
+    text = raw.strip()
+    if not portable:
+        return _expand_hwf_path(text, hwf_home)
+    if text == "~/.hwf" or text.startswith("~/.hwf/"):
+        return text
+    try:
+        rel = Path(text).resolve().relative_to(hwf_home.resolve())
+        return f"~/.hwf/{rel.as_posix()}" if rel.as_posix() != "." else "~/.hwf"
+    except ValueError:
+        return text
+
+
 def roles_path(hwf_home: Optional[Path] = None, *, path: Optional[Path] = None) -> Path:
     if path is not None:
         return Path(path)
@@ -176,6 +195,7 @@ def compile_team_profile(
     *,
     hwf_home: Optional[Path] = None,
     write_settings: bool = False,
+    portable: bool = False,
 ) -> dict[str, Any]:
     """把单条 team 角色定义翻译成 Herdr 可直接启动的 {kind, args}。"""
     home = Path(hwf_home) if hwf_home is not None else HWF_HOME
@@ -211,7 +231,7 @@ def compile_team_profile(
             args.extend(["--mode", "auto", "--dangerously-skip-permissions"])
     elif tool == "omp":
         if omp_config:
-            args.extend(["--config", _expand_hwf_path(omp_config, home)])
+            args.extend(["--config", _format_hwf_path(omp_config, home, portable=portable)])
         if model:
             args.extend(["--model", model])
         if thinking:
@@ -229,8 +249,9 @@ def compile_team_profile(
             args.append("--dangerously-skip-permissions")
     elif tool == "droid":
         # 交互式 droid 没有 --model 参数，统一落到 --settings JSON 的 sessionDefaultSettings。
+        settings_arg: Optional[str] = None
         if settings_file:
-            resolved_settings = Path(_expand_hwf_path(settings_file, home))
+            settings_arg = _format_hwf_path(settings_file, home, portable=portable)
         elif model or thinking:
             resolved_settings = _managed_droid_settings_path(name, home)
             if write_settings:
@@ -238,10 +259,9 @@ def compile_team_profile(
                 resolved_settings.parent.mkdir(parents=True, exist_ok=True)
                 if not resolved_settings.is_file() or resolved_settings.read_text(encoding="utf-8") != payload:
                     resolved_settings.write_text(payload, encoding="utf-8")
-        else:
-            resolved_settings = None
-        if resolved_settings is not None:
-            args.extend(["--settings", str(resolved_settings)])
+            settings_arg = f"~/.hwf/herdr/droid-{name}.json" if portable else str(resolved_settings)
+        if settings_arg is not None:
+            args.extend(["--settings", settings_arg])
         if yolo:
             args.extend(["--auto", "high"])
     elif tool == "pi":
@@ -259,12 +279,13 @@ def compile_herdr_config(
     *,
     hwf_home: Optional[Path] = None,
     write_settings: bool = False,
+    portable: bool = False,
 ) -> dict[str, Any]:
     validated = validate_roles_data(roles_data)
     profiles: dict[str, dict[str, Any]] = {}
     for role_name, spec in validated["team"].items():
         profiles[role_name] = compile_team_profile(
-            role_name, spec, hwf_home=hwf_home, write_settings=write_settings
+            role_name, spec, hwf_home=hwf_home, write_settings=write_settings, portable=portable
         )
     return {
         "profiles": profiles,
@@ -277,8 +298,9 @@ def render_herdr_config_yaml(
     *,
     hwf_home: Optional[Path] = None,
     write_settings: bool = False,
+    portable: bool = True,
 ) -> str:
-    compiled = compile_herdr_config(roles_data, hwf_home=hwf_home, write_settings=write_settings)
+    compiled = compile_herdr_config(roles_data, hwf_home=hwf_home, write_settings=write_settings, portable=portable)
     lines = [
         "# 本文件由 ~/.hwf/roles.yaml 自动生成，请勿直接手工修改。",
         "# 调整任何角色的工具、模型或思考强度，请编辑 ~/.hwf/roles.yaml 后运行：",

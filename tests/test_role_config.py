@@ -87,6 +87,28 @@ class RepoConsistencyTests(unittest.TestCase):
             self.assertNotIn(key, cfg.get("retrospect", {}))
             self.assertNotIn(key, cfg.get("typesafe", {}))
 
+    def test_herdr_config_uses_portable_paths_across_checkouts(self) -> None:
+        """确保入库的 herdr/config.yaml 不含本机绝对用户目录，且在任意 CI 检出路径下 check 均通过。"""
+        rendered = (HWF_ROOT / "herdr" / "config.yaml").read_text(encoding="utf-8")
+        self.assertNotIn("/Users/", rendered)
+        self.assertNotIn("/home/", rendered)
+        self.assertIn("~/.hwf/scheduler-omp.yml", rendered)
+
+        with tempfile.TemporaryDirectory(prefix="hwf-ci-checkout-") as tmp:
+            ci_dir = Path(tmp) / "builds" / "team-up"
+            (ci_dir / "herdr").mkdir(parents=True)
+            (ci_dir / "roles.yaml").write_text((HWF_ROOT / "roles.yaml").read_text(encoding="utf-8"), encoding="utf-8")
+            (ci_dir / "herdr" / "config.yaml").write_text(rendered, encoding="utf-8")
+            RC.clear_cache()
+
+            in_sync, target = RC.sync_herdr_config(ci_dir, check_only=True)
+            self.assertTrue(in_sync, f"模拟 CI 检出目录 {target} 判定不同步")
+            res = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "role_config.py"), "--home", str(ci_dir), "check"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(res.returncode, 0, res.stderr)
+
 
 class ValidationAndTeamCompilationTests(unittest.TestCase):
     def test_validation_errors(self) -> None:
@@ -166,6 +188,11 @@ services: {}
             self.assertFalse(changed2)
             in_sync_after, _ = RC.sync_herdr_config(home, check_only=True)
             self.assertTrue(in_sync_after)
+            yaml_text = target.read_text(encoding="utf-8")
+            self.assertNotIn(str(home), yaml_text)
+            self.assertIn("~/.hwf/member-omp.yml", yaml_text)
+            self.assertIn("~/.hwf/herdr/droid-droid-role.json", yaml_text)
+            self.assertIn("~/.hwf/herdr/custom-droid.json", yaml_text)
 
             compiled = RC.compile_herdr_config(RC.load_roles(home), hwf_home=home, write_settings=False)
             p = compiled["profiles"]

@@ -1717,4 +1717,62 @@ class DynamicAllProjectAndAuthBoundaryTests(unittest.TestCase):
         self.assertEqual(state["watched_issues"][url]["status"], "standby")
         self.assertIn("gitlab_projects.py", [p.name for p in INBOX.watched_scripts()])
 
+    def test_closed_issue_mention_todo_is_skipped_without_clone_comment_or_watch(self) -> None:
+        url = "https://git.example/backend/user/-/issues/1"
+        git_clones: list[list[str]] = []
+        comments: list[str] = []
+        done_todos: list[int] = []
+        launched: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[0] == "git" and "clone" in cmd:
+                git_clones.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[0] == "hwf":
+                launched.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[:2] == ["glab", "api"]:
+                endpoint = cmd[-1]
+                if endpoint.endswith("/mark_as_done"):
+                    done_todos.append(int(endpoint.split("/")[1]))
+                    return subprocess.CompletedProcess(cmd, 0, "{}", "")
+                if "/notes" in endpoint and "-X" in cmd and "POST" in cmd:
+                    comments.append(endpoint)
+                    return subprocess.CompletedProcess(cmd, 0, "{}", "")
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+        cfg = {
+            "host": "git.example",
+            "agent_user": "pjhagent",
+            "allowed_users": ["pengjh"],
+            "label": "herdr-auto",
+            "projects": {},
+            "code_root": str(self.tmp / "code"),
+            "local_config_path": str(self.tmp / "local.json"),
+        }
+        state: dict[str, Any] = {}
+        inbox = INBOX.Inbox(cfg, state, run=fake_run, jev=None)
+        inbox.me = "pjhagent"
+        closed_todo = {
+            "id": 3100,
+            "action_name": "mentioned",
+            "target_type": "Issue",
+            "target_url": f"{url}#note_18884",
+            "body": "/go 将工作区切换到 feat-workspace @pjhagent",
+            "author": {"username": "pengjh"},
+            "project": {"id": 42, "path_with_namespace": "backend/user"},
+            "target": {
+                "id": 100, "iid": 1, "project_id": 42, "title": "旧单",
+                "state": "closed", "labels": [], "web_url": url,
+            },
+        }
+        inbox.handle_mention(closed_todo)
+        self.assertEqual(done_todos, [3100])
+        self.assertEqual(git_clones, [])
+        self.assertEqual(comments, [])
+        self.assertEqual(launched, [])
+        self.assertNotIn(url, state.get("followed", {}))
+        self.assertNotIn(url, state.get("watched_issues", {}))
+
+
 

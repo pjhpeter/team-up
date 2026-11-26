@@ -873,8 +873,20 @@ class Inbox:
         url = GP.canon_issue_url(todo["target_url"])
         project = todo["project"]["path_with_namespace"]
         actor = todo["author"]["username"]
+        is_closed = issue.get("state") == "closed"
+        is_status_query = self.is_command(str(todo.get("body") or ""), STATUS_COMMANDS)
+        if is_closed and url not in self.state["origins"] and not is_status_query:
+            # 已关闭的历史旧单不再拉仓库、不在旧单留言，也不写入 watched_issues 误发飞书「已自动接手」提醒。
+            log(f"skip mention on closed issue: {url}#note_{note_id}")
+            self.api(f"todos/{todo['id']}/mark_as_done", "POST")
+            return
         if note_id not in self.state["forwarded"]:
             note = self.api(f"projects/{issue['project_id']}/issues/{issue['iid']}/notes/{note_id}")
+            note_is_status = self.is_command(str(note.get("body") or ""), STATUS_COMMANDS)
+            if is_closed and url not in self.state["origins"] and not note_is_status:
+                log(f"skip mention on closed issue: {url}#note_{note_id}")
+                self.api(f"todos/{todo['id']}/mark_as_done", "POST")
+                return
             repo = self.ensure_repo(project)
             if not repo:
                 log(f"skip mention for {url}#note_{note_id}: failed to resolve or clone local repo for {project}")
@@ -884,14 +896,15 @@ class Inbox:
             if not self.handle_note(url, repo, note, where):
                 return
             self.remember(note_id)
-            self.follow(url, project, issue["iid"])
-            if self.dynamic_projects:
-                self.register_watched_issue(
-                    url=url, project=project, project_id=issue["project_id"], iid=issue["iid"],
-                    title=str(issue.get("title") or ""), kind="mentioned_agent", actor=actor,
-                    event_key=f"todo:{todo['id']}", status="active",
-                    note_url=f"{url}#note_{note_id}", excerpt=str(note.get("body") or ""),
-                )
+            if not is_closed:
+                self.follow(url, project, issue["iid"])
+                if self.dynamic_projects and not note_is_status:
+                    self.register_watched_issue(
+                        url=url, project=project, project_id=issue["project_id"], iid=issue["iid"],
+                        title=str(issue.get("title") or ""), kind="mentioned_agent", actor=actor,
+                        event_key=f"todo:{todo['id']}", status="active",
+                        note_url=f"{url}#note_{note_id}", excerpt=str(note.get("body") or ""),
+                    )
             save_state(self.state)
         self.api(f"todos/{todo['id']}/mark_as_done", "POST")
 
@@ -934,6 +947,7 @@ class Inbox:
                         return
                     if url in self.state["followed"] and self._should_evict_followed_issue(url, issue, now):
                         self.state["followed"].pop(url, None)
+                        self.state["watched_issues"].pop(GP.canon_issue_url(url), None)
                         log(f"evicted closed followed issue: {url}")
         else:
             seen: set[str] = set()
@@ -959,6 +973,7 @@ class Inbox:
                     return
                 if url in self.state["followed"] and self._should_evict_followed_issue(url, issue, now):
                     self.state["followed"].pop(url, None)
+                    self.state["watched_issues"].pop(GP.canon_issue_url(url), None)
                     log(f"evicted closed followed issue: {url}")
         self.prune_closed_followed(now)
         self.state["follow_since"] = now
@@ -1020,6 +1035,7 @@ class Inbox:
                 url = GP.canon_issue_url(raw_url) if raw_url else entries.get(int(issue.get("iid") or -1))
                 if url and url in self.state["followed"] and self._should_evict_followed_issue(url, issue, now):
                     self.state["followed"].pop(url, None)
+                    self.state["watched_issues"].pop(GP.canon_issue_url(url), None)
                     evicted.append(url)
                     log(f"pruned stale closed followed issue: {url}")
         self.state["followed_pruned_at"] = now

@@ -109,6 +109,7 @@ DIALOG_RULE = re.compile(r"^[─━═├┤╭╮╰╯┌┐└┘]")  # 分�
 DIALOG_TYPING = re.compile(r"type your own|type something|tell claude what to do|自己输入|其他.*输入", re.IGNORECASE)
 CHOICE_REPLY = re.compile(r"^(?:选(?:择)?\s*)?(?:第\s*)?(\d{1,2})\s*(?:项|个)?$")
 FEISHU_SUFFIX = "_（来自飞书）_"
+FEISHU_SUFFIXES = frozenset({FEISHU_SUFFIX, "_（来自飞书秘书）_"})
 CHOICE_SETTLE_S = 3  # 按键后等界面刷新再读屏核对
 STAGE_PREFIX = "状态:"
 WAITING_LABEL = "状态:等你处理"
@@ -527,10 +528,15 @@ class Inbox:
         self.comment(where, f"@{user} 已切到{label}模式，{effect}。{receipt}")
         return True
 
+    @staticmethod
+    def is_from_feishu(body: str) -> bool:
+        lines = body.rstrip().rsplit("\n", 1)
+        return bool(lines) and lines[-1].strip() in FEISHU_SUFFIXES
+
     def words(self, body: str) -> list[str]:
         """仅供命令解析：去掉末行飞书桥尾注和 @本账号，转交消息仍保留原文。"""
         lines = body.rstrip().rsplit("\n", 1)
-        if len(lines) == 2 and lines[-1].strip() in ("_（来自飞书）_", "_（来自飞书秘书）_"):
+        if len(lines) == 2 and lines[-1].strip() in FEISHU_SUFFIXES:
             body = lines[0]
         return [w for w in body.split() if w.lower() != f"@{self.me}".lower()]
 
@@ -882,11 +888,17 @@ class Inbox:
             return
         if note_id not in self.state["forwarded"]:
             note = self.api(f"projects/{issue['project_id']}/issues/{issue['iid']}/notes/{note_id}")
-            note_is_status = self.is_command(str(note.get("body") or ""), STATUS_COMMANDS)
+            note_body = str(note.get("body") or "")
+            note_is_status = self.is_command(note_body, STATUS_COMMANDS)
             if is_closed and url not in self.state["origins"] and not note_is_status:
                 log(f"skip mention on closed issue: {url}#note_{note_id}")
                 self.api(f"todos/{todo['id']}/mark_as_done", "POST")
                 return
+            was_tracked = (
+                url in self.state["origins"]
+                or url in self.state["followed"]
+                or (self.state["watched_issues"].get(url) or {}).get("status") == "active"
+            )
             repo = self.ensure_repo(project)
             if not repo:
                 log(f"skip mention for {url}#note_{note_id}: failed to resolve or clone local repo for {project}")
@@ -898,12 +910,13 @@ class Inbox:
             self.remember(note_id)
             if not is_closed:
                 self.follow(url, project, issue["iid"])
-                if self.dynamic_projects and not note_is_status:
+                # 只对「首次在 GitLab 接手」且非飞书自己发出的评论登记接活提醒；在途单后续 @ 与飞书回流评论不重复弹接活通知。
+                if self.dynamic_projects and not note_is_status and not was_tracked and not self.is_from_feishu(note_body):
                     self.register_watched_issue(
                         url=url, project=project, project_id=issue["project_id"], iid=issue["iid"],
                         title=str(issue.get("title") or ""), kind="mentioned_agent", actor=actor,
                         event_key=f"todo:{todo['id']}", status="active",
-                        note_url=f"{url}#note_{note_id}", excerpt=str(note.get("body") or ""),
+                        note_url=f"{url}#note_{note_id}", excerpt=note_body,
                     )
             save_state(self.state)
         self.api(f"todos/{todo['id']}/mark_as_done", "POST")

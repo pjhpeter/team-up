@@ -1774,5 +1774,98 @@ class DynamicAllProjectAndAuthBoundaryTests(unittest.TestCase):
         self.assertNotIn(url, state.get("followed", {}))
         self.assertNotIn(url, state.get("watched_issues", {}))
 
+    def test_followup_and_feishu_originated_mentions_do_not_reannounce_watched_issue(self) -> None:
+        url = "https://git.example/frontend/web-v1/-/issues/513"
+        fresh_url = "https://git.example/frontend/web-v1/-/issues/514"
+        repo_dir = self.tmp / "web-v1"
+        repo_dir.mkdir(parents=True, exist_ok=True)
+        notes = {
+            "projects/10/issues/513/notes/3001": {
+                "id": 3001,
+                "author": {"username": "pengjh"},
+                "body": "@pjhagent 顺手补充一个细节",
+                "system": False,
+            },
+            "projects/10/issues/514/notes/3002": {
+                "id": 3002,
+                "author": {"username": "pengjh"},
+                "body": "@pjhagent MR 已合并，close issue\n\n_（来自飞书秘书）_",
+                "system": False,
+            },
+        }
+        done_todos: list[int] = []
+
+        def fake_run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[:2] == ["glab", "api"]:
+                endpoint = cmd[-1]
+                if endpoint in notes:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps(notes[endpoint]), "")
+                if endpoint.endswith("/mark_as_done"):
+                    done_todos.append(int(endpoint.split("/")[1]))
+                    return subprocess.CompletedProcess(cmd, 0, "{}", "")
+                if "/notes" in endpoint and "-X" in cmd and "POST" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, "{}", "")
+            if cmd[:2] == ["herdr", "agent"] and "list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": {"agents": []}}), "")
+            if cmd[0] == "hwf":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+        cfg = {
+            "host": "git.example",
+            "agent_user": "pjhagent",
+            "allowed_users": ["pengjh"],
+            "label": "herdr-auto",
+            "projects": {},
+            "dynamic_projects": True,
+            "code_root": str(self.tmp),
+            "local_config_path": str(self.tmp / "local.json"),
+        }
+        (self.tmp / "local.json").write_text(
+            json.dumps({"projects": {"frontend/web-v1": str(repo_dir)}}), encoding="utf-8"
+        )
+        state: dict[str, Any] = {
+            "origins": {
+                url: {"project": "frontend/web-v1", "project_id": 10, "iid": 513, "repo": str(repo_dir),
+                      "initiator": "pengjh", "last_note_id": 2999, "mode": "deliver"},
+            },
+            "watched_issues": {
+                url: {"url": url, "project": "frontend/web-v1", "project_id": 10, "iid": 513,
+                      "title": "翻转水印", "kind": "mentioned_agent", "actor": "pengjh",
+                      "event_key": "todo:4769", "status": "active"},
+            },
+        }
+        inbox = INBOX.Inbox(cfg, state, run=fake_run, jev=None)
+        inbox.me = "pjhagent"
+        inbox.handle_note = lambda *_a, **_kw: True  # type: ignore[method-assign]
+
+        # 1. 已在跟进的 #513 收到新的 @pjhagent 评论：不应覆写 event_key 重弹接活通知
+        inbox.handle_mention({
+            "id": 4999,
+            "action_name": "mentioned",
+            "target_type": "Issue",
+            "target_url": f"{url}#note_3001",
+            "body": "@pjhagent 顺手补充一个细节",
+            "author": {"username": "pengjh"},
+            "project": {"id": 10, "path_with_namespace": "frontend/web-v1"},
+            "target": {"id": 5130, "iid": 513, "project_id": 10, "title": "翻转水印", "state": "opened", "web_url": url},
+        })
+        self.assertEqual(state["watched_issues"][url]["event_key"], "todo:4769")
+
+        # 2. 来自飞书秘书的评论（带 _（来自飞书秘书）_）：即使首次出现也不写入 watched_issues 触发回弹
+        inbox.handle_mention({
+            "id": 5000,
+            "action_name": "mentioned",
+            "target_type": "Issue",
+            "target_url": f"{fresh_url}#note_3002",
+            "body": "@pjhagent MR 已合并，close issue\n\n_（来自飞书秘书）_",
+            "author": {"username": "pengjh"},
+            "project": {"id": 10, "path_with_namespace": "frontend/web-v1"},
+            "target": {"id": 5140, "iid": 514, "project_id": 10, "title": "新单", "state": "opened", "web_url": fresh_url},
+        })
+        self.assertNotIn(fresh_url, state["watched_issues"])
+        self.assertEqual(done_todos, [4999, 5000])
+
+
 
 

@@ -341,6 +341,43 @@ class ClaimTest(Case):
         remaining_names = {a["name"] for a in fake.agents}
         self.assertEqual(remaining_names, {"delivery-scheduler-w1-ps", "i453-arch", "i453-test", "i453-test-3", "i453-dev"})
 
+    def test_agy_adds_session_trusted_workspace_and_supports_keep_session_and_override(self) -> None:
+        import json as _json
+        cfg = self.dir / "agy.yaml"
+        cfg.write_text(
+            "profiles:\n"
+            "  arch: {kind: agy, args: ['--model', 'gemini-4-neon-xhigh', '--effort', 'xhigh', '--mode', 'auto', '--dangerously-skip-permissions']}\n",
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HWF_GLOBAL_CONFIG": str(cfg)}):
+            fake = FakeHerdr([SCHED])
+            out = self.run_claim(fake, "arch")
+            self.assertEqual((out["action"], out["kind"]), ("created", "agy"))
+            self.assertEqual(out["label"], "arch-gemini-4-neon-xhigh-#453核查")
+            (start,) = fake.starts()
+            started_args = list(start[start.index("--") + 1:])
+            self.assertIn("--settings", started_args)
+            settings_val = _json.loads(started_args[started_args.index("--settings") + 1])
+            self.assertIn(os.path.realpath(self.dir), settings_val["trustedWorkspaces"])
+
+            # 同目录 --keep-session 时 running_args_match 应命中已拼好 --settings 的命令行，直接复用
+            out2 = self.run_claim(fake, "arch", keep_session=True)
+            self.assertEqual(out2["action"], "kept")
+
+            # --model-override 只替换 --model，保留 --effort 与会话级 --settings，旧 agy 会话按 /exit 退出重启
+            out3 = self.run_claim(
+                fake, "arch", model_override="gemini-4-neon-high",
+                authorized_by="https://git.bootingai.net/x/-/issues/453#note_1",
+            )
+            self.assertEqual(out3["action"], "restarted")
+            self.assertIn(("pane", "run", "w1:pNEW", "/exit"), fake.calls)
+            self.assertIn("gemini-4-neon-high", out3["args"])
+            self.assertEqual(out3["args"].count("--settings"), 1)
+
+        # 配置里已显式带 --settings 时不重复追加
+        explicit = ["--model", "gemini-4-neon-xhigh", "--settings", '{"trustedWorkspaces":["/x"]}']
+        self.assertEqual(MS.prepare_launch_args("agy", explicit, str(self.dir)), explicit)
+
 
 if __name__ == "__main__":
     unittest.main()

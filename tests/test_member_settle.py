@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -207,6 +208,94 @@ class MainTest(SessionCase):
         self.assertEqual(sleeps, [15, 15])
         self.assertIn("status: idle -> idle | screen stable: yes | finished: yes", output)
         self.assertIn("verdict line: 通过", output)
+
+
+def _pb_varint(n: int) -> bytes:
+    out = bytearray()
+    while True:
+        b = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(b | 0x80)
+        else:
+            out.append(b)
+            return bytes(out)
+
+
+def _pb_bytes(field_num: int, data: bytes) -> bytes:
+    return _pb_varint((field_num << 3) | 2) + _pb_varint(len(data)) + data
+
+
+def _agy_reply_step(text: str | None = None, thinking: str = "") -> bytes:
+    inner = bytearray()
+    if text is not None:
+        inner.extend(_pb_bytes(1, text.encode("utf-8")))
+    if thinking:
+        inner.extend(_pb_bytes(3, thinking.encode("utf-8")))
+    return _pb_bytes(20, bytes(inner))
+
+
+class AgySessionTest(SessionCase):
+    def _create_agy_db(self, root: Path, cid: str, steps: list[tuple[int, int, bytes]]) -> Path:
+        db_path = root / "conversations" / f"{cid}.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.execute("CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer, step_payload blob)")
+        conn.executemany("INSERT INTO steps (idx, step_type, step_payload) VALUES (?, ?, ?)", steps)
+        conn.commit()
+        conn.close()
+        return db_path
+
+    def test_extracts_agy_markdown_via_cwd_cache_and_summaries_fallback(self) -> None:
+        root = self.dir / "agy"
+        work_dir = self.dir / "repo"
+        work_dir.mkdir()
+        real_work = os.path.realpath(work_dir)
+        # 最新会话只有一轮旧回复，次新会话才是当前屏幕上的回复（验证 on_screen 校验与候选回退）
+        cid_new = "conv-newer"
+        cid_match = "conv-match"
+        self._create_agy_db(root, cid_new, [(1, 15, _agy_reply_step("别的窗格的回复内容"))])
+        reply_md = "## 给用户的摘要\n\n**方案可行**，已核对 `config.yaml`。\n\n## 完整内容\n\n| 项 | 值 |\n|---|---|\n| 模型 | Neon |\n\n通过"
+        match_db = self._create_agy_db(root, cid_match, [
+            (0, 14, b""),
+            (1, 15, _agy_reply_step("上一轮草稿")),
+            (2, 15, _agy_reply_step(reply_md, thinking="thought")),
+            (3, 15, _agy_reply_step(None, thinking="tool call only")),
+        ])
+
+        cache = root / "cache" / "last_conversations.json"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({real_work: cid_new}), encoding="utf-8")
+
+        summary_db = root / "conversation_summaries.db"
+        sconn = sqlite3.connect(summary_db)
+        sconn.execute("CREATE TABLE conversation_summaries (conversation_id text, workspace_uris text, last_modified_time text)")
+        sconn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?)",
+            (cid_new, json.dumps([f"file://{real_work}"]), "2026-11-26 10:00:00+00:00"),
+        )
+        sconn.execute(
+            "INSERT INTO conversation_summaries VALUES (?, ?, ?)",
+            (cid_match, json.dumps([f"file://{real_work}"]), "2026-11-26 09:59:00+00:00"),
+        )
+        sconn.commit()
+        sconn.close()
+
+        screen = "  给用户的摘要\n\n  方案可行，已核对 config.yaml。\n\n  完整内容\n\n  通过\n"
+        with patch.dict(os.environ, {"AGY_CONFIG_DIR": str(root)}):
+            reply, source = SETTLE.read_reply({"agent": "agy", "cwd": str(work_dir)}, screen)
+            self.assertEqual(reply, reply_md)
+            self.assertEqual(source, str(match_db))
+
+            # 未来 Herdr 直接返回 agent_session 时也能定位
+            found = SETTLE.session_file({"agent": "agy", "kind": "id", "value": cid_match})
+            self.assertEqual(found, str(match_db))
+            self.assertEqual(SETTLE.last_reply(found), reply_md)
+
+            # 屏幕与所有候选会话都对不上时安全退回屏幕文字
+            miss, reason = SETTLE.read_reply({"agent": "agy", "cwd": str(work_dir)}, "完全不相关的屏幕文字\n")
+            self.assertIsNone(miss)
+            self.assertIn("与屏幕对不上", reason)
 
 
 if __name__ == "__main__":

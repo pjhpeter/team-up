@@ -22,6 +22,7 @@ import glob
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import time
@@ -66,6 +67,10 @@ def body(screen: str) -> str:
     return "\n".join(screen.rstrip("\n").split("\n")[:-4])
 
 
+def agy_root() -> str:
+    return os.environ.get("AGY_CONFIG_DIR") or os.path.expanduser("~/.gemini/antigravity-cli")
+
+
 def session_file(session: dict) -> str | None:
     """按 herdr 报告的 agent_session 找成员的会话记录文件；找不到返回 None。"""
     value = str(session.get("value") or "")
@@ -82,10 +87,160 @@ def session_file(session: dict) -> str | None:
         pattern = os.path.join(root, "sessions", "**", f"rollout-*-{glob.escape(value)}.jsonl")
     elif agent == "droid":
         pattern = os.path.join(os.path.expanduser("~/.factory"), "sessions", "*", f"{glob.escape(value)}.jsonl")
+    elif agent == "agy":
+        path = os.path.join(agy_root(), "conversations", f"{value}.db")
+        return path if os.path.isfile(path) else None
     else:
         return None
     matches = glob.glob(pattern, recursive=True)
     return max(matches, key=os.path.getmtime) if matches else None
+
+
+def _connect_sqlite_ro(path: str) -> sqlite3.Connection:
+    """尽量只读打开 SQLite；WAL 模式只读偶发打不开时退回普通连接（仅执行 SELECT）。"""
+    try:
+        return sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+    except sqlite3.OperationalError:
+        return sqlite3.connect(path, timeout=5)
+
+
+def _read_varint(buf: bytes, idx: int) -> tuple[int, int]:
+    val, shift = 0, 0
+    while idx < len(buf):
+        b = buf[idx]
+        idx += 1
+        val |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return val, idx
+        shift += 7
+    raise ValueError("truncated protobuf varint")
+
+
+def _parse_pb(buf: bytes) -> list[tuple[int, int, int | bytes]]:
+    idx, out = 0, []
+    while idx < len(buf):
+        tag, idx = _read_varint(buf, idx)
+        fnum, wtype = tag >> 3, tag & 7
+        if wtype == 0:
+            val, idx = _read_varint(buf, idx)
+            out.append((fnum, wtype, val))
+        elif wtype == 1:
+            if idx + 8 > len(buf):
+                break
+            out.append((fnum, wtype, buf[idx:idx + 8]))
+            idx += 8
+        elif wtype == 2:
+            ln, idx = _read_varint(buf, idx)
+            if idx + ln > len(buf):
+                break
+            out.append((fnum, wtype, buf[idx:idx + ln]))
+            idx += ln
+        elif wtype == 5:
+            if idx + 4 > len(buf):
+                break
+            out.append((fnum, wtype, buf[idx:idx + 4]))
+            idx += 4
+        else:
+            break
+    return out
+
+
+def last_agy_reply(path: str) -> str | None:
+    """从 agy 会话 SQLite（steps.step_type=15 的 protobuf 载荷）提取最后一条助手原始 Markdown 回复。"""
+    conn = _connect_sqlite_ro(path)
+    try:
+        rows = conn.execute("SELECT step_payload FROM steps WHERE step_type = 15 ORDER BY idx DESC")
+        for (payload,) in rows:
+            if not payload:
+                continue
+            buf = bytes(payload)
+            try:
+                fields = _parse_pb(buf)
+            except ValueError:
+                continue
+            for fnum, wtype, val in fields:
+                if fnum != 20 or wtype != 2 or not isinstance(val, (bytes, bytearray)):
+                    continue
+                try:
+                    subfields = _parse_pb(bytes(val))
+                except ValueError:
+                    continue
+                primary = "".join(
+                    sv.decode("utf-8", errors="replace")
+                    for sf, sw, sv in subfields if sf == 1 and sw == 2 and isinstance(sv, (bytes, bytearray))
+                )
+                if primary.strip():
+                    return primary
+                fallback = "".join(
+                    sv.decode("utf-8", errors="replace")
+                    for sf, sw, sv in subfields if sf == 8 and sw == 2 and isinstance(sv, (bytes, bytearray))
+                )
+                if fallback.strip():
+                    return fallback
+    finally:
+        conn.close()
+    return None
+
+
+def agy_candidate_dbs(info: dict) -> list[str]:
+    """Herdr 未报告 agy 的 agent_session 时，按成员工作目录从 last_conversations.json 与 summaries 库定位候选会话。"""
+    root = agy_root()
+    conv_dir = os.path.join(root, "conversations")
+    if not os.path.isdir(conv_dir):
+        return []
+    raw_cwd = str(info.get("foreground_cwd") or info.get("cwd") or "").strip()
+    if not raw_cwd:
+        return []
+    cwds: list[str] = []
+    for p in (raw_cwd, os.path.realpath(raw_cwd)):
+        if p and p not in cwds:
+            cwds.append(p)
+
+    cids: list[str] = []
+    cache_file = os.path.join(root, "cache", "last_conversations.json")
+    try:
+        with open(cache_file, encoding="utf-8") as handle:
+            last_map = json.load(handle)
+        if isinstance(last_map, dict):
+            for p in cwds:
+                cid = last_map.get(p)
+                if isinstance(cid, str) and cid and cid not in cids:
+                    cids.append(cid)
+    except (OSError, ValueError):
+        pass
+
+    summary_db = os.path.join(root, "conversation_summaries.db")
+    if os.path.isfile(summary_db):
+        try:
+            conn = _connect_sqlite_ro(summary_db)
+            try:
+                uri_set = {f"file://{p}" for p in cwds}
+                rows = conn.execute(
+                    "SELECT conversation_id, workspace_uris FROM conversation_summaries "
+                    "ORDER BY last_modified_time DESC LIMIT 50"
+                )
+                for cid, raw_uris in rows:
+                    if not isinstance(cid, str) or not cid or cid in cids:
+                        continue
+                    try:
+                        uris = json.loads(raw_uris) if isinstance(raw_uris, str) else []
+                    except ValueError:
+                        uris = []
+                    if isinstance(uris, list) and any(str(u) in uri_set for u in uris):
+                        cids.append(cid)
+                        if len(cids) >= 5:
+                            break
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            pass
+
+    paths: list[str] = []
+    for cid in cids:
+        db_path = os.path.join(conv_dir, f"{cid}.db")
+        if os.path.isfile(db_path) and db_path not in paths:
+            paths.append(db_path)
+    return paths
 
 
 def record_text(record: dict) -> tuple[str, str] | None:
@@ -108,7 +263,9 @@ def record_text(record: dict) -> tuple[str, str] | None:
 
 
 def last_reply(path: str) -> str | None:
-    """取最后一条带文字的回复。Claude 会把一条回复拆成多行记录（message.id 相同），要拼回去。"""
+    """取最后一条带文字的回复。agy 读 SQLite steps；Claude/omp/codex/droid 读 JSONL。"""
+    if path.endswith(".db"):
+        return last_agy_reply(path)
     last_id, parts = None, []
     with open(path, encoding="utf-8") as handle:
         for line in handle:
@@ -146,20 +303,40 @@ def on_screen(reply: str, screen: str) -> bool:
 def read_reply(info: dict, screen: str) -> tuple[str | None, str]:
     """返回 (原始 Markdown, 说明)。取不到时原始 Markdown 为 None，说明写原因。不因此让核对失败。"""
     session = info.get("agent_session")
-    if not isinstance(session, dict):
-        return None, "herdr 没有报告这个成员的会话记录"
-    path = session_file(session)
-    if not path:
-        return None, f"找不到 {session.get('agent')} 的会话记录文件"
-    try:
-        reply = last_reply(path)
-    except OSError as error:
-        return None, f"读会话记录失败：{error}"
-    if not reply:
-        return None, f"会话记录里没有回复：{path}"
-    if not on_screen(reply, screen):
-        return None, f"会话记录最后一条回复与屏幕对不上（可能是旧回复）：{path}"
-    return reply, path
+    if isinstance(session, dict):
+        path = session_file(session)
+        if not path:
+            return None, f"找不到 {session.get('agent')} 的会话记录文件"
+        try:
+            reply = last_reply(path)
+        except (OSError, sqlite3.Error) as error:
+            return None, f"读会话记录失败：{error}"
+        if not reply:
+            return None, f"会话记录里没有回复：{path}"
+        if not on_screen(reply, screen):
+            return None, f"会话记录最后一条回复与屏幕对不上（可能是旧回复）：{path}"
+        return reply, path
+
+    if info.get("agent") == "agy":
+        candidates = agy_candidate_dbs(info)
+        if not candidates:
+            return None, "找不到 agy 的会话记录文件"
+        last_reason = f"会话记录里没有回复：{candidates[0]}"
+        for db_path in candidates:
+            try:
+                reply = last_agy_reply(db_path)
+            except (OSError, sqlite3.Error) as error:
+                last_reason = f"读会话记录失败：{error}"
+                continue
+            if not reply:
+                last_reason = f"会话记录里没有回复：{db_path}"
+                continue
+            if on_screen(reply, screen):
+                return reply, db_path
+            last_reason = f"会话记录最后一条回复与屏幕对不上（可能是旧回复）：{db_path}"
+        return None, last_reason
+
+    return None, "herdr 没有报告这个成员的会话记录"
 
 
 def text_lines(text: str) -> int:

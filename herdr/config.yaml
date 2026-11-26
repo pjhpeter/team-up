@@ -1,7 +1,6 @@
 # 机器级角色定义（hwf 全局插件配置层，最低优先级）。
-# 2026-11-17 用户指示：arch 改用 droid + thinking medium，不再用 omp（取代 11-13 的 omp + factory-droid 方案）。
-# 2026-11-20 用户指示：arch 模型改为 gemini-4-carbon；2026-11-21 用户指示：arch 思考强度由 medium 改为 high；用户明确指定时才用其他模型。
-# arch 的 thinking 为 high，arch-lite 的 thinking 为 medium；三个开发角色 thinking 为 medium。
+# 2026-11-26 用户指示：arch 改用 agy + gemini-4-neon-xhigh（思考强度 xhigh），不再用 droid + gemini-4-carbon。
+# arch 的 thinking 为 xhigh，arch-lite 的 thinking 为 medium；三个开发角色 thinking 为 medium。
 # 2026-11-18 用户指示：GPT 角色全部升到对应 6.2 版本（gpt-6.1-sol → gpt-6.2-sol，gpt-6-astra → gpt-6.2-astra），思考强度不变。
 # 2026-11-11 用户指示：固定使用 GPT 的成员统一用 codex；模型与思考强度不变。
 # 模型不可用时先报告；每次临时替换须用户确认，替换与恢复都记入 STATE。
@@ -13,8 +12,8 @@
 #
 # 用户 2026-10-17 指示：所有成员一律 YOLO 权限，不再逐次审批。
 # omp 用 --approval-mode yolo；codex 用 --dangerously-bypass-approvals-and-sandbox；
-# pi 无审批门禁。审批授权不改变「禁止在远程服务器执行命令」等全局约束，后者仍由
-# PROTOCOL.md 与全局规则执行。
+# agy 用 --mode auto --dangerously-skip-permissions；pi 无审批门禁。审批授权不改变
+# 「禁止在远程服务器执行命令」等全局约束，后者仍由 PROTOCOL.md 与全局规则执行。
 profiles:
   # 入口 `prefix+k` / `hwf run team-up` 新建调度者时用这个 profile。
   # 需要无人值守执行 glab、herdr、git 并写任务记录，因此用 yolo。
@@ -28,14 +27,13 @@ profiles:
   scheduler:
     kind: omp
     args: ["--config", "/Users/pengjiahui/.hwf/scheduler-omp.yml", "--approval-mode", "yolo"]
-  # 架构师：2026-11-17 改用 droid，2026-11-20 模型改为 gemini-4-carbon，2026-11-21 思考强度改为 high。
-  # 交互式 droid 没有 --model 参数，模型与思考档写在 droid-arch.json（sessionDefaultSettings）；
-  # --auto high 是 droid 交互模式里最高的自主等级。用户指定其他模型时改领其他角色（--settings 不能临时替换模型）。
+  # 架构师：2026-11-26 改用 agy + gemini-4-neon-xhigh，思考强度 xhigh（YOLO：--mode auto --dangerously-skip-permissions）。
+  # member-start.py 会自动通过一次性会话级 --settings 信任当前工作目录，避免新仓库/worktree 弹出信任提示卡住启动。
   # 承担复杂度判定、独立方案评审、关键取舍、风险终审与最终验收；不编写技术方案。
   # 常规代码评审和回改由 code-review 承担。
   arch:
-    kind: droid
-    args: ["--settings", "/Users/pengjiahui/.hwf/herdr/droid-arch.json", "--auto", "high"]
+    kind: agy
+    args: ["--model", "gemini-4-neon-xhigh", "--effort", "xhigh", "--mode", "auto", "--dangerously-skip-permissions"]
   # 技术方案编写（arch-lite）：所有技术方案的初稿、逐文件改动、回滚与验证表、评审回改。
   # 方案作者使用 codex + gpt-6.2-astra，思考强度 medium。
   # 不签发、不拍板、不评审自己的方案；编写会话不得兼任同一交付物的 precheck/arch/dev。

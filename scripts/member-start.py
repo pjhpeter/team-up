@@ -154,6 +154,22 @@ def override_model(args: Sequence[str], model: str) -> list[str]:
         raise ClaimError("这个角色的模型写在 --settings 文件里，不能临时替换；按用户授权改领其他角色")
     raise ClaimError("配置里找不到模型参数，无法替换")
 
+def prepare_launch_args(kind: str, args: Sequence[str], cwd: str, repo: Optional[Path] = None) -> list[str]:
+    """按执行体补齐运行时启动参数。agy 对工作目录做精确信任匹配，用会话级 --settings 信任当前 cwd/主仓避免卡在启动弹窗。"""
+    out = list(args)
+    if kind != "agy":
+        return out
+    if any(a == "--settings" or a.startswith("--settings=") for a in out):
+        return out
+    candidates: list[str] = []
+    for raw in (cwd, os.path.realpath(cwd), str(repo) if repo else "", os.path.realpath(str(repo)) if repo else ""):
+        if raw and raw not in candidates:
+            candidates.append(raw)
+    if candidates:
+        out.extend(["--settings", json.dumps({"trustedWorkspaces": candidates}, ensure_ascii=False, separators=(",", ":"))])
+    return out
+
+
 def pane_label(profile: str, args: Sequence[str], task: str, issue: str = "") -> str:
     model = (model_of(args) or "").rsplit("/", 1)[-1]
     # 补齐 issue 编号，避免 Agent 退出后空壳窗格丢失归属标识
@@ -465,6 +481,7 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
         if not authorized_by:
             raise ClaimError("换模型必须附 --authorized-by（用户授权的 issue 评论链接），协议不允许擅自替换")
         profile["args"] = override_model(profile["args"], model_override)
+    profile["args"] = prepare_launch_args(profile["kind"], profile["args"], cwd, repo)
     all_agents = agents()
     scheduler = current_scheduler(all_agents)
     registry = read_registry()

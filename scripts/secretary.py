@@ -327,6 +327,13 @@ class Secretary:
             if not project or not isinstance(iid, int):
                 continue
             ref = self.ref(project, iid)
+            pid = quote(project, safe="")
+            info = self.bridge.api(f"projects/{pid}/issues/{iid}")
+            if info.get("state") == "closed":
+                announced[url] = event_key
+                for old in list(announced)[:-300]:
+                    del announced[old]
+                continue
             title = str(item.get("title") or "")
             actor = str(item.get("actor") or "")
             kind = str(item.get("kind") or "")
@@ -378,6 +385,8 @@ class Secretary:
             notes = self.notes_of(w)
             if known is None:
                 issue = self.bridge.api(f"projects/{pid}/issues/{w['iid']}")
+                if issue.get("state") == "closed":
+                    continue  # 已关闭的单子不再纳入活跃跟踪
                 issues[url] = {**w, "title": issue.get("title", "") or w.get("title", ""),
                                "last_note": max([n["id"] for n in notes] or [0]),
                                "last_agent_at": self.bridge.now()}
@@ -608,22 +617,27 @@ class Secretary:
         for url, issue in sorted(self.state["issues"].items(), key=lambda kv: (kv[1].get("project", ""), kv[1]["iid"])):
             ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
             try:
-                lines.append(self.task_line(url, issue))
+                line = self.task_line(url, issue)
             except Exception as e:  # 一个需求查不到不影响其他
                 lines.append(f"- [{ref}]({url}) {issue.get('title', '')}：这次没查到（{str(e)[:80]}）")
+                continue
+            if line:
+                lines.append(line)
         return lines
 
     def task_line(self, url: str, issue: Mapping[str, Any]) -> str:
         pid = quote(issue["project"], safe="")
         info = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}")
+        if info.get("state") == "closed":
+            return ""
         labels = [l for l in info.get("labels", []) if l.startswith("状态:")]
         ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
         if issue.get("standby"):
-            parts = ["、".join(labels) or ("已关闭" if info.get("state") == "closed" else "待你发话启动")]
+            parts = ["、".join(labels) or "待你发话启动"]
             if info.get("state") == "opened":
                 parts.append("暂未拉起 Agent（回复可先只读分析，或发 /go 开工）")
             return f"- [{ref}]({url}) {issue.get('title', '')}：{'；'.join(parts)}"
-        parts = ["、".join(labels) or ("已关闭" if info.get("state") == "closed" else "没有进度标签")]
+        parts = ["、".join(labels) or "没有进度标签"]
         alerts = []
         if WAITING_LABEL in labels:
             if self.user_spoke_last(issue):

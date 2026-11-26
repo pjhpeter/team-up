@@ -1873,6 +1873,110 @@ class DynamicAllProjectAndAuthBoundaryTests(unittest.TestCase):
         self.assertNotIn(fresh_url, state["watched_issues"])
         self.assertEqual(done_todos, [4999, 5000])
 
+    def test_prune_closed_watched_evicts_orphan_standby_and_recent_closed_immediately(self) -> None:
+        orphan_url = "https://git.example/backend/user/-/issues/1"
+        recent_followed_url = "https://git.example/frontend/web-v1/-/issues/513"
+        closed_standby_url = "https://git.example/frontend/web-v1/-/issues/485"
+        open_standby_url = "https://git.example/frontend/web-v1/-/issues/490"
+        origin_url = "https://git.example/frontend/web-v1/-/issues/494"
+        queries: list[str] = []
+
+        def fake_run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[:2] == ["glab", "api"]:
+                endpoint = cmd[-1]
+                queries.append(endpoint)
+                if endpoint.startswith("projects/backend%2Fuser/issues?state=closed"):
+                    return subprocess.CompletedProcess(
+                        cmd, 0,
+                        json.dumps([{"iid": 1, "web_url": orphan_url, "state": "closed", "closed_at": "2026-10-22T07:55:39Z"}]),
+                        "",
+                    )
+                if endpoint.startswith("projects/frontend%2Fweb-v1/issues?state=closed"):
+                    return subprocess.CompletedProcess(
+                        cmd, 0,
+                        json.dumps([
+                            {"iid": 513, "web_url": recent_followed_url, "state": "closed", "closed_at": "2026-11-26T10:41:10Z"},
+                            {"iid": 485, "web_url": closed_standby_url, "state": "closed", "closed_at": "2026-11-26T11:20:00Z"},
+                        ]),
+                        "",
+                    )
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+        cfg = {
+            "host": "git.example",
+            "agent_user": "pjhagent",
+            "allowed_users": ["pengjh"],
+            "label": "herdr-auto",
+            "projects": {},
+            "dynamic_projects": True,
+            "code_root": str(self.tmp),
+            "local_config_path": str(self.tmp / "local.json"),
+        }
+        state: dict[str, Any] = {
+            "origins": {
+                origin_url: {"project": "frontend/web-v1", "project_id": 10, "iid": 494,
+                             "repo": str(self.tmp), "initiator": "pengjh", "last_note_id": 1},
+            },
+            "followed": {
+                recent_followed_url: {"project": "frontend/web-v1", "iid": 513},
+            },
+            "watched_issues": {
+                orphan_url: {"url": orphan_url, "project": "backend/user", "project_id": 71, "iid": 1,
+                             "title": "旧单", "kind": "mentioned_agent", "actor": "pengjh",
+                             "event_key": "todo:3100", "status": "active"},
+                recent_followed_url: {"url": recent_followed_url, "project": "frontend/web-v1", "project_id": 10, "iid": 513,
+                                      "title": "水印", "kind": "mentioned_agent", "actor": "pengjh",
+                                      "event_key": "todo:4772", "status": "active"},
+                closed_standby_url: {"url": closed_standby_url, "project": "frontend/web-v1", "project_id": 10, "iid": 485,
+                                     "title": "画布同步", "kind": "assigned_user", "actor": "nmagent",
+                                     "event_key": "user-todo:4774", "status": "standby"},
+                open_standby_url: {"url": open_standby_url, "project": "frontend/web-v1", "project_id": 10, "iid": 490,
+                                   "title": "仍在途", "kind": "assigned_user", "actor": "nmagent",
+                                   "event_key": "user-todo:4775", "status": "standby"},
+                origin_url: {"url": origin_url, "project": "frontend/web-v1", "project_id": 10, "iid": 494,
+                             "title": "发起单", "kind": "assigned_agent", "actor": "pengjh",
+                             "event_key": "todo:4700", "status": "active"},
+            },
+        }
+        inbox = INBOX.Inbox(cfg, state, run=fake_run, jev=None)
+        now = 1_800_000_000.0
+        evicted = inbox.prune_closed_watched(now)
+        self.assertEqual(set(evicted), {orphan_url, recent_followed_url, closed_standby_url})
+        self.assertEqual(set(state["watched_issues"]), {open_standby_url, origin_url})
+        # followed 不受影响，仍保留刚关闭的 #513 承接 7 天内尾随评论
+        self.assertIn(recent_followed_url, state["followed"])
+        # 发起单 #494 交给 poll_origin 查，不放进 prune_closed_watched 的 iids[]
+        fe_queries = [q for q in queries if q.startswith("projects/frontend%2Fweb-v1/issues?state=closed")]
+        self.assertEqual(len(fe_queries), 1)
+        self.assertNotIn("iids[]=494", fe_queries[0])
+
+        # 60 秒节流窗口内不重复发请求
+        queries.clear()
+        self.assertEqual(inbox.prune_closed_watched(now + 30), [])
+        self.assertEqual(queries, [])
+
+    def test_poll_followed_evicts_closed_watched_issue_immediately_while_keeping_followed_7d(self) -> None:
+        recent_url = "https://git.example/frontend/web-v1/-/issues/513"
+        now = 1_800_000_000.0
+        closed_at = INBOX.time.strftime("%Y-%m-%dT%H:%M:%SZ", INBOX.time.gmtime(now - 600))
+        state: dict[str, Any] = {
+            "follow_since": now - 60,
+            "followed_pruned_at": now,
+            "followed": {recent_url: {"project": "frontend/web-v1", "iid": 513}},
+            "watched_issues": {
+                recent_url: {"url": recent_url, "project": "frontend/web-v1", "project_id": 10, "iid": 513,
+                             "title": "水印", "kind": "mentioned_agent", "actor": "pengjh",
+                             "event_key": "todo:4772", "status": "active"},
+            },
+        }
+        world = FakeWorld([])
+        world.by_iid = [{"iid": 513, "project_id": 10, "web_url": recent_url, "state": "closed", "closed_at": closed_at}]
+        with patch.object(INBOX.time, "time", return_value=now):
+            make(world, state).poll_followed()
+        self.assertNotIn(recent_url, state["watched_issues"])
+        self.assertIn(recent_url, state["followed"])
+
+
 
 
 

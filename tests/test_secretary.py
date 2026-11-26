@@ -691,6 +691,56 @@ class SecretaryTest(unittest.TestCase):
         self.b.handle(msg("om_cross7", "帮我看下 backend/api#7 的进展"))
         self.assertEqual(self.w.writes[-1][1], "projects/backend/api/issues/7/notes")
 
+    def test_closed_watched_issue_is_not_announced_tracked_or_shown_in_patrol(self) -> None:
+        closed_url = "https://git.example.com/backend/user/-/issues/1"
+        self.w.projects["backend/user"] = {"path_with_namespace": "backend/user", "archived": False}
+        self.w.extra_issues[("backend/user", 1)] = {
+            "iid": 1, "title": "旧邮箱绑定", "state": "closed", "labels": [], "notes": [], "events": [],
+        }
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({
+            "origins": {URL7: {"project": "frontend/web-v1", "iid": 7, "repo": str(self.home / "repo")}},
+            "watched_issues": {
+                closed_url: {
+                    "project": "backend/user",
+                    "iid": 1,
+                    "title": "旧邮箱绑定",
+                    "status": "active",
+                    "kind": "mentioned_agent",
+                    "actor": "pengjh",
+                    "event_key": "todo:3100",
+                }
+            },
+        }))
+        sent_before = len(self.w.sent)
+        self.sec.poll()
+        # 1. 已关闭的跨项目 watched_issues 既不推送飞书接活提醒，也不纳入 secretary.issues
+        self.assertEqual(len(self.w.sent), sent_before)
+        self.assertNotIn(closed_url, self.sec.state["issues"])
+
+        # 2. 先在 #7 打开时跑一次巡检建立基线，再将 #7 关闭（仍挂在 watched 窗口期内、甚至残留等你处理标签），
+        #    巡检与总览应直接跳过已关闭单，不展示「已关闭」也不误算待审数。
+        self.now += 3600
+        first_patrol = self.sec.patrol()
+        self.assertIsNotNone(first_patrol)
+        self.assertIn("#7", first_patrol)
+
+        self.w.issues[7]["labels"] = ["状态:等你处理"]
+        self.w.issues[7]["state"] = "closed"
+        self.w.agent_note(7, "最终关单说明")
+        self.assertEqual(self.sec.overview(), [])
+        self.assertEqual(self.sec.pending_review_count(self.sec.overview()), 0)
+        self.now += 3600
+        patrol_text = self.sec.patrol()
+        self.assertIsNotNone(patrol_text)
+        self.assertNotIn("已关闭", patrol_text)
+        self.assertIn("现在没有在跑的需求", patrol_text)
+        # 且当上游移除后，关闭前的最后一条评论仍会被补发再移出跟踪
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({"origins": {}, "watched_issues": {}}))
+        self.sec.poll()
+        self.assertTrue(any("最终关单说明" in s["text"] for s in self.forwarded()))
+        self.assertNotIn(URL7, self.sec.state["issues"])
+
+
 
 
 if __name__ == "__main__":

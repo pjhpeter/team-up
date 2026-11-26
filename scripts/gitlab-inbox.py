@@ -99,6 +99,7 @@ FOLLOW_OVERLAP_S = 300
 FOLLOWED_CAP = 100  # 用户 @ 过本账号的非发起 issue，一次 iids[] 查询能装下的量
 FOLLOWED_CLOSED_RETENTION_S = 7 * 86400  # 已关闭满 7 天的跟进 issue 自动移出 followed，再次 @ 时会自动接回
 FOLLOWED_PRUNE_INTERVAL_S = 3600  # 低频批量巡检久未更新的已关跟进单
+WATCHED_PRUNE_INTERVAL_S = 60  # 每分钟批量核对非发起 watched_issues，关闭后立刻停推秘书巡检
 MAX_IDLE_SCHEDULER_SESSION_BYTES = 30 * 1024 * 1024  # 完全空闲且无在途任务的调度者会话超过 30MB 时自动轮换
 CLOSED_CAP = 200  # 已关闭的发起 issue 只为“用户重开后接着跟踪”保留，留最近的即可。
 # 发起 issue 描述里指定调度者参数的行：`/model jc-gpt/gpt-6.1-sol`、`/thinking high`（2026-10-22 用户指示）。
@@ -886,6 +887,8 @@ class Inbox:
         is_status_query = self.is_command(str(todo.get("body") or ""), STATUS_COMMANDS)
         if is_closed and url not in self.state["origins"] and not is_status_query:
             # 已关闭的历史旧单不再拉仓库、不在旧单留言，也不写入 watched_issues 误发飞书「已自动接手」提醒。
+            if self.state["watched_issues"].pop(url, None) is not None:
+                save_state(self.state)
             log(f"skip mention on closed issue: {url}#note_{note_id}")
             self.api(f"todos/{todo['id']}/mark_as_done", "POST")
             return
@@ -894,6 +897,8 @@ class Inbox:
             note_body = str(note.get("body") or "")
             note_is_status = self.is_command(note_body, STATUS_COMMANDS)
             if is_closed and url not in self.state["origins"] and not note_is_status:
+                if self.state["watched_issues"].pop(url, None) is not None:
+                    save_state(self.state)
                 log(f"skip mention on closed issue: {url}#note_{note_id}")
                 self.api(f"todos/{todo['id']}/mark_as_done", "POST")
                 return
@@ -961,6 +966,9 @@ class Inbox:
                     seen.add(url)
                     if not self.poll_followed_issue(url, repo, issue, floor):
                         return
+                    if issue.get("state") == "closed":
+                        if self.state["watched_issues"].pop(GP.canon_issue_url(url), None) is not None:
+                            log(f"evicted closed watched issue: {url}")
                     if url in self.state["followed"] and self._should_evict_followed_issue(url, issue, now):
                         self.state["followed"].pop(url, None)
                         self.state["watched_issues"].pop(GP.canon_issue_url(url), None)
@@ -987,6 +995,9 @@ class Inbox:
                 seen.add(url)
                 if not self.poll_followed_issue(url, "", issue, floor, project=project):
                     return
+                if issue.get("state") == "closed":
+                    if self.state["watched_issues"].pop(GP.canon_issue_url(url), None) is not None:
+                        log(f"evicted closed watched issue: {url}")
                 if url in self.state["followed"] and self._should_evict_followed_issue(url, issue, now):
                     self.state["followed"].pop(url, None)
                     self.state["watched_issues"].pop(GP.canon_issue_url(url), None)
@@ -1047,14 +1058,80 @@ class Inbox:
             if not isinstance(closed_issues, list):
                 continue
             for issue in closed_issues:
+                if not isinstance(issue, Mapping) or issue.get("state") != "closed":
+                    continue
                 raw_url = issue.get("web_url")
                 url = GP.canon_issue_url(raw_url) if raw_url else entries.get(int(issue.get("iid") or -1))
+                if url and self.state["watched_issues"].pop(GP.canon_issue_url(url), None) is not None:
+                    log(f"evicted closed watched issue: {url}")
                 if url and url in self.state["followed"] and self._should_evict_followed_issue(url, issue, now):
                     self.state["followed"].pop(url, None)
-                    self.state["watched_issues"].pop(GP.canon_issue_url(url), None)
                     evicted.append(url)
                     log(f"pruned stale closed followed issue: {url}")
         self.state["followed_pruned_at"] = now
+        return evicted
+
+    def prune_closed_watched(self, now: float) -> list[str]:
+        """批量核对非发起 watched_issues，关闭后立即移出，不再等 followed 的 7 天窗口或让 standby 单长期滞留。"""
+        watched: dict[str, Any] = self.state["watched_issues"]
+        if not watched:
+            return []
+        last_pruned = float(self.state.get("watched_pruned_at") or 0.0)
+        if last_pruned > 0 and (now - last_pruned) < WATCHED_PRUNE_INTERVAL_S:
+            return []
+        origin_urls = {GP.canon_issue_url(u) for u in self.state["origins"]}
+        by_proj: dict[str, dict[int, list[str]]] = {}
+        for raw_url, meta in list(watched.items()):
+            canon_url = GP.canon_issue_url(raw_url)
+            if canon_url in origin_urls:
+                continue  # 发起单由 poll_origin 每轮直接核对关闭状态
+            if not isinstance(meta, Mapping):
+                continue
+            project = str(meta.get("project") or GP.extract_project_from_web_url(canon_url) or "")
+            iid = meta.get("iid")
+            if not project or not isinstance(iid, int):
+                continue
+            by_proj.setdefault(project, {}).setdefault(iid, []).append(raw_url)
+        if not by_proj:
+            return []
+        evicted: list[str] = []
+        ok_all = True
+        for project, iid_map in sorted(by_proj.items()):
+            all_iids = sorted(iid_map)
+            for idx in range(0, len(all_iids), 100):
+                batch = all_iids[idx:idx + 100]
+                query = (
+                    f"projects/{quote(project, safe='')}/issues?state=closed&per_page=100"
+                    + "".join(f"&iids[]={iid}" for iid in batch)
+                )
+                try:
+                    closed_issues = self.api(query)
+                except InboxError as exc:
+                    log(f"prune watched_issues failed for {project}: {exc}")
+                    ok_all = False
+                    break
+                if not isinstance(closed_issues, list):
+                    continue
+                for issue in closed_issues:
+                    if not isinstance(issue, Mapping) or issue.get("state") != "closed":
+                        continue
+                    iid = issue.get("iid")
+                    raw_keys = list(iid_map.get(int(iid), ())) if isinstance(iid, int) else []
+                    web_url = GP.canon_issue_url(str(issue.get("web_url") or ""))
+                    if web_url and web_url not in raw_keys:
+                        raw_keys.append(web_url)
+                    removed_any = False
+                    for key in raw_keys:
+                        if watched.pop(key, None) is not None:
+                            removed_any = True
+                    if removed_any:
+                        label_url = web_url or (GP.canon_issue_url(raw_keys[0]) if raw_keys else f"{project}#{iid}")
+                        evicted.append(label_url)
+                        log(f"evicted closed watched issue: {label_url}")
+        if ok_all:
+            self.state["watched_pruned_at"] = now
+        if evicted or ok_all:
+            save_state(self.state)
         return evicted
 
     def poll_followed_issue(
@@ -1449,6 +1526,7 @@ class Inbox:
             self.poll_origin(url, origin)
         self.poll_followed()
         self.poll_user_items()
+        self.prune_closed_watched(time.time())
         self.rotate_oversized_idle_schedulers()
 
 

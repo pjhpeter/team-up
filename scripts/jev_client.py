@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import base64
 from dataclasses import dataclass
+import io
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import subprocess
 import sys
@@ -290,6 +292,60 @@ def _sips_dimensions(path: Path) -> tuple[int, int]:
     return width, height
 
 
+def _normalize_image_with_pillow(path: Path) -> tuple[str, bytes]:
+    """Linux 等无 sips 环境下使用 Pillow 完成与 sips 等价的缩放、白底补边与静帧转码。"""
+    try:
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise JevImageError(f"sips unavailable and Pillow not installed for {path.name}: {exc}") from exc
+
+    try:
+        with Image.open(path) as opened:
+            opened.load()
+            img = ImageOps.exif_transpose(opened)
+            img = img.convert("RGBA" if "A" in img.getbands() else "RGB")
+    except Exception as exc:  # noqa: BLE001 - Pillow 对坏图可能抛出多种异常
+        raise JevImageError(f"Invalid or unreadable image {path.name}: {exc}") from exc
+
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        raise JevImageError(f"Image {path.name} reported non-positive dimensions ({w}x{h})")
+
+    if max(w, h) > MAX_IMAGE_SIDE:
+        scale = MAX_IMAGE_SIDE / float(max(w, h))
+        w = max(1, round(w * scale))
+        h = max(1, round(h * scale))
+        resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+        img = img.resize((w, h), resample)
+
+    if w < MIN_IMAGE_SIDE or h < MIN_IMAGE_SIDE:
+        pad_w = max(w, MIN_IMAGE_SIDE)
+        pad_h = max(h, MIN_IMAGE_SIDE)
+        canvas = Image.new("RGB", (pad_w, pad_h), (255, 255, 255))
+        offset = ((pad_w - w) // 2, (pad_h - h) // 2)
+        if img.mode == "RGBA":
+            canvas.paste(img, offset, mask=img.getchannel("A"))
+        else:
+            canvas.paste(img, offset)
+        img = canvas
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    normalized = buf.getvalue()
+    if len(normalized) > MAX_IMAGE_BYTES:
+        jpg_buf = io.BytesIO()
+        rgb = img.convert("RGB") if img.mode != "RGB" else img
+        rgb.save(jpg_buf, format="JPEG", quality=85)
+        jpg_bytes = jpg_buf.getvalue()
+        if len(jpg_bytes) <= MAX_IMAGE_BYTES:
+            return "jpeg", jpg_bytes
+        raise JevImageError(f"Normalized image {path.name} still exceeds 16 MiB")
+
+    if not normalized.startswith(PNG_MAGIC):
+        raise JevImageError(f"Normalized output is not valid PNG for {path.name}")
+    return "png", normalized
+
+
 def detect_or_convert_image(path: Path) -> tuple[str, bytes]:
     """将图片归一化为符合官方 [280, 1568] 像素约束的静态 PNG/JPEG。"""
     if not path.is_file():
@@ -309,6 +365,9 @@ def detect_or_convert_image(path: Path) -> tuple[str, bytes]:
         w, h = jpeg_info
         if _within_limits(w, h, len(raw)):
             return "jpeg", raw
+
+    if shutil.which("sips") is None:
+        return _normalize_image_with_pillow(path)
 
     with tempfile.TemporaryDirectory(prefix="hwf-jev-img-") as tmp:
         stage = Path(tmp) / "stage.png"

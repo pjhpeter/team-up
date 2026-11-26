@@ -12,6 +12,7 @@ import sys
 import tempfile
 from typing import Any, Mapping
 import unittest
+from unittest.mock import patch
 import urllib.error
 import zlib
 
@@ -139,6 +140,35 @@ class JevClientTest(unittest.TestCase):
             self.assertLessEqual(dims[1], 1568)
             self.assertGreaterEqual(dims[0], 280)
             self.assertGreaterEqual(dims[1], 280)
+
+    def test_pillow_fallback_when_sips_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(JC.shutil, "which", return_value=None):
+            huge = Path(tmp) / "retina.png"
+            huge.write_bytes(make_png(2000, 1200))
+            fmt, out_bytes = JC.detect_or_convert_image(huge)
+            self.assertEqual(fmt, "png")
+            dims = JC._inspect_png(out_bytes)
+            self.assertIsNotNone(dims)
+            assert dims is not None
+            self.assertLessEqual(dims[0], 1568)
+            self.assertLessEqual(dims[1], 1568)
+            self.assertGreaterEqual(dims[0], 280)
+            self.assertGreaterEqual(dims[1], 280)
+
+            tiny = Path(tmp) / "tiny.png"
+            tiny.write_bytes(make_png(32, 24))
+            fmt_t, tiny_bytes = JC.detect_or_convert_image(tiny)
+            self.assertEqual(fmt_t, "png")
+            dims_t = JC._inspect_png(tiny_bytes)
+            self.assertIsNotNone(dims_t)
+            assert dims_t is not None
+            self.assertGreaterEqual(dims_t[0], 280)
+            self.assertGreaterEqual(dims_t[1], 280)
+
+            corrupt = Path(tmp) / "corrupt.png"
+            corrupt.write_bytes(b"not-an-image")
+            with self.assertRaises(JC.JevImageError):
+                JC.detect_or_convert_image(corrupt)
 
     def test_long_context_header_enabled_above_threshold(self) -> None:
         transport = FakeTransport([

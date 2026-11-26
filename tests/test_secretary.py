@@ -645,6 +645,53 @@ class SecretaryTest(unittest.TestCase):
         self.assertIn("同时等你拍板或确认上线", text)
         self.assertIn("达到审核提醒阈值 3", text)
 
+    def test_watched_standby_issue_announced_and_reply_routes_cross_project(self) -> None:
+        cross_url = "https://git.example.com/backend/api/-/issues/42"
+        self.w.projects["backend/api"] = {"path_with_namespace": "backend/api", "archived": False}
+        self.w.extra_issues[("backend/api", 42)] = {
+            "iid": 42, "title": "订单导出报错", "state": "opened", "labels": [], "notes": [], "events": [],
+        }
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({
+            "origins": {},
+            "watched_issues": {
+                cross_url: {
+                    "project": "backend/api",
+                    "iid": 42,
+                    "title": "订单导出报错",
+                    "status": "standby",
+                    "kind": "assigned_user",
+                    "actor": "colleague",
+                    "event_key": "user_todo:777",
+                }
+            },
+        }))
+        self.sec.poll()
+        self.assertTrue(any("backend/api#42" in s["text"] and "新登记待你处理" in s["text"] for s in self.w.sent))
+        # 对应提醒消息已映射回跨项目 URL
+        self.assertIn(cross_url, self.sec.state["msgs"].values())
+        # 第二轮不重复推送同一条待命提醒
+        sent_before = len(self.w.sent)
+        self.sec.poll()
+        self.assertEqual(len(self.w.sent), sent_before)
+
+    def test_ambiguous_same_iid_across_projects_requires_disambiguation(self) -> None:
+        cross_url = "https://git.example.com/backend/api/-/issues/7"
+        self.w.projects["backend/api"] = {"path_with_namespace": "backend/api", "archived": False}
+        self.w.extra_issues[("backend/api", 7)] = {
+            "iid": 7, "title": "另一个七号", "state": "opened", "labels": [], "notes": [], "events": [],
+        }
+        self.sec.state["issues"][cross_url] = {
+            "project": "backend/api", "iid": 7, "title": "另一个七号",
+            "repo": "", "last_note": 0, "last_agent_at": self.now,
+        }
+        candidates = list(self.sec.known_tasks().values())
+        self.assertIn(7, self.sec._ambiguous_iids(candidates))
+        self.w.respond({"action": "relay", "mode": "analyze", "reply": "", "issue": 7,
+                        "reference": "explicit", "evidence": "backend/api#7"})
+        self.b.handle(msg("om_cross7", "帮我看下 backend/api#7 的进展"))
+        self.assertEqual(self.w.writes[-1][1], "projects/backend/api/issues/7/notes")
+
+
 
 if __name__ == "__main__":
     unittest.main()

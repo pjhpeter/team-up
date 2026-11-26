@@ -7,28 +7,41 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
 from urllib.parse import quote, urlsplit
 import uuid
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import gitlab_projects as GP
 
 
 class TopicError(Exception):
     pass
 
 
+def parse_issue_url(config, url):
+    """接受配置的 GitLab host 下任意项目的完整 issue / work_items URL，返回 (project, iid)。"""
+    try:
+        return GP.parse_issue_url(config["gitlab_host"], url)
+    except ValueError:
+        raise TopicError("只接受配置的 GitLab host 下的完整 issue URL（不含查询参数或锚点）") from None
+
+
 def issue_id(config, url):
-    """只接受配置项目的完整 issue URL，不把正文引用当作拆分关系。"""
-    parsed = urlsplit(url)
-    prefix = f"/{config['default_project']}/-/"
-    match = re.fullmatch(re.escape(prefix) + r"(?:issues|work_items)/([1-9]\d*)/?", parsed.path)
-    if (parsed.scheme not in ("https", "http") or parsed.netloc != config["gitlab_host"]
-            or parsed.username or parsed.password or parsed.query or parsed.fragment or not match):
-        raise TopicError("只接受配置的 GitLab host/project 下的完整 issue URL（不含查询参数或锚点）")
-    return int(match[1])
+    """兼容旧调用：返回 URL 对应的 issue 编号。"""
+    return parse_issue_url(config, url)[1]
 
 
-def request_key(config, iid):
-    return hashlib.sha256(f"{config['gitlab_host']}/{config['default_project']}#{iid}".encode()).hexdigest()[:32]
+def issue_ref(config, project, iid):
+    return GP.format_issue_ref(project, iid, config["default_project"])
+
+
+def request_key(config, iid, project=None):
+    proj = project or config["default_project"]
+    return hashlib.sha256(f"{config['gitlab_host']}/{proj}#{iid}".encode()).hexdigest()[:32]
 
 
 def read_json(path, default=None):
@@ -67,37 +80,52 @@ def lock_bridge(state_path):
 
 
 def status(config, directory, target_url):
-    iid = issue_id(config, target_url)
-    key = request_key(config, iid)
+    project, iid = parse_issue_url(config, target_url)
+    key = request_key(config, iid, project)
     request = read_json(directory / f"{key}.request.json")
     if not request:
-        return {"status": "not_registered", "target_iid": iid}
+        return {"status": "not_registered", "project": project, "target_iid": iid}
     result = read_json(directory / f"{key}.result.json", {})
     return {**request, **result}
 
 
 def register(config, directory, source_url, target_url, api, now=time.time):
-    source, target = issue_id(config, source_url), issue_id(config, target_url)
-    if source == target:
+    source_project, source = parse_issue_url(config, source_url)
+    target_project, target = parse_issue_url(config, target_url)
+    if (source_project, source) == (target_project, target):
         raise TopicError("来源和目标不能是同一个 issue")
+    # 跨项目登记时在创建目录/锁前先确认项目未被归档且机器人有权限访问
+    for proj in {source_project, target_project}:
+        if proj != config["default_project"]:
+            try:
+                meta = api(f"projects/{quote(proj, safe='')}") or {}
+            except Exception as exc:
+                raise TopicError(f"无法访问项目 {proj}：{exc}") from None
+            if meta.get("archived"):
+                raise TopicError(f"项目 {proj} 已归档，拒绝登记话题")
     directory.mkdir(parents=True, exist_ok=True)
-    key = request_key(config, target)
+    key = request_key(config, target, target_project)
     path = directory / f"{key}.request.json"
     # 登记者只写不可变请求，绝不读取运行状态或覆盖消费者的结果。
     with (directory / "register.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         existing = read_json(path)
         if existing:
-            if existing["source_iid"] != source:
-                raise TopicError(f"目标 #{target} 已登记来源 #{existing['source_iid']}，拒绝改绑")
+            existing_src_proj = existing.get("source_project") or existing["project"]
+            if (existing_src_proj, existing["source_iid"]) != (source_project, source):
+                target_ref = issue_ref(config, target_project, target)
+                existing_ref = issue_ref(config, existing_src_proj, existing["source_iid"])
+                raise TopicError(f"目标 {target_ref} 已登记来源 {existing_ref}，拒绝改绑")
             return status(config, directory, target_url)
-        pid = quote(config["default_project"], safe="")
-        api(f"projects/{pid}/issues/{source}")
-        issue = api(f"projects/{pid}/issues/{target}")
-        notes = api(f"projects/{pid}/issues/{target}/notes?sort=desc&order_by=created_at&per_page=1")
+        spid = quote(source_project, safe="")
+        tpid = quote(target_project, safe="")
+        api(f"projects/{spid}/issues/{source}")
+        issue = api(f"projects/{tpid}/issues/{target}")
+        notes = api(f"projects/{tpid}/issues/{target}/notes?sort=desc&order_by=created_at&per_page=1")
         request = {"key": key, "status": "queued", "host": config["gitlab_host"],
-                   "project": config["default_project"], "source_iid": source, "target_iid": target,
-                   "target_url": f"https://{config['gitlab_host']}/{config['default_project']}/-/issues/{target}",
+                   "source_project": source_project, "project": target_project,
+                   "source_iid": source, "target_iid": target,
+                   "target_url": f"https://{config['gitlab_host']}/{target_project}/-/issues/{target}",
                    "registered_at": now(), "last_note": max((n["id"] for n in notes), default=0),
                    "title": issue["title"], "closed": issue["state"] == "closed"}
         write_json(path, request)
@@ -108,9 +136,10 @@ class Topics:
     def __init__(self, bridge, directory, persist):
         self.bridge, self.directory, self.persist = bridge, directory, persist
 
-    def matches(self, iid, chat=None):
+    def matches(self, iid, chat=None, project=None):
+        proj = project or self.bridge.project
         return [(root, t) for root, t in self.bridge.state["threads"].items()
-                if t["project"] == self.bridge.project and t["iid"] == iid
+                if t["project"] == proj and t["iid"] == iid
                 and (chat is None or t["chat_id"] == chat)]
 
     def consume(self):
@@ -119,8 +148,9 @@ class Topics:
             result = read_json(result_path, {"effects": {}})
             try:
                 request = read_json(path)
-                if request["host"] != self.bridge.host or request["project"] != self.bridge.project:
-                    raise TopicError("请求不属于当前配置的 GitLab 项目")
+                allowed = getattr(self.bridge, "is_project_allowed", lambda p: p == self.bridge.project)
+                if request["host"] != self.bridge.host or not allowed(request["project"]):
+                    raise TopicError("请求不属于允许访问的未归档 GitLab 项目")
                 if result.get("status") == "needs_attention":
                     continue
                 self.finish(request, result, result_path)
@@ -183,23 +213,27 @@ class Topics:
         if result.get("status") in ("ready", "archived"):
             self.install_binding(request, result)
             return
+        source_project = request.get("source_project") or request["project"]
+        target_project = request["project"]
+        source_ref = issue_ref(self.bridge.cfg, source_project, request["source_iid"])
+        target_ref = issue_ref(self.bridge.cfg, target_project, request["target_iid"])
         if not result.get("source_root"):
-            sources = self.matches(request["source_iid"])
+            sources = self.matches(request["source_iid"], project=source_project)
             if not sources:
                 raise TopicError("来源 issue 没有飞书绑定；请先在正确聊天关联来源 issue")
             if len(sources) != 1 or not sources[0][1].get("chat_id"):
                 raise TopicError("来源 issue 有多个话题或聊天，无法确定来源；未发送任何消息")
             source_root, source = sources[0]
-            targets = self.matches(request["target_iid"], source["chat_id"])
+            targets = self.matches(request["target_iid"], source["chat_id"], project=target_project)
             if len(targets) > 1:
                 raise TopicError("同一聊天已有多个目标话题，无法选择；未发送任何消息")
-            issue = self.bridge.api(f"projects/{quote(request['project'], safe='')}/issues/{request['target_iid']}")
+            issue = self.bridge.api(f"projects/{quote(target_project, safe='')}/issues/{request['target_iid']}")
             result.update(source_root=source_root, chat_id=source["chat_id"], closed=issue["state"] == "closed")
             if targets:
                 result.update(root=targets[0][0], reused=True)
             write_json(path, result)
         if not result.get("root"):
-            title = (f"#{request['target_iid']} {request['title']}（来源 #{request['source_iid']}）"
+            title = (f"{target_ref} {request['title']}（来源 {source_ref}）"
                      f"\n{request['target_url']}")
             root = self.effect(request, result, path, "root",
                                ["im", "+messages-send", "--chat-id", result["chat_id"], "--markdown", "-"], title)
@@ -224,8 +258,8 @@ class Topics:
             if not result.get("thread_id") or not result.get("message_app_link"):
                 raise TopicError("尚未读到目标 thread_id/message_app_link；保留已发消息，稍后只重试读取")
         self.install_binding(request, result)
-        notice = (f"#{request['target_iid']} 已拆为[独立话题]({result['message_app_link']})，"
-                  f"后续确认与结果请到那里；本话题仍是 #{request['source_iid']}。"
+        notice = (f"{target_ref} 已拆为[独立话题]({result['message_app_link']})，"
+                  f"后续确认与结果请到那里；本话题仍是 {source_ref}。"
                   + ("目标已关闭，新入口仅供归档查看。" if result["closed"] else ""))
         self.effect(request, result, path, "notice",
                     ["im", "+messages-reply", "--message-id", result["source_root"], "--reply-in-thread", "--markdown", "-"], notice)
@@ -234,10 +268,11 @@ class Topics:
         write_json(path, result)
 
 
-def redirect(bridge, linked, msg, iid):
+def redirect(bridge, linked, msg, iid, project=None):
     """只提示去独立话题，不在旧话题新建/改绑，也不把附件写进错误 issue。"""
+    target_project = project or bridge.project
     matches = [(root, t) for root, t in bridge.state["threads"].items()
-               if t["project"] == bridge.project and t["iid"] == iid and t["chat_id"] == msg["chat_id"]]
+               if t["project"] == target_project and t["iid"] == iid and t["chat_id"] == msg["chat_id"]]
     link = ""
     if len(matches) == 1:
         root, target = matches[0]
@@ -246,8 +281,11 @@ def redirect(bridge, linked, msg, iid):
             data = bridge.lark(["im", "+messages-mget", "--message-ids", root, "--no-reactions"])
             link = next((m.get("message_app_link", "") for m in (data.get("data") or {}).get("messages", [])
                          if m.get("message_id") == root), "")
-    destination = f"请到 [#{iid} 的独立话题]({link})继续。" if link else f"请回主聊天发「#{iid}」，再到它的独立话题继续。"
-    bridge.reply(msg["message_id"], f"本话题仍关联 #{bridge.state['threads'][linked]['iid']}。{destination}"
+    target_ref = issue_ref(bridge.cfg, target_project, iid)
+    cur_thread = bridge.state["threads"][linked]
+    cur_ref = issue_ref(bridge.cfg, cur_thread["project"], cur_thread["iid"])
+    destination = f"请到 [{target_ref} 的独立话题]({link})继续。" if link else f"请回主聊天发「{target_ref}」，再到它的独立话题继续。"
+    bridge.reply(msg["message_id"], f"本话题仍关联 {cur_ref}。{destination}"
                  "这条消息和附件未转发，请到目标话题重新发送。", f"redirect-{msg['message_id']}")
 
 
@@ -259,7 +297,7 @@ def is_registered_topic(home: Path, target_url: str) -> bool:
         return False
     config = {"gitlab_host": parsed.netloc, "default_project": match[1]}
     iid = int(match[2])
-    path = home / "state" / "feishu-topics" / f"{request_key(config, iid)}.request.json"
+    path = home / "state" / "feishu-topics" / f"{request_key(config, iid, match[1])}.request.json"
     request = read_json(path, {})
     return (request.get("host") == config["gitlab_host"] and request.get("project") == config["default_project"]
             and request.get("target_iid") == iid)

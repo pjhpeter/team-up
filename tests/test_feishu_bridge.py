@@ -48,6 +48,8 @@ class World:
         self.threads: dict[str, list] = {}  # thread_id → 话题消息（历史格式）
         self.unreadable_threads: set[str] = set()
         self.sent: list[dict] = []  # 机器人主动发的顶层消息（秘书）
+        self.projects: dict[str, dict] = {"frontend/web-v1": {"path_with_namespace": "frontend/web-v1", "archived": False}}
+        self.extra_issues: dict[tuple[str, int], dict] = {}
 
     def __call__(self, cmd, input=None, env=None, cwd=None, **_):
         if cmd[0] == "lark-cli":
@@ -76,22 +78,32 @@ class World:
             iid = max(self.issues) + 1
             self.issues[iid] = {"iid": iid, "title": fields["title"], "state": "opened", "notes": []}
             return ok({"iid": iid})
-        parts = base.split("/")
-        if len(parts) >= 5 and parts[3] == "issues":
-            iid = int(parts[4])
-            if iid not in self.issues:
-                return subprocess.CompletedProcess([], 1, "", "404 Not Found")
-            issue = self.issues[iid]
-            if base.endswith("/notes") and method == "POST":
-                self.next_note += 1
-                note = {"id": self.next_note, "body": fields["body"], "system": False,
-                        "author": {"name": "彭嘉辉"}}
-                issue["notes"].append(note)
-                return ok(note)
-            if base.endswith("/notes"):
-                notes = sorted(issue["notes"], key=lambda n: n["id"], reverse="sort=desc" in path)
-                return ok(notes[:1] if re.search(r"per_page=1(&|$)", path) else notes)
-            return ok({k: v for k, v in issue.items() if k != "notes"})
+        if base.startswith("projects/"):
+            rest = base[len("projects/"):]
+            if "/issues/" in rest:
+                proj, tail = rest.split("/issues/", 1)
+                tail_parts = tail.split("/")
+                iid = int(tail_parts[0])
+                issue = self.extra_issues.get((proj, iid))
+                if issue is None and proj == "frontend/web-v1":
+                    issue = self.issues.get(iid)
+                if issue is None:
+                    return subprocess.CompletedProcess([], 1, "", "404 Not Found")
+                if tail.endswith("/notes") and method == "POST":
+                    self.next_note += 1
+                    note = {"id": self.next_note, "body": fields["body"], "system": False,
+                            "author": {"name": "彭嘉辉"}}
+                    issue["notes"].append(note)
+                    return ok(note)
+                if tail.endswith("/notes"):
+                    notes = sorted(issue["notes"], key=lambda n: n["id"], reverse="sort=desc" in path)
+                    return ok(notes[:1] if re.search(r"per_page=1(&|$)", path) else notes)
+                return ok({k: v for k, v in issue.items() if k != "notes"})
+            if "/issues" not in rest and method == "GET":
+                info = self.projects.get(rest)
+                if info is None:
+                    return subprocess.CompletedProcess([], 1, "", "404 Not Found")
+                return ok(info)
         raise AssertionError(f"unexpected {method} {path}")
 
     def lark(self, cmd, stdin, cwd=None):
@@ -175,11 +187,8 @@ class BridgeTest(unittest.TestCase):
         cfg = {"gitlab_host": "git.example.com", "default_project": "frontend/web-v1",
                "users": {ME: "pengjh"}, "bot_open_id": BOT}
         self.uploads: list[tuple] = []
-        self.tmp = tempfile.TemporaryDirectory()  # 观察队列写到这里，不碰本机 ~/.hwf/state
+        self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        proactive = FB.proactive_module()
-        self.addCleanup(setattr, proactive, "STATE_DIR", proactive.STATE_DIR)
-        proactive.STATE_DIR = Path(self.tmp.name)
         self.b = FB.Bridge(cfg, self.state, run=self.w, user_token="tok", now=lambda: 1_000_000.0,
                            upload=self.fake_upload, media_dir=Path(tempfile.mkdtemp(prefix="fb-media-")))
         self.b._secretary = FB.secretary_module().Secretary(self.b, home=Path(self.tmp.name))
@@ -485,84 +494,24 @@ class BridgeTest(unittest.TestCase):
                           mentions=[{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]))
         self.assertEqual([w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")], ["这次 @ 了"])
 
-    def observed(self) -> list:
-        path = Path(self.tmp.name) / "proactive-feishu-queue.jsonl"
-        return [json.loads(l) for l in path.read_text().splitlines()] if path.exists() else []
-
-    def test_observe_chat_messages_go_to_queue_silently(self) -> None:
-        self.b.observe_chats = {"oc_g": "研发小分队"}
-        self.b.handle(msg("om_1", "导出又挂了 [Image: img_1]", sender="ou_other", chat="oc_g", chat_type="group",
-                          thread="omt_9"))
-        self.b.handle(msg("om_2", "我顺口说一句", chat="oc_g", chat_type="group"))  # 本人没 @ 也只观察
-        self.b.handle(msg("om_3", "随便聊", sender="ou_other", chat="oc_x", chat_type="group"))  # 非观察群：丢掉
-        self.assertEqual(self.w.replies, [])
-        self.assertEqual(self.w.writes, [])
-        rows = self.observed()
-        self.assertEqual([r["mid"] for r in rows], ["om_1", "om_2"])
-        self.assertEqual(rows[0]["text"], "导出又挂了 [图片]")
-        self.assertEqual(len(rows[0]["images"]), 1)
-        self.assertTrue(Path(rows[0]["images"][0]).is_file())
-        self.assertTrue(rows[0]["images"][0].startswith(str(Path(self.tmp.name) / "proactive-media" / "om_1")))
-        self.assertEqual((rows[0]["chat_name"], rows[0]["thread"], rows[0]["sender"]), ("研发小分队", "omt_9", "ou_other"))
-
-    def test_observe_chat_stranger_mention_is_observed_and_gets_fixed_reply(self) -> None:
-        self.b.observe_chats = {"oc_g": "研发小分队"}
-        bot = [{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]
-        self.b.handle(msg("om_1", "@交付助手-试点 导出挂了帮看下", sender="ou_other", chat="oc_g",
-                          chat_type="group", mentions=bot))
-        self.b.handle(msg("om_2", "@交付助手-试点 需求：本人明确指令", chat="oc_g", chat_type="group", mentions=bot))
-        self.assertEqual([r["mid"] for r in self.observed()], ["om_1"])  # 本人 @ 是指令，不进观察
-        self.assertIn(self.w.replies[0]["text"], FB.DENY_TEXTS)
-        self.assertEqual([w[2]["title"] for w in self.w.writes if w[1].endswith("/issues")], ["本人明确指令"])
-
-    def test_observe_files_are_named_not_downloaded_and_broken_image_is_skipped(self) -> None:
-        self.b.observe_chats = {"oc_g": "研发小分队"}
-        self.w.broken_images.add("img_bad")
-        self.b.handle(msg("om_1", '日志在这 <file key="file_1" name="日志.zip"/> [Image: img_bad]', sender="ou_other",
-                          chat="oc_g", chat_type="group"))
-        row = self.observed()[0]
-        self.assertEqual(row["text"], "日志在这 [文件 日志.zip] [图片]")
-        self.assertEqual(row["images"], [])
-        self.assertEqual(self.w.downloads, [])  # 文件不下载；坏图下载失败不影响入队
-        self.assertEqual(self.w.replies, [])
-
-    def test_observe_quote_reply_carries_quoted_text(self) -> None:
-        self.b.observe_chats = {"oc_g": "研发小分队"}
-        self.w.messages["om_old"] = "导出 PDF 点了没反应 [Image: img_9]"
-        self.b.handle(msg("om_1", "我这也是", sender="ou_other", chat="oc_g", chat_type="group",
-                          root="om_old", reply_to="om_old"))
-        self.b.handle(msg("om_2", "话题里接着说", sender="ou_other", chat="oc_g", chat_type="group",
-                          root="om_old", reply_to="om_old", thread="omt_1"))
-        rows = self.observed()
-        self.assertEqual(rows[0]["quote"], "导出 PDF 点了没反应 [附件]")
-        self.assertEqual(rows[1]["quote"], "")  # 话题里不额外取
-        self.assertEqual(self.w.replies, [])
-
-    def test_observe_skips_linked_thread_and_marks_replied_message_handled(self) -> None:
-        self.b.observe_chats = {"oc_g": "研发小分队"}
-        bot = [{"key": "@_user_1", "id": "cli_abc", "name": "交付助手-试点"}]
-        self.b.handle(msg("om_bug", "头像没更新", sender="ou_other", chat="oc_g", chat_type="group"))
-        self.b.handle(msg("om_req", "@交付助手-试点 需求：处理这个问题", chat="oc_g", chat_type="group", mentions=bot,
-                          root="om_bug", reply_to="om_bug"))
-        tid = next(iter(self.state["thread_ids"]))
-        self.b.handle(msg("om_go", "同意", chat="oc_g", chat_type="group", root="om_bug", thread=tid))
-        self.b.handle(msg("om_other", "话题外另一件事", sender="ou_other", chat="oc_g", chat_type="group"))
-        rows = self.observed()
-        self.assertEqual([r.get("mid") for r in rows if "mid" in r], ["om_bug", "om_other"])  # 话题里跟 Agent 的对话不进观察
-        iid = self.state["threads"]["om_req"]["iid"]
-        self.assertEqual([r for r in rows if "handled" in r], [{"handled": "om_bug", "chat": "oc_g", "iid": iid}])
-
-    def test_catch_up_observes_group_history_but_skips_other_groups(self) -> None:
-        self.b.observe_chats = {"oc_g": "研发小分队"}
-        self.state["chats"] = {"oc_g": 1, "oc_x": 1}
-        self.state["group_chats"] = ["oc_g", "oc_x"]
-        item = lambda mid, chat: {"message_id": mid, "chat_id": chat, "content": "聊天", "create_time": "2026-11-08 17:00",
-                                  "sender": {"id": "ou_other", "name": "小王", "sender_type": "user"}}
-        self.w.history = {"oc_g": [item("om_1", "oc_g")], "oc_x": [item("om_2", "oc_x")]}
-        self.b.catch_up()
-        rows = self.observed()
-        self.assertEqual([(r["mid"], r["sender_name"]) for r in rows], [("om_1", "小王")])
-        self.assertEqual(self.w.replies, [])
+    def test_cross_project_bind_by_qualified_ref_and_url_and_archived_reject(self) -> None:
+        self.w.projects["backend/api"] = {"path_with_namespace": "backend/api", "archived": False}
+        self.w.projects["legacy/old"] = {"path_with_namespace": "legacy/old", "archived": True}
+        self.w.extra_issues[("backend/api", 99)] = {"iid": 99, "title": "跨项目接口", "state": "opened", "notes": []}
+        self.w.extra_issues[("backend/api", 100)] = {"iid": 100, "title": "跨项目链接", "state": "opened", "notes": []}
+        self.w.extra_issues[("legacy/old", 5)] = {"iid": 5, "title": "归档单", "state": "opened", "notes": []}
+        self.b.handle(msg("om_q1", "backend/api#99 帮忙看下"))
+        self.assertEqual(self.state["threads"]["om_q1"]["project"], "backend/api")
+        self.assertEqual(self.state["threads"]["om_q1"]["iid"], 99)
+        self.assertIn("backend/api#99", self.w.replies[-1]["text"])
+        self.b.handle(msg("om_q2", "https://git.example.com/backend/api/-/issues/100 也看看"))
+        self.assertEqual(self.state["threads"]["om_q2"]["project"], "backend/api")
+        self.assertEqual(self.state["threads"]["om_q2"]["iid"], 100)
+        self.b.handle(msg("om_q3", "legacy/old#5 看看"))
+        self.assertNotIn("om_q3", self.state["threads"])
+        self.assertIn("已归档或机器人没有权限", self.w.replies[-1]["text"])
+        self.assertEqual(self.b.handle(msg("om_g", "群里闲聊", sender="ou_other", chat="oc_g", chat_type="group")), None)
+        self.assertFalse((Path(self.tmp.name) / "proactive-feishu-queue.jsonl").exists())
 
     def test_other_people_mentioned_keep_their_name(self) -> None:
         self.b.handle(msg("om_1", "需求：让 @_user_2 看下", mentions=[{"key": "@_user_2", "id": "ou_x", "name": "小王"}]))

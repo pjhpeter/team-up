@@ -152,6 +152,16 @@ class InitProjectTest(unittest.TestCase):
         for url in ("git@h.com:a/b/c.git", "https://h.com/a/b/c.git", "ssh://git@h.com:2222/a/b/c.git"):
             self.assertEqual(INIT.parse_remote(url), ("h.com", "a/b/c"))
 
+    def test_dynamic_all_projects_mode_preserves_empty_projects_config(self) -> None:
+        self.inbox.write_text(json.dumps({"host": "git.example.com"}))
+        init = self.run_init(apply=True)
+        saved = json.loads(self.inbox.read_text())
+        self.assertNotIn("projects", saved)
+        self.assertTrue(any("全项目动态监听" in line for line in init.lines))
+        local = json.loads((self.tmp / "gitlab-inbox.local.json").read_text())
+        self.assertEqual(local["projects"]["group/demo"], str(self.repo))
+
+
 
 if __name__ == "__main__":
     unittest.main()

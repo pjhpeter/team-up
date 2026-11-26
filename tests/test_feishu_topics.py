@@ -163,7 +163,7 @@ class TopicTest(unittest.TestCase):
         self.bridge.handle(msg("om_foreign", "https://other.example/frontend/web-v1/-/issues/470", thread="omt_source"))
         self.bridge.handle(msg("om_foreign_project", "需求：https://git.example.com/other/project/-/issues/470", thread="omt_source"))
         self.assertFalse(self.world.writes)
-        self.assertIn("不属于", self.world.replies[-1]["text"])
+        self.assertIn("已归档或机器人没有权限", self.world.replies[-1]["text"])
 
     def test_duplicate_registration_keeps_result_watermark_and_source(self):
         request = self.register()

@@ -27,11 +27,11 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `herdr/droid-arch.json` | 架构师（droid）的模型与思考档；交互式 droid 只能用 `--settings` 文件指定 |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
-| `scripts/` | 收件箱（含对话模式自然语言开工识别、过期跟进单定期修剪与超长空闲调度者会话自动轮转）、飞书桥（含 14 天静默话题自动归档与发言自动恢复）、常驻轮询瞬时断网退避与去重（`poll_backoff.py`）、TypeSafe Jev 公共客户端（`jev_client.py`：概率决策、钥匙串读密与图片尺寸自动归一化）、Jev 规则库与遥测演进引擎（`jev_gates.py`：读取 `jev-gates.json`、记录滚动遥测 `state/jev-gates.jsonl`、校验红线并自动演进清单）、团队铁律语义预检（`semantic-lint.py`：进代码评审前按动态清单并行扫描红线与提示项）、周期复盘（`retrospect.py`：含可勾选待办复制与核心四问自检 HTML）、主动接活（`proactive.py`：Jev 概率初筛 + 大模型研判 + 可点选批量标注 HTML 报告）、找调度者、按角色领取与跨目录复用成员（`member-start.py`，同步回收同单各角色多余空闲副本窗格）、成员监听与静默屏幕排障（`member-wait.py`）、阶段中释放空闲成员（`member-release.py`，支持待上线与长时阻塞前 `--all-idle` 释放空闲成员及已退回命令行的本单空壳窗格）、测试账号分配与套餐标签筛选（`test-account.py`：支持 `free`/`paid`/`plus-trial`/`region:*` 标签筛选、`pool` 脱敏总览与 `tag` 状态标注）、测试浏览器脱敏自动登录（`test-browser.py`：支持独立 Chrome profile 与 `ego-browser` 空间脱敏注入）、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件并做空白废片/明文密码视觉拦截与回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部与进入等待态前未答用户留言核对、长记录自动归档 `STATE-history.md`、`brief-html` 一键生成 30 秒恢复现场与核心四问交互 HTML、按通知模式发评论、拦截敏感凭据外泄与长文未先写结论、拦截交卷评论缺失或折叠藏匿的逐条验收录屏对账表、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：核对未答用户留言、关成员、删本单与跨仓登记 worktree、发收尾回执、写 INDEX）、跨仓库清理过期临时目录与干净陈旧 worktree（`clean-tmp.py`）、新项目接入等脚本 |
+| `scripts/` | 跨项目发现与仓库自动克隆公共模块（`gitlab_projects.py`：全量非归档项目发现、缓存、自动 clone 与路径持久化）、收件箱（支持跨全部非归档项目监听本人与机器人的指派与 @、对话模式自然语言开工识别、过期跟进单定期修剪与超长空闲调度者会话自动轮转）、飞书桥（含跨项目议题关联、14 天静默话题自动归档与发言自动恢复）、常驻轮询瞬时断网退避与去重（`poll_backoff.py`）、TypeSafe Jev 公共客户端（`jev_client.py`：概率决策、钥匙串读密与图片尺寸自动归一化）、Jev 规则库与遥测演进引擎（`jev_gates.py`：读取 `jev-gates.json`、记录滚动遥测 `state/jev-gates.jsonl`、校验红线并自动演进清单）、团队铁律语义预检（`semantic-lint.py`：进代码评审前按动态清单并行扫描红线与提示项）、周期复盘（`retrospect.py`：含可勾选待办复制与核心四问自检 HTML）、主动接活（`proactive.py`：仅面向 GitLab 全量非归档项目，Jev 概率初筛 + 大模型研判 + `auto` 只读分析回帖 + 可点选批量标注 HTML 报告）、找调度者、按角色领取与跨目录复用成员（`member-start.py`，同步回收同单各角色多余空闲副本窗格）、成员监听与静默屏幕排障（`member-wait.py`）、阶段中释放空闲成员（`member-release.py`，支持待上线与长时阻塞前 `--all-idle` 释放空闲成员及已退回命令行的本单空壳窗格）、测试账号分配与套餐标签筛选（`test-account.py`：支持 `free`/`paid`/`plus-trial`/`region:*` 标签筛选、`pool` 脱敏总览与 `tag` 状态标注）、测试浏览器脱敏自动登录（`test-browser.py`：支持独立 Chrome profile 与 `ego-browser` 空间脱敏注入）、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件并做空白废片/明文密码视觉拦截与回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部与进入等待态前未答用户留言核对、长记录自动归档 `STATE-history.md`、`brief-html` 一键生成 30 秒恢复现场与核心四问交互 HTML、按通知模式发评论、拦截敏感凭据外泄与长文未先写结论、拦截交卷评论缺失或折叠藏匿的逐条验收录屏对账表、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：核对未答用户留言、关成员、删本单与跨仓登记 worktree、发收尾回执、写 INDEX）、跨仓库清理过期临时目录与干净陈旧 worktree（`clean-tmp.py`）、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `omp-extensions/` | omp 扩展：记录守卫拦下调度者手改 INDEX、直接用 glab 发评论、裸调 `herdr agent wait` 及超 2500 字的超长派活命令；监听守卫拦下未挂 `member-wait.py` 的本团队活跃成员（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
-| `gitlab-inbox.config.json` | 收件箱共用配置：盯哪些 GitLab 项目、只认谁的操作、开关标签、轮询间隔；`proactive` 段是主动接活配置，`retrospect` 段是周二/周五中午周期复盘配置，`typesafe` 段是 TypeSafe Jev（`jev-1.14.0`）模型与钥匙串服务名配置（未配密钥时各关卡自动回退原确定性规则与大模型流程） |
+| `gitlab-inbox.config.json` | 收件箱共用配置：省略或清空 `projects` 时动态覆盖机器人可访问的全部非归档项目（也可显式指定列表），配置白名单、开关标签、轮询间隔；`proactive` 段是 GitLab 主动接活配置，`retrospect` 段是周二/周五中午周期复盘配置，`typesafe` 段是 TypeSafe Jev（`jev-1.14.0`）模型与钥匙串服务名配置（未配密钥时各关卡自动回退原确定性规则与大模型流程） |
 | `jev-gates.json` | Jev 五道决策关卡的阈值与关卡 4/5 检查清单（按文件 mtime 自动热加载，免重启生效；安全与授权红线标 `protected: true` 锁死，其余常规项由周期复盘在数据达标并通过单测后自动新增、调优或淘汰） |
 | `proactive-rules.md` | 主动接活的规则：什么情况 → 做什么，每条规则单独一档 |
 
@@ -85,19 +85,18 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 每人接一套：用 lark-cli 建好机器人应用、存一个本人 GitLab 令牌、写本机配置 `~/.hwf/feishu-bridge.local.json`，然后在一个 Herdr 窗格里常驻 `python3 ~/.hwf/scripts/feishu-bridge.py`。完整步骤、用法和排查见 Wiki [飞书接入](https://git.bootingai.net/ai-hub/skills/workflow/team-up/-/wikis/飞书接入)。
 
-## 主动接活（observe 档）
+## 主动接活（仅 GitLab，开启 `auto` 只读真接活）
 
-没人叫 Agent 时，收件箱每 10 分钟看一遍 GitLab 新开的 issue（创建满 2 小时仍没人指派的）和 main / release-* 失败的流水线，再加上飞书「观察群」里的对话，先经 Jev 概率初筛过滤明显闲聊与已延续话题，命中候选再按 `proactive-rules.md` 交大模型逐条判断 Agent 本来该不该主动接活。observe 档**只记录、不动手**：对 GitLab 只读，不在飞书说话，不启动调度者。
+飞书群主动观察已禁用；GitLab 主动接活开启 `auto` 档。收件箱每 10 分钟扫描机器人可访问的**全部非归档 GitLab 项目**，针对「指派给本人/机器人或 `@` 了本人/机器人且创建满 2 小时仍未处理的 issue」以及「由本人或机器人触发/合并的 `main` / `release-*` 失败流水线」，先经 Jev 概率初筛，命中候选再按 `proactive-rules.md` 交大模型逐条研判。命中 `auto` 规则后，按需自动克隆缺失仓库，调用只读工具（`omp --tools read,grep,find,ls`）完成排查并把中文结论直接写回对应 GitLab issue / MR 评论；**改代码、建分支仍严格等待白名单用户发 `/go`**。
 
 | 要做的事 | 怎么做 |
 | --- | --- |
-| 看观察结果 | `python3 ~/.hwf/scripts/proactive.py report`（生成交互报告并打开；右侧可直接点选「判对了 / 判错了 / 标漏接」并一键复制批量终端命令或发给 Agent，也保留单条命令） |
+| 看执行与判断报告 | `python3 ~/.hwf/scripts/proactive.py report`（生成交互报告并打开；右侧可直接点选「判对了 / 判错了 / 标漏接」并一键复制批量终端命令或发给 Agent，也保留单条命令） |
 | 标注判得对不对 | `proactive.py mark O-0031 ok`、`mark O-0032 wrong 理由`（理由写「严重」算严重误接）、`mark O-0040 should R2 理由`（漏接） |
 | 改了规则验证一下 | `proactive.py replay R2 --days 14`：拿旧事件按新规则重判，对照之前的标注，不改原记录 |
-| 加观察群 | 机器人要有飞书权限 `im:message.group_msg`；在 `feishu-bridge.local.json` 加 `"observe_chats": {"oc_xxx": "群名"}`，重启飞书桥 |
-| 放开一条规则 | 成绩卡显示「可以考虑切 auto」后，由人把该规则的档位改掉（auto 档还没实现，现在按 observe 处理） |
+| 调整规则档位 | 编辑 `proactive-rules.md` 中每条规则的 `auto` / `observe` / `off`，下一轮自动生效 |
 
-平时不推送；每天 18 点后当天有新的「本来会接」时发一条 ntfy，当天判不了的事件超过 5 个时也发一条。记录都在本机 `state/proactive-*`。观察群里的图片会下载到本机、判断时一起给模型看（每段对话最多 4 张；文件和视频只记名字不下载），聊天原文和图片 7 天后自动删除；图片每小时检查一次，总量超过 300MB 就从最旧的开始删。搬到 GitLab 的附件上传完立刻删，飞书桥启动时还会清空中转目录。
+平时不额外刷屏；每天 18 点后当天有新的命中记录时发一条 ntfy 汇总，当天判不了的事件超过 5 个时也发一条。记录都在本机 `state/proactive-*`。搬到 GitLab 的飞书附件上传完立刻删，飞书桥启动时还会清空中转目录。
 
 ## 周期复盘（每周二、周五 12:00）
 

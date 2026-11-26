@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -104,6 +105,7 @@ def _load(name: str, file: str) -> Any:
 
 
 _FS: Any = None
+_GP = _load("gitlab_projects", "gitlab_projects.py")
 _INTENT = _load("hwf_task_intent", "task_intent.py")
 _JC = _load("jev_client", "jev_client.py")
 _JG = _load("jev_gates", "jev_gates.py")
@@ -122,8 +124,8 @@ def _ts(value: Any) -> float:
 
 
 def canon(url: str) -> str:
-    """GitLab 同一张 issue 有 issues、work_items 两种链接（收件箱记后者、桥记前者），统一成 issues 才不会当成两个需求。"""
-    return url.replace("/-/work_items/", "/-/issues/")
+    """GitLab 同一张 issue 有 issues、work_items 两种链接，统一成 issues 才不会当成两个需求。"""
+    return _GP.canon_issue_url(url)
 
 
 def find_scheduler() -> Any:
@@ -141,6 +143,7 @@ class Secretary:
         self.state.setdefault("msgs", {})     # 私聊里的转达消息 id → issue URL（快速回复用）
         self.state.setdefault("held", {})     # issue URL → 飞书没发出去、下一轮重发的 Agent 发言
         self.state.setdefault("recent", [])   # 最近转达的摘要，回答提问时当材料
+        self.state.setdefault("announced", {})  # 已推送到飞书的新登记提醒：canon URL → event_key
         self.merge_link_forms()
         cfg = dict(DEFAULT_MODEL)
         cfg.update(bridge.cfg.get("secretary") or {})
@@ -150,6 +153,17 @@ class Secretary:
             bridge_cfg.get("typesafe") if "typesafe" in bridge_cfg else None
         )
         self.intent_error: str | None = None
+
+    def ref(self, project: str, iid: int) -> str:
+        return _GP.format_issue_ref(project, iid, getattr(self.bridge, "project", ""))
+
+    def _project_allowed(self, project: str) -> bool:
+        if not project:
+            return False
+        checker = getattr(self.bridge, "is_project_allowed", None)
+        if callable(checker):
+            return bool(checker(project))
+        return project == getattr(self.bridge, "project", "")
 
     def merge_link_forms(self) -> None:
         """旧状态里同一需求可能按两种链接各记了一份：合成一份，攒着的发言按评论 id 去重。"""
@@ -197,29 +211,34 @@ class Secretary:
 
     # ---------- 看哪些 issue ----------
     def known_tasks(self) -> dict[str, dict[str, Any]]:
-        """目标只取本项目登记，不能因为其他项目恰好有同号任务就转过去。"""
-        project = getattr(self.bridge, "project", "")
-        if not project:
-            return {}
-        return {canon(url): issue for url, issue in {**self.watched(), **self.state["issues"]}.items()
-                if issue.get("project") == project
-                and canon(url) == canon(self.bridge.issue_url(project, issue["iid"]))}
+        """返回允许访问的未归档项目下的全部已登记任务（跨项目按规范化 URL 去重）。"""
+        tasks: dict[str, dict[str, Any]] = {}
+        for url, issue in {**self.watched(), **self.state["issues"]}.items():
+            project = str(issue.get("project") or "")
+            iid = issue.get("iid")
+            if not project or not isinstance(iid, int) or not self._project_allowed(project):
+                continue
+            canonical = canon(url)
+            if canonical == canon(self.bridge.issue_url(project, iid)):
+                tasks[canonical] = issue
+        return tasks
 
     def single_task_url(self, text: str) -> Optional[str]:
-        """只解析单一当前项目链接；引用作者和任务存在性由调用方另行验证。"""
+        """解析单一可访问且未归档项目的 issue 链接；引用作者和任务存在性由调用方另行验证。"""
         links = re.findall(r"https?://[^\s<>()\[\]\"，。；！？]+", text)
         task_links = {canon(url.split("#", 1)[0].split("?", 1)[0]).rstrip(".,;")
                       for url in links if "/-/issues/" in url or "/-/work_items/" in url}
         if len(task_links) != 1:
             return None
         url = next(iter(task_links))
-        number = url.rsplit("/", 1)[-1]
-        if not re.fullmatch(r"[1-9][0-9]*", number):
+        try:
+            project, iid = _GP.parse_issue_url(self.bridge.host, url)
+        except ValueError:
             return None
-        if url != canon(self.bridge.issue_url(self.bridge.project, int(number))):
+        if not self._project_allowed(project):
             return None
         # 回答里还提到另一任务（即使没有链接）也不能偷偷选第一张。
-        if any(m.group(1) != number for m in BARE_ISSUE.finditer(text)):
+        if any(m.group(1) != str(iid) for m in BARE_ISSUE.finditer(text)):
             return None
         return url
 
@@ -238,16 +257,40 @@ class Secretary:
         except (OSError, ValueError):
             return {}
 
+    def _inbox_state(self) -> dict[str, Any]:
+        try:
+            return json.loads((self.home / "state" / "gitlab-inbox.json").read_text())
+        except (OSError, ValueError):
+            return {}
+
     def watched(self) -> dict[str, dict[str, Any]]:
         found: dict[str, dict[str, Any]] = {}
         repos = self.repos()
-        try:
-            origins = json.loads((self.home / "state" / "gitlab-inbox.json").read_text()).get("origins", {})
-        except (OSError, ValueError):
-            origins = {}
+        inbox = self._inbox_state()
+        origins = inbox.get("origins") or {}
         for url, o in origins.items():
-            found[canon(url)] = {"project": o["project"], "iid": int(o["iid"]), "repo": o.get("repo") or repos.get(o["project"], ""),
-                                 "notify": o.get("notify", ""), "initiator": o.get("initiator", "")}
+            found[canon(url)] = {
+                "project": o["project"], "iid": int(o["iid"]), "repo": o.get("repo") or repos.get(o["project"], ""),
+                "notify": o.get("notify", ""), "initiator": o.get("initiator", ""), "standby": False,
+            }
+        watched_issues = inbox.get("watched_issues") or {}
+        for url, item in watched_issues.items():
+            if not isinstance(item, Mapping):
+                continue
+            cu = canon(url)
+            if cu in found:
+                continue
+            project = str(item.get("project") or "")
+            iid = item.get("iid")
+            if not project or not isinstance(iid, int):
+                continue
+            found[cu] = {
+                "project": project, "iid": iid, "repo": repos.get(project, ""),
+                "title": str(item.get("title") or ""),
+                "standby": item.get("status") == "standby",
+                "watch_kind": str(item.get("kind") or ""),
+                "watch_actor": str(item.get("actor") or ""),
+            }
         for t in self.bridge.state.get("threads", {}).values():
             if t.get("closed"):
                 continue
@@ -255,11 +298,60 @@ class Secretary:
             found.setdefault(url, {"project": t["project"], "iid": int(t["iid"]), "repo": repos.get(t["project"], "")})
         return found
 
+    def announce_watched_issues(self) -> None:
+        """向私聊推送收件箱新登记的跨项目事项：指派/提及本人先提醒等你发话，指派/提及机器人同步告知已自动启动只读分析。"""
+        if not self.chat:
+            return
+        watched_issues = self._inbox_state().get("watched_issues") or {}
+        announced: dict[str, str] = self.state.setdefault("announced", {})
+        for raw_url, item in watched_issues.items():
+            if not isinstance(item, Mapping):
+                continue
+            url = canon(raw_url)
+            event_key = str(item.get("event_key") or "")
+            if not event_key or announced.get(url) == event_key:
+                continue
+            project = str(item.get("project") or "")
+            iid = item.get("iid")
+            if not project or not isinstance(iid, int):
+                continue
+            ref = self.ref(project, iid)
+            title = str(item.get("title") or "")
+            actor = str(item.get("actor") or "")
+            kind = str(item.get("kind") or "")
+            link = str(item.get("note_url") or url)
+            excerpt = str(item.get("excerpt") or "").strip()
+            excerpt_line = f"\n> {excerpt[:160]}" if excerpt else ""
+            if kind in ("assigned_user", "mentioned_user"):
+                reason = f"@{actor} 指派给了你" if kind == "assigned_user" else f"@{actor} 提及了你"
+                text = (
+                    f"📌 **新登记待你处理：[{ref}]({link}) {title}**\n"
+                    f"来源：{reason}{excerpt_line}\n"
+                    "暂未拉起 Agent。直接回复本条消息即可让我先做只读分析，或回复 `/go` 开始改代码。"
+                )
+            else:
+                reason = f"@{actor} 指派给了机器人" if kind == "assigned_agent" else f"@{actor} 提及了机器人"
+                text = (
+                    f"🤖 **已自动接手只读分析：[{ref}]({link}) {title}**\n"
+                    f"来源：{reason}{excerpt_line}\n"
+                    "已自动拉起只读分析（改代码仍等你发 `/go`）；回复本条消息可直接跟进。"
+                )
+            mid = self.say(text, f"sec-watch-{hashlib.sha256(f'{url}:{event_key}'.encode()).hexdigest()[:16]}")
+            announced[url] = event_key
+            for old in list(announced)[:-300]:
+                del announced[old]
+            if mid:
+                msgs = self.state["msgs"]
+                msgs[mid] = url
+                for old in list(msgs)[:-MSG_MAP_CAP]:
+                    del msgs[old]
+
     # ---------- 转达 ----------
     def poll(self, forward: bool = True) -> None:
         """需要用户处理的 Agent 发言马上转到私聊；免打扰下过程存档只留 GitLab，详尽模式下全部转达。"""
         if not self.chat:
             return
+        self.announce_watched_issues()
         issues, held = self.state["issues"], self.state["held"]
         watched = self.watched()
         for url in [u for u in issues if u not in watched]:
@@ -275,7 +367,8 @@ class Secretary:
             notes = self.notes_of(w)
             if known is None:
                 issue = self.bridge.api(f"projects/{pid}/issues/{w['iid']}")
-                issues[url] = {**w, "title": issue.get("title", ""), "last_note": max([n["id"] for n in notes] or [0]),
+                issues[url] = {**w, "title": issue.get("title", "") or w.get("title", ""),
+                               "last_note": max([n["id"] for n in notes] or [0]),
                                "last_agent_at": self.bridge.now()}
                 continue  # 第一次看到只记水位，不回放旧评论
             known.update(w)
@@ -364,7 +457,8 @@ class Secretary:
     def held_entry(self, url: str, issue: Mapping[str, Any], n: Mapping[str, Any]) -> dict[str, Any]:
         clean_body, _ = strip_kind_tag(n.get("body") or "")
         body = FOLDED.sub("", clean_body).strip()
-        self.state["recent"] = (self.state["recent"] + [f"#{issue['iid']} {issue.get('title', '')}：{body[:200]}"])[-RECENT_CAP:]
+        ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
+        self.state["recent"] = (self.state["recent"] + [f"{ref} {issue.get('title', '')}：{body[:200]}"])[-RECENT_CAP:]
         return {"id": n["id"], "body": body}
 
     def should_forward(self, n: Mapping[str, Any], include_users: bool = False, verbose: bool = False) -> bool:
@@ -442,8 +536,11 @@ class Secretary:
         body = entry["body"]
         if len(body) > SUMMARY_CAP:
             body = body[:SUMMARY_CAP].rstrip() + "…"
-        head = f"**[#{issue['iid']}]({link}) {issue.get('title', '')}**"
-        mid = self.say(f"{head}\n{body}", f"sec-{issue['iid']}-{entry['id']}")
+        ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
+        head = f"**[{ref}]({link}) {issue.get('title', '')}**"
+        proj_tag = hashlib.sha256(str(issue.get("project") or "").encode()).hexdigest()[:6]
+        key = f"sec-{issue['iid']}-{entry['id']}" if issue.get("project") == getattr(self.bridge, "project", "") else f"sec-{proj_tag}-{issue['iid']}-{entry['id']}"
+        mid = self.say(f"{head}\n{body}", key)
         if mid:
             msgs = self.state["msgs"]
             msgs[mid] = url
@@ -497,17 +594,24 @@ class Secretary:
         return text
     def overview(self) -> list[str]:
         lines = []
-        for url, issue in sorted(self.state["issues"].items(), key=lambda kv: kv[1]["iid"]):
+        for url, issue in sorted(self.state["issues"].items(), key=lambda kv: (kv[1].get("project", ""), kv[1]["iid"])):
+            ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
             try:
                 lines.append(self.task_line(url, issue))
             except Exception as e:  # 一个需求查不到不影响其他
-                lines.append(f"- [#{issue['iid']}]({url}) {issue.get('title', '')}：这次没查到（{str(e)[:80]}）")
+                lines.append(f"- [{ref}]({url}) {issue.get('title', '')}：这次没查到（{str(e)[:80]}）")
         return lines
 
     def task_line(self, url: str, issue: Mapping[str, Any]) -> str:
         pid = quote(issue["project"], safe="")
         info = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}")
         labels = [l for l in info.get("labels", []) if l.startswith("状态:")]
+        ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
+        if issue.get("standby"):
+            parts = ["、".join(labels) or ("已关闭" if info.get("state") == "closed" else "待你发话启动")]
+            if info.get("state") == "opened":
+                parts.append("暂未拉起 Agent（回复可先只读分析，或发 /go 开工）")
+            return f"- [{ref}]({url}) {issue.get('title', '')}：{'；'.join(parts)}"
         parts = ["、".join(labels) or ("已关闭" if info.get("state") == "closed" else "没有进度标签")]
         alerts = []
         if WAITING_LABEL in labels:
@@ -533,7 +637,7 @@ class Secretary:
             last = max(float(issue.get("last_agent_at") or 0), self.state_mtime(issue.get("repo") or "", owner["task"]))
             if info.get("state") == "opened" and WAITING_LABEL not in labels and self.bridge.now() - last > IDLE_ALERT_S:
                 alerts.append(f"超过 {IDLE_ALERT_S // 3600} 小时没有动静")
-        line = f"- [#{issue['iid']}]({url}) {issue.get('title', '')}：{'；'.join(parts)}"
+        line = f"- [{ref}]({url}) {issue.get('title', '')}：{'；'.join(parts)}"
         return line + ("\n  ⚠️ " + "；".join(alerts) if alerts else "")
 
     def user_spoke_last(self, issue: Mapping[str, Any]) -> bool:
@@ -636,39 +740,58 @@ class Secretary:
         mid = msg["message_id"]
         thread = bool(msg.get("thread_id"))
         issue = self.state["issues"].get(url)
-        project = issue["project"] if issue else self.bridge.project
-        iid = issue["iid"] if issue else int(url.rsplit("/", 1)[-1])
+        if issue:
+            project, iid = str(issue["project"]), int(issue["iid"])
+        else:
+            try:
+                project, iid = _GP.parse_issue_url(self.bridge.host, url)
+            except ValueError:
+                project, iid = self.bridge.project, int(url.rsplit("/", 1)[-1])
         body = self.relay_body(msg, text, mode=mode, project=project)
         if not body:
             self.bridge.reply(mid, "这条没有内容，没转。", f"sec-empty-{mid}", in_thread=thread)
             return
         self.bridge.note_as_user(project, iid, f"@{self.bridge.agent} {body}")
+        ref = self.ref(project, iid)
         title = f" {issue.get('title', '')}" if issue else ""
-        self.bridge.reply(mid, f"已转给 [#{iid}]({url}){title}。{ack}", f"sec-relayed-{mid}", in_thread=thread)
+        self.bridge.reply(mid, f"已转给 [{ref}]({url}){title}。{ack}", f"sec-relayed-{mid}", in_thread=thread)
 
     def linkify(self, text: str) -> str:
-        """把正在跟进的需求的「#编号」换成 issue 链接；模型回答时常把总览里的链接丢掉。"""
-        urls = {str(i["iid"]): u for u, i in self.state["issues"].items()}
+        """把唯一匹配正在跟进需求的「#编号」换成 issue 链接；跨项目同号时不强行替换。"""
+        by_iid: dict[str, list[str]] = {}
+        for u, i in self.state["issues"].items():
+            by_iid.setdefault(str(i["iid"]), []).append(u)
+        urls = {k: v[0] for k, v in by_iid.items() if len(v) == 1}
         return BARE_ISSUE.sub(lambda m: f"[#{m.group(1)}]({urls[m.group(1)]})" if m.group(1) in urls else m.group(0), text)
 
     def recent_notes(self, *, candidates: list[dict] | None = None) -> list[str]:
         """只读调用方范围内的最近评论，避免群聊分类材料混入其他会话任务。"""
         out = []
         issues = self.state["issues"].values() if candidates is None else candidates
-        for issue in sorted(issues, key=lambda item: item["iid"]):
+        for issue in sorted(issues, key=lambda item: (item.get("project", ""), item["iid"])):
             pid = quote(issue["project"], safe="")
             try:
                 notes = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}/notes?sort=desc&order_by=created_at&per_page=10")
             except Exception:
                 continue
             kept = [n for n in notes if not n.get("system") and not RECEIPT.match(strip_kind_tag(n.get("body") or "")[0])][:NOTES_PER_ISSUE]
+            ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
             for n in reversed(kept):
                 author = (n.get("author") or {}).get("username") or (n.get("author") or {}).get("name") or ""
                 who = "Agent" if author == self.bridge.agent else "用户"
                 clean_body, _ = strip_kind_tag(n.get("body") or "")
                 body = FOLDED.sub("", clean_body).strip()[:NOTE_CAP]
-                out.append(f"- #{issue['iid']} {who}（{str(n.get('created_at') or '')[:16]}）：{body}")
+                out.append(f"- {ref} {who}（{str(n.get('created_at') or '')[:16]}）：{body}")
         return out
+
+    @staticmethod
+    def _ambiguous_iids(candidates: list[dict]) -> set[int]:
+        projects_by_iid: dict[int, set[str]] = {}
+        for item in candidates:
+            iid = item.get("iid")
+            if type(iid) is int and iid > 0:
+                projects_by_iid.setdefault(iid, set()).add(str(item.get("project") or ""))
+        return {iid for iid, projs in projects_by_iid.items() if len(projs) > 1}
 
     def classify_intent(self, text: str, context: str = "", *, candidates: list[dict] | None = None,
                         linked_issue: int | None = None, recent: list[dict] | None = None) -> dict | None:
@@ -677,10 +800,12 @@ class Secretary:
         # 显式空候选是调用方限制范围，不能回退到秘书的全量登记。
         candidates = list(self.known_tasks().values()) if candidates is None else candidates
         recent = [] if recent is None else recent
+        ambiguous_issues = self._ambiguous_iids(candidates)
         identities = [{key: item[key] for key in ("iid", "title", "project") if key in item}
                       for item in candidates]
         fast = self._fast_relay_with_jev(text, context, candidates=candidates, identities=identities,
-                                         linked_issue=linked_issue, recent=recent)
+                                         linked_issue=linked_issue, recent=recent,
+                                         ambiguous_issues=ambiguous_issues)
         if fast is not None:
             return fast
         material = json.dumps({"current_message": text, "context": context, "candidates": identities,
@@ -694,7 +819,8 @@ class Secretary:
         except ValueError:
             self.intent_error = "invalid_json"
             return None
-        result = _INTENT.validate_intent(intent, text, candidates, linked_issue, recent)
+        result = _INTENT.validate_intent(intent, text, candidates, linked_issue, recent,
+                                         ambiguous_issues=ambiguous_issues)
         self.intent_error = "invalid_intent" if result is None else None
         return result
 
@@ -707,11 +833,15 @@ class Secretary:
         identities: list[dict],
         linked_issue: int | None,
         recent: list[dict],
+        ambiguous_issues: set[int] | None = None,
     ) -> dict | None:
         if self.jev is None or not text.strip():
             return None
         # 多轮澄清拼接或分段批量续发涉及历史拆句，交由 omp 完整处理。
         if "同一次待澄清请求的用户原话：\n" in text or "本次转告的逐项状态" in context or "引用的任务无法核实" in context:
+            return None
+        # 存在跨项目同名编号冲突时回退重模型/澄清，防止快转错投。
+        if ambiguous_issues:
             return None
 
         target_options: dict[str, str] = {}

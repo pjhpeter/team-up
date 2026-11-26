@@ -59,6 +59,7 @@ import uuid
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
+import gitlab_projects as GP
 import poll_backoff as PB
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
@@ -95,13 +96,14 @@ NAME_ATTR_RE = re.compile(r"\bname=\"([^\"]*)\"")
 FOLDER_TAG_RE = re.compile(r"</?folder\b[^>]*>")
 PENDING_IMAGE_S = 600  # 单独发的图片/文件在这段时间内会自动带进下一条「需求：」/「#编号」
 IMAGE_HINT = "收到附件。10 分钟内接着说要做什么，或发「#编号」关联已有 issue，我会把附件一起带上。"
-# 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉
-BIND_RE = re.compile(r"^\s*(?:#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*")
+# 链接尾巴只吃 URL 里的 ASCII 字符，免得把紧跟的「，处理这个…」吞掉；同时支持 #123、group/repo#123 与完整 issue 链接
+BIND_RE = re.compile(
+    r"^\s*(?:#(\d+)|([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)#(\d+)|https?://\S+?/-/(?:issues|work_items)/(\d+)(?:[/?#][!-~]*)?)[\s,，。:：;；]*"
+)
+QUALIFIED_ISSUE_RE = re.compile(r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)#([1-9][0-9]*)(?![0-9])")
 # 中文可紧贴任务编号；数字只用于查候选，不代表已获转告授权。
 ISSUE_NUMBER_RE = re.compile(r"(?<![0-9A-Za-z_./])[1-9][0-9]*(?![0-9])")
 FAILED_TEXT = "这条没处理成功，请重发。"
-OBSERVE_IMAGES_PER_MESSAGE = 4  # 观察群一条消息最多下载几张图给模型看
-OBSERVE_DOWNLOAD_TIMEOUT_S = 60  # 观察是顺带做的，单张图下载超时比搬到 GitLab 短，免得拖慢 @ 指令的处理
 # 白名单外的人找机器人时随机回一句（2026-11-09 用户指定前两句，其余为配套编写）
 DENY_TEXTS = (
     "给钱我主人，我帮你干活",
@@ -237,10 +239,11 @@ class Bridge:
         self.project: str = config["default_project"]
         self.label: str = config.get("label", "herdr-auto")
         self.users: dict[str, str] = dict(config["users"])
-        # 主动接活的观察群：chat_id → 群名（备注）。这些群里的消息写进本机观察队列，由收件箱里的 proactive 判断。
-        self.observe_chats: dict[str, str] = dict(config.get("observe_chats") or {})
         self.user_token = user_token
         self.agent: str = config.get("agent_account") or self.api("user")["username"]
+        self.project_cache = GP.ProjectActivityCache()
+        # 默认项目直接预标为活跃，避免单仓日常轮询多发 GET projects/<pid>。
+        self.project_cache.mark(self.project, True)
         state.setdefault("threads", {})      # 话题根消息 id → {project, iid, chat_id, last_note, closed}
         state.setdefault("seen", [])         # 已处理的飞书消息 id
         state.setdefault("posted_notes", []) # 桥自己发到 GitLab 的评论 id（不再搬回飞书）
@@ -267,6 +270,17 @@ class Bridge:
         if self._secretary is None:
             self._secretary = secretary_module().Secretary(self)
         return self._secretary
+
+    def is_project_allowed(self, project: str) -> bool:
+        """校验 GitLab 项目是否机器人有权限且未归档；默认项目免查。"""
+        if not project:
+            return False
+        if project == self.project:
+            return True
+        return self.project_cache.is_active(project, self.api)
+
+    def issue_ref(self, project: str, iid: int) -> str:
+        return GP.format_issue_ref(project, iid, self.project)
 
     # ---------- 外部命令 ----------
     def sh(self, cmd: list[str], stdin: Optional[str] = None, env: Optional[dict] = None,
@@ -388,11 +402,13 @@ class Bridge:
                     own_bot = sender.get("id") == self._bot_app_id
             target = self.secretary.single_task_url(content) if own_bot else None
             if target:
-                iid = topics_module().issue_id(self.cfg, target)
-                issue = self.api(f"projects/{quote(self.project, safe='')}/issues/{iid}")
+                project, iid = topics_module().parse_issue_url(self.cfg, target)
+                if not self.is_project_allowed(project):
+                    raise BridgeError("quoted project archived or inaccessible")
+                issue = self.api(f"projects/{quote(project, safe='')}/issues/{iid}")
                 if not issue or issue.get("iid") != iid:
                     raise BridgeError("quoted task unavailable")
-        except BridgeError as e:
+        except (BridgeError, topics_module().TopicError) as e:
             log(f"recover quoted task {quoted} failed: {e}")
             target = None
         if target:
@@ -538,11 +554,6 @@ class Bridge:
             return  # 机器人（含自己）发的不处理，避免来回刷屏
         mentioned = any(map(self.is_bot_mention, msg.get("mentions") or []))
         user = self.users.get(msg.get("sender_id", ""))
-        if msg.get("chat_type") == "group" and chat in self.observe_chats and not (mentioned and user) \
-                and not self.in_linked_thread(msg):
-            # 观察群：白名单的人 @ 机器人是明确指令，照常处理；其余消息（含同事 @ 机器人）交给主动接活去判断。
-            # 已关联 issue 的话题里是在跟 Agent 说话，那件事已经有人管了，不进观察
-            self.observe(msg)
         if msg.get("chat_type") == "group" and not mentioned:
             # 应用开了「获取群组中所有消息」权限后，群里每句话都会推过来；没 @ 机器人的不是对它说的，
             # 一律不回（否则会给同事回「没有使用权限」或用法说明，在群里刷屏）。2026-11-08
@@ -564,7 +575,9 @@ class Bridge:
         target = self.secretary.target(msg) if private else None
         if target:
             try:
-                topics_module().issue_id(self.cfg, target)
+                t_proj, _ = topics_module().parse_issue_url(self.cfg, target)
+                if not self.is_project_allowed(t_proj):
+                    target = None
             except topics_module().TopicError:
                 target = None
         if text.startswith("/") and (linked or target):
@@ -582,27 +595,41 @@ class Bridge:
             # 补充编号和多目标句子都须完整理解，不能静默只绑定第一个。
             self.natural_entry(msg, text, user, linked=linked, target=target)
             return
+        bind_project: Optional[str] = None
+        bind_iid: Optional[int] = None
         if m:
-            iid = int(m.group(1) or m.group(2))
-            if m.group(2):
+            if m.group(4):
                 url = re.match(r"https?://[^\s,，。;；]+", candidate.strip()).group(0)
                 try:
-                    iid = topics_module().issue_id(self.cfg, url)
+                    bind_project, bind_iid = topics_module().parse_issue_url(self.cfg, url)
                 except topics_module().TopicError:
-                    self.reply(mid, "该链接不属于当前配置的项目；本话题绑定不变，这条消息未转发。", f"wrong-project-{mid}")
+                    self.reply(mid, "该链接不是当前 GitLab 实例的合法 issue 链接；本话题绑定不变，这条消息未转发。", f"wrong-project-{mid}")
                     return
-            if linked and iid != self.state["threads"][linked]["iid"]:
-                topics_module().redirect(self, linked, msg, iid)
-                return
+                if not self.is_project_allowed(bind_project):
+                    self.reply(mid, f"项目 {bind_project} 已归档或机器人没有权限；本话题绑定不变，这条消息未转发。", f"wrong-project-{mid}")
+                    return
+            elif m.group(2) and m.group(3):
+                bind_project, bind_iid = m.group(2), int(m.group(3))
+                if not self.is_project_allowed(bind_project):
+                    self.reply(mid, f"项目 {bind_project} 已归档或机器人没有权限；本话题绑定不变，这条消息未转发。", f"wrong-project-{mid}")
+                    return
+            else:
+                bind_iid = int(m.group(1))
+            if linked:
+                cur_t = self.state["threads"][linked]
+                eff_proj = bind_project or cur_t["project"]
+                if (eff_proj, bind_iid) != (cur_t["project"], cur_t["iid"]):
+                    topics_module().redirect(self, linked, msg, bind_iid, project=bind_project or self.project)
+                    return
         # 引用回复（主对话里的「回复 xxx」）不算话题，按普通消息处理；真在话题里但还没关联的，发「需求：」也认
         # 「需求：」后面紧跟已有 issue 的链接或 #编号，是让 Agent 处理那张单，关联它而不是新建
         # 图文消息可能先放附件；命令只看文字，上传仍从原始 msg 提取附件。
-        if m:
+        if m and bind_iid is not None:
             if linked:
                 self.follow_up(linked, msg, text)
                 self.remember_target(msg, self.state["threads"][linked])
             else:
-                self.bind(mid, chat, iid, m.string[m.end():].strip(), user, msg)
+                self.bind(mid, chat, bind_iid, m.string[m.end():].strip(), user, msg, project=bind_project)
             return
         if c and (command_text[c.end():].strip() or find_attachments(text)):
             self.create(mid, chat, command_text[c.end():].strip(), user, msg.get("sender_name") or user, msg)
@@ -649,37 +676,103 @@ class Bridge:
     def remember_target(self, msg: dict[str, Any], issue: dict) -> None:
         recent = self.recent_targets(msg)
         key = self.intent_scope(msg)
+        proj = str(issue.get("project") or self.project)
         self.state["recent_targets"].pop(key, None)
-        self.state["recent_targets"][key] = ([item for item in recent if item["iid"] != issue["iid"]]
-                                            + [{"iid": issue["iid"], "title": issue.get("title", ""),
-                                                "project": self.project, "ts": self.now(),
-                                                "time": datetime.fromtimestamp(self.now()).isoformat(timespec="seconds")}])[-20:]
+        self.state["recent_targets"][key] = (
+            [item for item in recent if (item.get("project") or self.project, item["iid"]) != (proj, issue["iid"])]
+            + [{"iid": issue["iid"], "title": issue.get("title", ""),
+                "project": proj, "ts": self.now(),
+                "time": datetime.fromtimestamp(self.now()).isoformat(timespec="seconds")}]
+        )[-20:]
         for old in list(self.state["recent_targets"])[:-200]:
             del self.state["recent_targets"][old]
 
-    def intent_candidates(self, msg: dict[str, Any], text: str, linked_issue: Optional[int]) -> list[dict]:
+    def intent_candidates(
+        self,
+        msg: dict[str, Any],
+        text: str,
+        linked_issue: Optional[int],
+        linked_project: Optional[str] = None,
+    ) -> list[dict]:
         """编号仅扩大只读候选，不等于转交许可；群候选绝不从私聊全量登记取。"""
         group = msg.get("chat_type") == "group" or msg.get("chat_id") in self.state["group_chats"]
-        known = {} if group else {item["iid"]: item for item in self.secretary.known_tasks().values()}
-        known.update({item["iid"]: item for item in self.state["threads"].values()
-                      if item.get("chat_id") == msg.get("chat_id") and item["project"] == self.project})
+        known: dict[tuple[str, int], dict] = {}
+        if not group:
+            for item in self.secretary.known_tasks().values():
+                proj = str(item.get("project") or self.project)
+                known[(proj, int(item["iid"]))] = dict(item, project=proj)
+        for item in self.state["threads"].values():
+            proj = str(item.get("project") or self.project)
+            if item.get("chat_id") == msg.get("chat_id") and self.is_project_allowed(proj):
+                known[(proj, int(item["iid"]))] = dict(item, project=proj)
         for item in self.recent_targets(msg):
-            known.setdefault(item["iid"], item)
-        # GET 确认明确数字引用与当前关联；禁止把引用背景里的编号混入当前用户选择。
-        explicit = {int(n) for n in ISSUE_NUMBER_RE.findall(text)}
+            proj = str(item.get("project") or self.project)
+            if self.is_project_allowed(proj):
+                known.setdefault((proj, int(item["iid"])), dict(item, project=proj))
+
+        # 解析跨项目 URL 与 group/repo#iid 显式引用
+        explicit_refs: set[tuple[str, int]] = set()
         for url in re.findall(r"https?://[^\s<>，。；]+", text):
             if "/-/issues/" in url or "/-/work_items/" in url:
-                explicit.add(topics_module().issue_id(self.cfg, url))
+                try:
+                    proj, iid = topics_module().parse_issue_url(self.cfg, url)
+                except topics_module().TopicError:
+                    continue
+                if self.is_project_allowed(proj):
+                    explicit_refs.add((proj, iid))
+        for m in QUALIFIED_ISSUE_RE.finditer(text):
+            proj, iid = m.group(1), int(m.group(2))
+            if self.is_project_allowed(proj):
+                explicit_refs.add((proj, iid))
         if linked_issue:
-            explicit.add(linked_issue)
-        for iid in explicit:
+            explicit_refs.add((linked_project or self.project, linked_issue))
+
+        # 裸数字只在尚未以跨项目显式引用命中时，补查默认项目
+        qualified_iids = {iid for _, iid in explicit_refs}
+        for n in ISSUE_NUMBER_RE.findall(text):
+            iid = int(n)
+            if iid not in qualified_iids:
+                explicit_refs.add((self.project, iid))
+
+        for proj, iid in explicit_refs:
             try:
-                issue = self.api(f"projects/{quote(self.project, safe='')}/issues/{iid}")
+                issue = self.api(f"projects/{quote(proj, safe='')}/issues/{iid}")
             except BridgeError:
                 continue
             if issue and issue.get("iid") == iid:
-                known[iid] = {**issue, "project": self.project}
-        return [dict(item, iid=iid, project=self.project) for iid, item in known.items()]
+                known[(proj, iid)] = {**issue, "project": proj}
+        return [dict(item, iid=iid, project=proj) for (proj, iid), item in known.items()]
+
+    def resolve_relay_project(
+        self,
+        iid: int,
+        action_item: dict[str, Any],
+        candidates: list[dict],
+        linked_project: Optional[str],
+        linked_issue: Optional[int],
+    ) -> Optional[str]:
+        """根据引用来源与候选任务确定唯一目标项目；跨项目同号无法唯一确定时返回 None。"""
+        ref = action_item.get("reference")
+        ev = str(action_item.get("evidence") or "")
+        if ref == "linked" and linked_project and linked_issue == iid:
+            return linked_project
+        for url in re.findall(r"https?://[^\s<>()\[\]\"，。；！？]+", ev):
+            if "/-/issues/" in url or "/-/work_items/" in url:
+                try:
+                    proj, url_iid = topics_module().parse_issue_url(self.cfg, url)
+                    if url_iid == iid:
+                        return proj
+                except topics_module().TopicError:
+                    pass
+        for m in QUALIFIED_ISSUE_RE.finditer(ev):
+            if int(m.group(2)) == iid:
+                return m.group(1)
+        matched_projects = sorted({str(c.get("project") or self.project) for c in candidates if c.get("iid") == iid})
+        if len(matched_projects) == 1:
+            return matched_projects[0]
+        if len(matched_projects) > 1:
+            return None
+        return linked_project if linked_issue == iid and linked_project else self.project
 
     def classify_message(self, msg: dict[str, Any], text: str, *, candidates: list[dict],
                          linked_issue: Optional[int] = None, recent: list[dict]) -> Optional[dict]:
@@ -711,9 +804,11 @@ class Bridge:
         return direct or scoped
 
     def save_pending_intent(self, key: str, msg: dict, previous: Optional[dict], *,
-                            linked_issue: Optional[int], status: str, question: str = "") -> dict:
+                            linked_issue: Optional[int], status: str, question: str = "",
+                            linked_project: Optional[str] = None) -> dict:
         item = {**(previous or {}), "chat": msg.get("chat_id", ""), "sender": msg.get("sender_id"),
                 "thread": msg.get("thread_id") or "", "linked_issue": linked_issue,
+                "linked_project": linked_project or (previous.get("linked_project") if previous else None),
                 "status": status, "question": question,
                 "messages": (previous["messages"] if previous else []) + [dict(msg)],
                 "reply_ids": list(previous["reply_ids"] if previous else [])}
@@ -740,26 +835,36 @@ class Bridge:
             request = ("同一次待澄清请求的用户原话：\n"
                        + "\n\n".join(self.clean_text(item) for item in previous["messages"])
                        + "\n\n本次用户补充（若改变或撤销原意，以本次为准）：\n" + text)
-        linked_issue = self.state["threads"][linked]["iid"] if linked else (
-            topics_module().issue_id(self.cfg, target) if target else None)
+        linked_project: Optional[str] = None
+        linked_issue: Optional[int] = None
+        if linked:
+            linked_project = str(self.state["threads"][linked].get("project") or self.project)
+            linked_issue = int(self.state["threads"][linked]["iid"])
+        elif target:
+            linked_project, linked_issue = topics_module().parse_issue_url(self.cfg, target)
         if linked_issue is None and previous:
             linked_issue = previous.get("linked_issue")
+            linked_project = previous.get("linked_project")
         in_thread = bool(msg.get("thread_id"))
         for url in re.findall(r"https?://[^\s<>，。；]+", text):
             if "/-/issues/" in url or "/-/work_items/" in url:
                 try:
-                    topics_module().issue_id(self.cfg, url)
+                    u_proj, _ = topics_module().parse_issue_url(self.cfg, url)
                 except topics_module().TopicError:
-                    self.reply(mid, "该链接不属于当前配置的项目，这条消息未转发。", f"wrong-project-{mid}", in_thread=in_thread)
+                    self.reply(mid, "该链接不是当前 GitLab 实例的合法 issue 链接，这条消息未转发。", f"wrong-project-{mid}", in_thread=in_thread)
                     return
-        candidates = self.intent_candidates(msg, request, linked_issue)
+                if not self.is_project_allowed(u_proj):
+                    self.reply(mid, f"项目 {u_proj} 已归档或机器人没有权限，这条消息未转发。", f"wrong-project-{mid}", in_thread=in_thread)
+                    return
+        candidates = self.intent_candidates(msg, request, linked_issue, linked_project)
         recent = self.recent_targets(msg)
         intent = self.classify_message(source, request, candidates=candidates, linked_issue=linked_issue, recent=recent)
         if intent is None:
             # 内部故障不等于用户没说清，也不能擅自转给引用里的另一张任务。
             reason = self.secretary.intent_error or "invalid_decision"
             log(f"intent failed mid={mid} reason={reason}")
-            item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue, status="failed")
+            item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue,
+                                            linked_project=linked_project, status="failed")
             self.persist()
             reply_id = self.reply(mid, "这次消息处理失败，尚未新建或启动任务，也未新增转告。原请求已保留，请回复“重试”。",
                                   f"intent-failed-{mid}", in_thread=in_thread)
@@ -771,12 +876,18 @@ class Bridge:
                       "reply": "没能确认引用对应哪张任务，尚未新建或转交。请写明任务编号或链接。"}
         if intent["action"] == "batch" or intent["action"] == "relay" and previous and previous.get("relay_plan"):
             if intent["action"] == "batch":
-                actions = intent["actions"]
+                actions = [
+                    {**act, "project": self.resolve_relay_project(act["issue"], act, candidates, linked_project, linked_issue) or self.project}
+                    for act in intent["actions"]
+                ]
             else:
                 old = next((item for item in previous["relay_plan"] if item["issue"] == intent["issue"]), None)
                 directive = (old["text"] + "\n\n用户补充（以本次为准）：\n" + text) if old else text
-                actions = [{**intent, "text": directive}]
-            item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue, status="partial")
+                proj = (old.get("project") if old else None) or self.resolve_relay_project(
+                    intent["issue"], intent, candidates, linked_project, linked_issue) or self.project
+                actions = [{**intent, "text": directive, "project": proj}]
+            item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue,
+                                            linked_project=linked_project, status="partial")
             self.deliver_relay_plan(key, source, actions, item)
             return
         if intent["action"] == "answer" and (intent["issue"] or linked_issue):
@@ -786,7 +897,7 @@ class Bridge:
         if action in ("answer", "clarify"):
             if action == "clarify":
                 item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue,
-                                                status="clarify", question=intent["reply"])
+                                                linked_project=linked_project, status="clarify", question=intent["reply"])
                 self.persist()
             reply_text = self.secretary.linkify(intent["reply"])
             reply_id = self.reply(mid, reply_text, f"intent-{mid}", in_thread=in_thread)
@@ -798,15 +909,26 @@ class Bridge:
             return
         try:
             if action == "relay":
-                issue = self.api(f"projects/{quote(self.project, safe='')}/issues/{iid}")
+                target_project = self.resolve_relay_project(iid, intent, candidates, linked_project, linked_issue)
+                if not target_project:
+                    projs = "、".join(sorted({str(c.get("project") or self.project) for c in candidates if c.get("iid") == iid}))
+                    q = f"多个项目都有 #{iid}（{projs}），请写明 `项目路径#{iid}` 或贴出完整链接。"
+                    item = self.save_pending_intent(key, msg, previous, linked_issue=linked_issue,
+                                                    linked_project=linked_project, status="clarify", question=q)
+                    self.persist()
+                    reply_id = self.reply(mid, q, f"intent-ambig-{mid}", in_thread=in_thread)
+                    if reply_id:
+                        item["reply_ids"].append(reply_id)
+                    return
+                issue = self.api(f"projects/{quote(target_project, safe='')}/issues/{iid}")
                 if issue.get("state") == "closed":
                     self.reply(mid, "这张任务已关闭，未转交。请明确要继续处理的未关闭任务，或提出独立新需求。",
                                f"closed-{mid}", in_thread=in_thread)
                     return
-                if linked and iid == self.state["threads"][linked]["iid"]:
+                if linked and (target_project, iid) == (self.state["threads"][linked]["project"], self.state["threads"][linked]["iid"]):
                     self.follow_up(linked, source, request, mode=mode)
                 else:
-                    self.secretary.relay(self.issue_url(self.project, iid), source, request, mode=mode)
+                    self.secretary.relay(self.issue_url(target_project, iid), source, request, mode=mode)
             else:
                 # request 是给模型看的拼接稿；正文只放用户原话
                 self.create(mid, chat, text, user, msg.get("sender_name") or user, source, mode=mode,
@@ -816,33 +938,39 @@ class Bridge:
             delivered = self.state["threads"].get(mid) or self.delivered
             if delivered:
                 pending.pop(key, None)
-                issue = next((item for item in candidates if item["iid"] == delivered["iid"]),
-                             {"iid": delivered["iid"], "title": self.strip_images(text)[:60]})
+                d_proj = str(delivered.get("project") or self.project)
+                issue = next(
+                    (item for item in candidates if item["iid"] == delivered["iid"] and str(item.get("project") or self.project) == d_proj),
+                    {"iid": delivered["iid"], "project": d_proj, "title": self.strip_images(text)[:60]},
+                )
                 self.remember_target(msg, issue)
 
     def deliver_relay_plan(self, key: str, source: dict, actions: list[dict], pending: dict) -> None:
         plan = pending.setdefault("relay_plan", [])
-        by_issue = {item["issue"]: item for item in plan}
+        by_issue = {(item.get("project") or self.project, item["issue"]): item for item in plan}
         for action in actions:
+            proj = str(action.get("project") or self.project)
             iid = action["issue"]
-            old = by_issue.get(iid)
+            old = by_issue.get((proj, iid))
             if old and old["status"] in ("sent", "sending", "unknown"):
                 continue
             if old:
                 old.update(text=action["text"], mode=action["mode"])
             else:
-                item = {"issue": iid, "text": action["text"], "mode": action["mode"], "status": "pending"}
+                item = {"project": proj, "issue": iid, "text": action["text"], "mode": action["mode"], "status": "pending"}
                 plan.append(item)
-                by_issue[iid] = item
+                by_issue[(proj, iid)] = item
         pending.setdefault("origin", source["message_id"])
         self.persist()
         # 附件只上传一次；续接使用已保存背景，不重复搬运。
         if "context" not in pending:
-            pending["context"] = self.message_context(source, self.project,
+            first_proj = str(plan[0].get("project") or self.project) if plan else self.project
+            pending["context"] = self.message_context(source, first_proj,
                                                        self.take_pending_images(source.get("chat_id", "")))
             self.persist()
-        selected = {item["issue"] for item in actions}
+        selected = {(str(item.get("project") or self.project), item["issue"]) for item in actions}
         for item in plan:
+            proj = str(item.get("project") or self.project)
             iid = item["issue"]
             marker = f"<!-- hwf-relay:{pending['origin']}:{iid} -->"
             if item["status"] in ("sending", "unknown"):
@@ -850,7 +978,7 @@ class Bridge:
                 item["status"] = "unknown"
                 try:
                     for page in range(1, 6):
-                        notes = self.api(f"projects/{quote(self.project, safe='')}/issues/{iid}/notes"
+                        notes = self.api(f"projects/{quote(proj, safe='')}/issues/{iid}/notes"
                                          f"?sort=desc&per_page=100&page={page}")
                         found = next((n for n in notes if marker in (n.get("body") or "")), None)
                         if found:
@@ -860,38 +988,39 @@ class Bridge:
                         if len(notes) < 100:
                             break
                 except (BridgeError, ValueError):
-                    log(f"relay reconciliation failed mid={pending['origin']} issue={iid}")
+                    log(f"relay reconciliation failed mid={pending['origin']} issue={proj}#{iid}")
                 self.persist()
-            if item["status"] != "pending" or iid not in selected:
+            if item["status"] != "pending" or (proj, iid) not in selected:
                 continue
             try:
-                issue = self.api(f"projects/{quote(self.project, safe='')}/issues/{iid}")
+                issue = self.api(f"projects/{quote(proj, safe='')}/issues/{iid}")
                 if issue.get("state") == "closed":
                     item["error"] = "closed"
                     continue
                 body = self.secretary.relay_body(source, item["text"], mode=item["mode"],
-                                                  project=self.project, context=pending["context"])
+                                                  project=proj, context=pending["context"])
                 if not body:
                     item["error"] = "empty"
                     continue
                 item["status"] = "sending"
                 self.persist()
-                note_id = self.note_as_user(self.project, iid, f"@{self.agent} {body}\n\n{marker}")
+                note_id = self.note_as_user(proj, iid, f"@{self.agent} {body}\n\n{marker}")
                 item.update(status="sent", note_id=note_id)
-                self.remember_target(source, issue)
-                self.secretary.track(self.issue_url(self.project, iid), {**issue, "project": self.project},
+                self.remember_target(source, {**issue, "project": proj})
+                self.secretary.track(self.issue_url(proj, iid), {**issue, "project": proj},
                                      last_note=note_id)
             except (BridgeError, ValueError):
                 if item["status"] == "sending":
                     item["status"] = "unknown"
                 item["error"] = "delivery_failed"
-                log(f"relay failed mid={pending['origin']} issue={iid} status={item['status']}")
+                log(f"relay failed mid={pending['origin']} issue={proj}#{iid} status={item['status']}")
             finally:
                 self.persist()
         lines = []
         for item in plan:
+            proj = str(item.get("project") or self.project)
             iid = item["issue"]
-            label = f"[#{iid}]({self.issue_url(self.project, iid)})"
+            label = f"[{self.issue_ref(proj, iid)}]({self.issue_url(proj, iid)})"
             result = ("已转交" if item["status"] == "sent" else
                       "发送结果待核实，请先查看任务评论，不要重复发送" if item["status"] == "unknown" else
                       "任务已关闭，未转交" if item.get("error") == "closed" else "未转交")
@@ -920,56 +1049,6 @@ class Bridge:
             elif key:
                 text = text.replace(key, f"@{name}")
         return text.strip()
-
-    def in_linked_thread(self, msg: dict[str, Any]) -> bool:
-        """这条消息在已关联 issue 的话题里：是跟 Agent 的对话，不是群里没人管的事。"""
-        root = msg.get("root_id") or ""
-        return msg.get("thread_id") in self.state["thread_ids"] or (
-            root != msg["message_id"] and root in self.state["threads"])
-
-    def mark_handled(self, msg: Optional[dict[str, Any]], chat: str, iid: int) -> None:
-        """在观察群里回复某句话建单或关联 issue：告诉主动接活那句话已经交给 Agent，别再记成「本来会接」。"""
-        if not msg or chat not in self.observe_chats:
-            return
-        for target in {msg.get("root_id") or "", msg.get("reply_to") or ""} - {"", msg["message_id"]}:
-            try:
-                proactive_module().append_feishu_queue({"handled": target, "chat": chat, "iid": iid})
-            except OSError as e:
-                log(f"mark handled {target} failed: {e}")
-
-    def observe(self, msg: dict[str, Any]) -> None:
-        """观察群里的一条消息进主动接活队列：只写本机文件，不回复、不碰 GitLab；写失败只记日志。"""
-        text = self.clean_text(msg)
-        attachments = find_attachments(text)
-        marks = ["[图片]" if a["kind"] == "image" else f"[文件 {a['name'] or '未命名'}]" for a in attachments]
-        body = " ".join([strip_attachments(text).strip(), *marks]).strip()
-        # 图片下载到本机给模型看（2026-11-08 用户同意）；文件、视频只写名字不下载。7 天后由 proactive 清理
-        images: list[str] = []
-        media = proactive_module().Files().media / msg["message_id"]
-        for a in [a for a in attachments if a["kind"] == "image"][:OBSERVE_IMAGES_PER_MESSAGE]:
-            try:
-                images.append(str(self.download(msg["message_id"], a, media, OBSERVE_DOWNLOAD_TIMEOUT_S)))
-            except BridgeError as e:
-                log(f"observe image {a['key']} of {msg['message_id']} failed: {e}")
-        chat = msg.get("chat_id", "")
-        quote = ""
-        quoted = msg.get("reply_to") or msg.get("root_id") or ""
-        if quoted and quoted != msg["message_id"] and not msg.get("thread_id"):
-            # 主聊天区的引用回复：把被引用那句带上，否则「同上」「这个也是」之类的话判不了；话题里本来就有上下文
-            try:
-                items = (self.lark(["im", "+messages-mget", "--message-ids", quoted]).get("data") or {}).get("messages")
-                raw = (items or [{}])[0].get("content") or ""
-                quote = (strip_attachments(raw).strip() + (" [附件]" if find_attachments(raw) else ""))[:300]
-            except BridgeError as e:
-                log(f"read quoted {quoted} failed: {e}")
-        try:
-            proactive_module().append_feishu_queue({
-                "mid": msg["message_id"], "chat": chat, "chat_name": self.observe_chats.get(chat, ""),
-                "root": msg.get("root_id") or "", "thread": msg.get("thread_id") or "",
-                "sender": msg.get("sender_id") or "", "sender_name": msg.get("sender_name") or "",
-                "text": body, "quote": quote, "images": images, "ms": int(msg.get("create_ms") or 0)})
-        except OSError as e:
-            log(f"observe {msg['message_id']} failed: {e}")
 
     @staticmethod
     def strip_images(text: str) -> str:
@@ -1083,37 +1162,67 @@ class Bridge:
                         f"{status}",
                    f"created-{mid}")
         self.link_thread(mid, mid)
-        self.mark_handled(msg, chat, iid)
         log(f"created {self.project}#{iid} from {mid} by {user}")
 
     def bind(self, mid: str, chat: str, iid: int, rest: str, user: str,
-             msg: Optional[dict[str, Any]] = None, *, mode: str = "analyze") -> None:
-        pid = quote(self.project, safe="")
-        try:
-            issue = self.api(f"projects/{pid}/issues/{iid}")
-        except BridgeError:
-            self.reply(mid, f"没找到 #{iid}（只能关联 {self.project} 里的 issue）。", f"bind-miss-{mid}")
+             msg: Optional[dict[str, Any]] = None, *, mode: str = "analyze",
+             project: Optional[str] = None) -> None:
+        target_project = project or self.project
+        issue: Optional[dict[str, Any]] = None
+        if project is not None:
+            if not self.is_project_allowed(target_project):
+                self.reply(mid, f"项目 {target_project} 已归档或机器人没有权限，无法关联。", f"bind-miss-{mid}")
+                return
+            try:
+                issue = self.api(f"projects/{quote(target_project, safe='')}/issues/{iid}")
+            except BridgeError:
+                issue = None
+        else:
+            # 未指定项目名时：先查默认项目；查不到再看秘书已登记的跨项目任务是否唯一命中该编号。
+            try:
+                issue = self.api(f"projects/{quote(target_project, safe='')}/issues/{iid}")
+            except BridgeError:
+                matches = [
+                    str(item["project"])
+                    for item in self.secretary.known_tasks().values()
+                    if item.get("iid") == iid and item.get("project") and item["project"] != self.project
+                ]
+                unique_projects = sorted(set(matches))
+                if len(unique_projects) == 1:
+                    target_project = unique_projects[0]
+                    try:
+                        issue = self.api(f"projects/{quote(target_project, safe='')}/issues/{iid}")
+                    except BridgeError:
+                        issue = None
+                elif len(unique_projects) > 1:
+                    projs = "、".join(unique_projects)
+                    self.reply(mid, f"多个项目都有 #{iid}（{projs}），请用「项目路径#{iid}」或贴完整链接关联。", f"bind-ambig-{mid}")
+                    return
+        if not issue:
+            ref = self.issue_ref(target_project, iid)
+            self.reply(mid, f"没找到 {ref}（如需关联其他项目，请发「项目路径#{iid}」或贴完整 issue 链接）。", f"bind-miss-{mid}")
             return
+        pid = quote(target_project, safe="")
         notes = self.api(f"projects/{pid}/issues/{iid}/notes?sort=desc&per_page=1")
-        context = self.message_context(msg, self.project, self.take_pending_images(chat), include_thread=True) if msg else ""
+        context = self.message_context(msg, target_project, self.take_pending_images(chat), include_thread=True) if msg else ""
         rest = self.strip_images(rest)
         if rest or context:
             # 已有 issue 未必在收件箱跟踪范围内，@Agent 保证转交。
             body = "\n\n".join(x for x in (rest, context) if x)
             body = self.execution_body(body, mode)
-            self.note_as_user(self.project, iid, f"@{self.agent} {body}\n\n_（来自飞书）_")
+            self.note_as_user(target_project, iid, f"@{self.agent} {body}\n\n_（来自飞书）_")
         # 评论发出去才算关联成功：失败时要用户重发，不能留一个半截的话题
-        self.state["threads"][mid] = {"project": self.project, "iid": iid, "chat_id": chat,
+        self.state["threads"][mid] = {"project": target_project, "iid": iid, "chat_id": chat,
                                       "last_note": notes[0]["id"] if notes else 0,
                                       "title": issue["title"], "closed": issue["state"] == "closed", "bound": True,
                                       "last_active_at": int(self.now())}
         if msg:
-            self.remember_target(msg, issue)
-        self.reply(mid, f"已关联 [#{iid}]({self.issue_url(self.project, iid)})：{issue['title']}\n"
+            self.remember_target(msg, {**issue, "project": target_project})
+        ref = self.issue_ref(target_project, iid)
+        self.reply(mid, f"已关联 [{ref}]({self.issue_url(target_project, iid)})：{issue['title']}\n"
                         "之后在这个话题里回复会同步成评论，issue 里的新评论也会发到这里。", f"bound-{mid}")
         self.link_thread(mid, mid)
-        self.mark_handled(msg, chat, iid)
-        log(f"bound {mid} → {self.project}#{iid} by {user}")
+        log(f"bound {mid} → {target_project}#{iid} by {user}")
 
     @staticmethod
     def execution_body(text: str, mode: str) -> str:
@@ -1264,7 +1373,8 @@ class Bridge:
         if len(body) > FEISHU_TEXT_CAP:
             body = body[:FEISHU_TEXT_CAP].rstrip() + f"\n\n…内容较长，全文见 [GitLab]({url})"
         who = n.get("author", {}).get("name") or n.get("author", {}).get("username", "?")
-        return f"**{who}**（[#{t['iid']}]({url})）：\n{body}"
+        ref = self.issue_ref(t["project"], t["iid"])
+        return f"**{who}**（[{ref}]({url})）：\n{body}"
 
     # ---------- 补漏 ----------
     def poll_history(self) -> None:
@@ -1376,22 +1486,6 @@ class Bridge:
             self.handle(msg)
 
 
-_PROACTIVE: Any = None
-
-
-def proactive_module() -> Any:
-    """按需加载同目录的 proactive.py（复用它的队列写入，队列格式只在一处定义）。"""
-    global _PROACTIVE
-    if _PROACTIVE is None:
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("proactive", Path(__file__).resolve().parent / "proactive.py")
-        assert spec is not None and spec.loader is not None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _PROACTIVE = module
-    return _PROACTIVE
-
-
 _SECRETARY: Any = None
 
 
@@ -1496,8 +1590,8 @@ def stop_children(*_: Any) -> None:
 def watched_scripts(base_dir: Optional[Path] = None) -> tuple[Path, ...]:
     root = base_dir or Path(__file__).resolve().parent
     return tuple(root / name for name in (
-        "feishu-bridge.py", "secretary.py", "task_intent.py", "feishu_topics.py",
-        "proactive.py", "jev_client.py", "jev_gates.py", "poll_backoff.py",
+        "feishu-bridge.py", "gitlab_projects.py", "secretary.py", "task_intent.py", "feishu_topics.py",
+        "jev_client.py", "jev_gates.py", "poll_backoff.py",
     ))
 
 

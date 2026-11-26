@@ -212,11 +212,14 @@ class Init:
             with open(path, "w") as f:  # 原地写回（不 mv 覆盖）
                 f.write(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
 
-        if self.project in cfg.get("projects", []):
+        shared_projects = cfg.get("projects")
+        if shared_projects in (None, []):
+            self.have("收件箱已开启全项目动态监听（无需修改 gitlab-inbox.config.json）")
+        elif self.project in shared_projects:
             self.have(f"收件箱登记 {self.project}（入库配置）")
         else:
             def add_shared() -> None:
-                cfg["projects"] = sorted(set(cfg.get("projects", [])) | {self.project})
+                cfg["projects"] = sorted(set(shared_projects) | {self.project})
                 dump(cfg_path, cfg)
             self.do(f"收件箱登记 {self.project}（改的是入库的 gitlab-inbox.config.json，记得在 ~/.hwf 提交 MR）", add_shared)
 

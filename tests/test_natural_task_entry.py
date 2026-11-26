@@ -319,12 +319,12 @@ class NaturalEntryTest(unittest.TestCase):
         self.model(action="relay", issue=7)
         self.b.handle(msg("om_foreign", "关联 https://git.example.com/other/project/-/issues/7"))
         self.assertEqual(self.w.writes, [])
-        self.assertIn("不属于", self.w.replies[-1]["text"])
+        self.assertIn("已归档或机器人没有权限", self.w.replies[-1]["text"])
 
     def test_explicit_foreign_link_also_stays_read_only(self):
         self.b.handle(msg("om_foreign", "https://git.example.com/other/project/-/issues/7"))
         self.assertEqual(self.w.writes, [])
-        self.assertIn("不属于", self.w.replies[-1]["text"])
+        self.assertIn("已归档或机器人没有权限", self.w.replies[-1]["text"])
 
     def test_background_issue_number_cannot_authorize_binding(self):
         self.model(action="relay", issue=7)

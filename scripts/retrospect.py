@@ -658,6 +658,18 @@ def collect_digest(
     projects: dict[str, str] = (
         dict(raw_projects) if isinstance(raw_projects, Mapping) else {str(p): "" for p in raw_projects}
     )
+    for p, r in (config.get("local_projects") or {}).items():
+        if p and r and not projects.get(p):
+            projects[str(p)] = str(r)
+    inbox_state = files.read_json(files.inbox_state, {})
+    for bucket in ("origins", "closed_origins"):
+        for origin in (inbox_state.get(bucket) or {}).values():
+            if not isinstance(origin, Mapping):
+                continue
+            proj = str(origin.get("project") or "")
+            repo_str = str(origin.get("repo") or "")
+            if proj and repo_str and not projects.get(proj):
+                projects[proj] = repo_str
     allowed_users = set(config.get("allowed_users") or [])
     host = str(config.get("host") or "git.bootingai.net")
 
@@ -679,7 +691,6 @@ def collect_digest(
                 if m:
                     active_iids_by_proj.setdefault(proj, set()).add(int(m.group(1)))
 
-    inbox_state = files.read_json(files.inbox_state, {})
     for origin in (inbox_state.get("origins") or {}).values():
         proj = origin.get("project")
         iid = origin.get("iid")

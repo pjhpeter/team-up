@@ -70,7 +70,7 @@ INTENT_PROMPT = (
 
 
 def validate_intent(value: object, text: str, candidates: list[dict], linked_issue: int | None,
-                    recent: list[dict]) -> dict[str, Any] | None:
+                    recent: list[dict], *, ambiguous_issues: set[int] | None = None) -> dict[str, Any] | None:
     """只接受可追溯的完整决策；绝不靠关键词猜动作或替模型补授权。"""
     if isinstance(value, dict) and value.get("action") == "batch":
         if set(value) != {"action", "actions"}:
@@ -90,7 +90,7 @@ def validate_intent(value: object, text: str, candidates: list[dict], linked_iss
                 return None
             # 广播正文可不含编号，目标证据仍须来自完整原话。
             single = {key: field for key, field in item.items() if key != "text"}
-            if validate_intent(single, text, candidates, linked_issue, recent) is None:
+            if validate_intent(single, text, candidates, linked_issue, recent, ambiguous_issues=ambiguous_issues) is None:
                 return None
             if item["issue"] in seen:
                 return None
@@ -127,6 +127,14 @@ def validate_intent(value: object, text: str, candidates: list[dict], linked_iss
     linked = linked_issue if type(linked_issue) is int and linked_issue > 0 else None
     if issue not in known and issue != linked:
         return None
+    # 跨项目存在相同编号时，除非通过 linked 或显式带项目路径（URL 或 group/repo#iid）消歧，否则拒绝猜单。
+    if ambiguous_issues and issue in ambiguous_issues and reference != "linked":
+        has_qualified_ref = bool(
+            re.search(rf"https?://[^\s<>()\[\]\"，。；！？]+/-/(?:issues|work_items)/{issue}(?![0-9])", evidence)
+            or re.search(rf"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+#{issue}(?![0-9])", evidence)
+        )
+        if not has_qualified_ref:
+            return None
     if reference == "explicit":
         pattern = rf"(?<![0-9A-Za-z_.]){issue}(?![0-9A-Za-z_.])"
         return value if re.search(pattern, text) and re.search(pattern, evidence) else None
@@ -156,6 +164,8 @@ def build_verified_relay_intent(
     candidates: list[dict],
     linked_issue: int | None,
     recent: list[dict],
+    *,
+    ambiguous_issues: set[int] | None = None,
 ) -> dict[str, Any] | None:
     """为 Jev 高置信单任务转交构造可追溯证据，并复用 validate_intent 做终审；拿不准证据时返回 None 回退重模型。"""
     stripped = text.strip()
@@ -166,9 +176,13 @@ def build_verified_relay_intent(
     evidence = ""
 
     url_match = re.search(rf"https?://[^\s<>()\[\]\"，。；！？]+/-/(?:issues|work_items)/{issue_iid}(?![0-9])", text)
+    qual_match = re.search(rf"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+#{issue_iid}(?![0-9])", text)
     if url_match:
         reference = "explicit"
         evidence = url_match.group(0)
+    elif qual_match:
+        reference = "explicit"
+        evidence = qual_match.group(0)
     else:
         for num_match in re.finditer(rf"(?<![0-9A-Za-z_.])#?{issue_iid}(?![0-9A-Za-z_.])", text):
             token = num_match.group(0)
@@ -228,4 +242,4 @@ def build_verified_relay_intent(
         "reference": reference,
         "evidence": evidence,
     }
-    return validate_intent(decision, text, candidates, linked_issue, recent)
+    return validate_intent(decision, text, candidates, linked_issue, recent, ambiguous_issues=ambiguous_issues)

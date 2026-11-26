@@ -1526,3 +1526,195 @@ class FollowedPruneAndSessionRotationTest(unittest.TestCase):
         self.assertEqual(rotated, ["delivery-scheduler-w1-p1"])
         self.assertEqual(world.resets, ["w1:p1"])
 
+
+class DynamicAllProjectAndAuthBoundaryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp_obj = tempfile.TemporaryDirectory(prefix="hwf-dyn-")
+        self.addCleanup(self.tmp_obj.cleanup)
+        self.tmp = Path(self.tmp_obj.name)
+        patcher = patch.object(INBOX, "STATE_PATH", self.tmp / "state.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_colleague_assign_to_bot_launches_readonly_chat_and_blocks_colleague_go(self) -> None:
+        cloned_dir = self.tmp / "code" / "api"
+        url = "https://git.example/backend/api/-/issues/88"
+        notes = [
+            {
+                "id": 201, "body": "@pjhagent /go 请马上改代码上线", "system": False,
+                "author": {"username": "colleague"},
+            }
+        ]
+        t_assign = {
+            "id": 901,
+            "action_name": "assigned",
+            "target_type": "Issue",
+            "target_url": url,
+            "author": {"username": "colleague"},
+            "project": {"id": 99, "path_with_namespace": "backend/api"},
+            "target": {
+                "id": 880, "iid": 88, "project_id": 99, "title": "接口超时",
+                "state": "opened", "labels": [], "description": "请排查", "web_url": url,
+            },
+        }
+        calls: list[list[str]] = []
+        prompts: list[str] = []
+        done_todos: list[int] = []
+        comments: list[str] = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            if cmd[:2] == ["git", "clone"]:
+                cloned_dir.mkdir(parents=True, exist_ok=True)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if any("find-scheduler.py" in str(x) for x in cmd):
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"task": "backend-api-88", "pane": "w9:p1"}), "")
+            if cmd[0] == "herdr":
+                if cmd[1:3] == ["agent", "list"]:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": {"agents": []}}), "")
+                if cmd[1:3] == ["agent", "get"]:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": {"agent": {"agent_status": "idle"}}}), "")
+                if cmd[1:3] == ["team", "start"]:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": {"window_id": "w9", "pane_id": "w9:p1"}}), "")
+                if cmd[1:3] == ["agent", "prompt"]:
+                    prompts.append(cmd[cmd.index("--text") + 1] if "--text" in cmd else cmd[-1])
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": {"ok": True}}), "")
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({"result": {}}), "")
+            if cmd[0] == "glab":
+                method = cmd[cmd.index("-X") + 1]
+                path = unquote(cmd[cmd.index("-X") + 2])
+                base = path.split("?")[0]
+                if base == "user":
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"username": "pjhagent"}), "")
+                if base == "todos":
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps([t_assign] if 901 not in done_todos else []), "")
+                if base.endswith("/mark_as_done"):
+                    done_todos.append(int(base.split("/")[1]))
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"id": 901}), "")
+                if base == "projects/backend/api":
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"id": 99, "path_with_namespace": "backend/api", "archived": False}), "")
+                if base in ("projects/99/issues/88", "projects/backend/api/issues/88"):
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({
+                        "iid": 88, "project_id": 99, "title": "接口超时", "state": "opened",
+                        "labels": [], "description": "请排查", "web_url": url,
+                    }), "")
+                if base.endswith("/notes") and method == "GET":
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps(notes), "")
+                if "/notes/" in base and method == "GET":
+                    nid = int(base.rsplit("/notes/", 1)[1])
+                    matched = next((n for n in notes if n["id"] == nid), notes[0])
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps(matched), "")
+                if base.endswith("/notes") and method == "POST":
+                    fields = dict(cmd[i + 1].split("=", 1) for i, c in enumerate(cmd) if c == "-f")
+                    body_val = fields.get("body", "")
+                    if not body_val and "body=" in path:
+                        body_val = unquote(path.split("body=", 1)[1])
+                    comments.append(body_val)
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"id": 999}), "")
+                if base.endswith("/resource_label_events"):
+                    return subprocess.CompletedProcess(cmd, 0, "[]", "")
+                if base == "projects/backend/api/issues":
+                    return subprocess.CompletedProcess(cmd, 0, "[]", "")
+                if base == "issues":
+                    return subprocess.CompletedProcess(cmd, 0, "[]", "")
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+        cfg = {
+            "host": "git.example",
+            "agent_user": "pjhagent",
+            "allowed_users": ["pengjh"],
+            "label": "herdr-auto",
+            "projects": {},
+            "code_root": str(self.tmp / "code"),
+            "local_config_path": str(self.tmp / "local.json"),
+        }
+        state: dict[str, Any] = {}
+        inbox = INBOX.Inbox(cfg, state, run=fake_run, jev=None)
+        inbox._user_token_loaded = True
+        inbox._user_token_value = ""
+        inbox.poll()
+        # 同事指派给机器人：自动 clone + 启动只读 CHAT + 写入 watched_issues
+        self.assertTrue(any(c[:2] == ["git", "clone"] for c in calls))
+        self.assertIn(url, state["origins"])
+        self.assertEqual(state["origins"][url]["mode"], "chat")
+        self.assertEqual(state["watched_issues"][url]["status"], "active")
+        self.assertIn(901, done_todos)
+
+        # 同事随后在评论里发 /go：严禁切换到 deliver，仍保持 chat 且提示无权改代码
+        t_mention = {
+            "id": 902,
+            "action_name": "mentioned",
+            "target_type": "Issue",
+            "target_url": f"{url}#note_201",
+            "author": {"username": "colleague"},
+            "project": {"id": 99, "path_with_namespace": "backend/api"},
+            "target": {
+                "id": 880, "iid": 88, "project_id": 99, "title": "接口超时",
+                "state": "opened", "labels": [], "description": "请排查", "web_url": url,
+            },
+        }
+        inbox.handle_mention(t_mention)
+        self.assertEqual(state["origins"][url]["mode"], "chat")
+        self.assertIn(902, done_todos)
+        self.assertTrue(any("禁止视作 /go" in p for p in prompts) or any("无权" in c or "仅" in c or "授权" in c for c in comments))
+
+    def test_poll_user_items_registers_standby_readonly_without_clone_or_mark_done(self) -> None:
+        url = "https://git.example/ops/deploy/-/issues/15"
+        user_writes: list[list[str]] = []
+        git_clones: list[list[str]] = []
+        user_todos: list[dict[str, Any]] = []
+
+        def fake_run(cmd, env=None, **kw):
+            if cmd[:2] == ["git", "clone"]:
+                git_clones.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            if cmd[0] == "glab":
+                method = cmd[cmd.index("-X") + 1]
+                path = unquote(cmd[cmd.index("-X") + 2])
+                base = path.split("?")[0]
+                as_user = bool(env and env.get("GITLAB_TOKEN") == "user-tok")
+                if as_user and method != "GET":
+                    user_writes.append(list(cmd))
+                if base == "todos" and as_user:
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps(user_todos), "")
+                if base == "issues" and as_user:
+                    return subprocess.CompletedProcess(cmd, 0, "[]", "")
+                if base == "projects/ops/deploy":
+                    return subprocess.CompletedProcess(cmd, 0, json.dumps({"path_with_namespace": "ops/deploy", "archived": False}), "")
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+        cfg = {
+            "host": "git.example",
+            "agent_user": "pjhagent",
+            "allowed_users": ["pengjh"],
+            "label": "herdr-auto",
+            "projects": {},
+            "code_root": str(self.tmp / "code"),
+            "local_config_path": str(self.tmp / "local.json"),
+        }
+        state: dict[str, Any] = {}
+        inbox = INBOX.Inbox(cfg, state, run=fake_run, jev=None)
+        inbox._user_token_loaded = True
+        inbox._user_token_value = "user-tok"
+        # 第一轮先建立水位，防止旧待办洪泛
+        inbox.poll_user_items()
+        self.assertEqual(state.get("user_todo_watermark"), 0)
+        # 第二轮产生新 todo（id=555 > 0）：只读登记为 standby，不 clone、不 mark_as_done
+        user_todos.append({
+            "id": 555,
+            "action_name": "mentioned",
+            "target_type": "Issue",
+            "target_url": f"{url}#note_10",
+            "author": {"username": "colleague"},
+            "project": {"id": 55, "path_with_namespace": "ops/deploy"},
+            "target": {"iid": 15, "title": "发版脚本异常", "state": "opened", "web_url": url},
+        })
+        inbox.poll_user_items()
+        self.assertEqual(user_writes, [])
+        self.assertEqual(git_clones, [])
+        self.assertNotIn(url, state.get("origins", {}))
+        self.assertIn(url, state["watched_issues"])
+        self.assertEqual(state["watched_issues"][url]["status"], "standby")
+        self.assertIn("gitlab_projects.py", [p.name for p in INBOX.watched_scripts()])
+
+

@@ -11,14 +11,23 @@ model / thinking 可以留空（空串表示用 omp 默认），但不能都为�
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
+from pathlib import Path
 import re
 import subprocess
 import sys
 import time
 from typing import Any, Sequence
 
+_RC_SPEC = importlib.util.spec_from_file_location("hwf_role_config", Path(__file__).with_name("role_config.py"))
+assert _RC_SPEC is not None and _RC_SPEC.loader is not None
+_RC = importlib.util.module_from_spec(_RC_SPEC)
+sys.modules.setdefault("hwf_role_config", _RC)
+_RC_SPEC.loader.exec_module(_RC)
+
+HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 HERDR = os.environ.get("HERDR_DISCOVERY_BIN") or os.environ.get("HERDR_BIN_PATH") or "herdr"
 START_TIMEOUT_MS = 90000
 SHELL_RETRIES = 10  # 新 tab 的 shell 可能还没出提示符，agent start 会拒绝，隔一秒重试
@@ -36,6 +45,22 @@ def handle(pane: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", pane.lower()).strip("-")
 
 
+def resolve_scheduler_launch(model: str, thinking: str, *, hwf_home: Path = HWF_HOME) -> tuple[str, list[str]]:
+    """按 roles.yaml 的 team.scheduler 配置解析调度者工具与参数，并叠加 issue 指定的 model/thinking。"""
+    spec = _RC.resolve_team_role("scheduler", hwf_home=hwf_home) or {
+        "tool": "omp",
+        "omp_config": str(hwf_home / "scheduler-omp.yml"),
+        "yolo": True,
+    }
+    merged = dict(spec)
+    if model:
+        merged["model"] = model
+    if thinking:
+        merged["thinking"] = thinking
+    compiled = _RC.compile_team_profile("scheduler", merged, hwf_home=hwf_home, write_settings=True)
+    return str(compiled["kind"]), list(compiled["args"])
+
+
 def start(repo: str, model: str, thinking: str, prompt: str) -> str:
     args = ["tab", "create", "--cwd", repo, "--label", f"scheduler {model or 'default'} {thinking}".strip(),
             "--no-focus"]
@@ -47,23 +72,18 @@ def start(repo: str, model: str, thinking: str, prompt: str) -> str:
     try:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
             raise RuntimeError(f"registration name too long or invalid: {name}")
-        # 调度者专用配置叠加：提前压缩上下文，降低长会话词元消耗（2026-10-28 用户同意）。
-        omp_args = ["--config", os.path.expanduser("~/.hwf/scheduler-omp.yml"), "--approval-mode", "yolo"]
-        if model:
-            omp_args[:0] = ["--model", model]
-        if thinking:
-            omp_args[:0] = ["--thinking", thinking]
+        kind, launch_args = resolve_scheduler_launch(model, thinking)
         for attempt in range(SHELL_RETRIES):
             try:
-                herdr("agent", "start", name, "--kind", "omp", "--pane", pane, "--timeout", str(START_TIMEOUT_MS),
-                      "--", *omp_args, timeout=START_TIMEOUT_MS // 1000 + 10)
+                herdr("agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", str(START_TIMEOUT_MS),
+                      "--", *launch_args, timeout=START_TIMEOUT_MS // 1000 + 10)
                 break
             except RuntimeError as error:
                 if "shell" not in str(error).lower() or attempt == SHELL_RETRIES - 1:
                     raise
                 time.sleep(1)
         # 共用的新建提示让调度者自己登记改名；这里已经用登记名启动，提前说明，免得它再改名。
-        note = (f"（入口已用登记名 {name} 启动你，模型 {model or 'omp 默认'}、思考强度 {thinking or '默认'}；"
+        note = (f"（入口已用登记名 {name} 启动你，工具 {kind}、模型 {model or '默认'}、思考强度 {thinking or '默认'}；"
                 "你已登记，用 herdr agent get 回读核对即可，不要改名。）\n")
         herdr("agent", "prompt", name, note + prompt)
         return name

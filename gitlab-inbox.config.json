@@ -5,20 +5,14 @@
   ],
   "label": "herdr-auto",
   "interval_seconds": 60,
-  "proactive": {
-    "model": "jc-gpt/gpt-6-luna",
-    "thinking": "medium"
-  },
+  "proactive": {},
   "retrospect": {
     "enabled": true,
     "weekdays": [1, 4],
     "hour": 12,
-    "minute": 0,
-    "model": "gemini-4-carbon",
-    "reasoning_effort": "high"
+    "minute": 0
   },
   "typesafe": {
-    "model": "jev-1.14.0",
     "api_key_keychain": {
       "service": "typesafe-jev-api",
       "account": "default"

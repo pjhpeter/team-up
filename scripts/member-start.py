@@ -56,6 +56,11 @@ _TAB_SPEC = importlib.util.spec_from_file_location("hwf_name_tab", Path(__file__
 assert _TAB_SPEC is not None and _TAB_SPEC.loader is not None
 _TAB = importlib.util.module_from_spec(_TAB_SPEC)
 _TAB_SPEC.loader.exec_module(_TAB)
+_RC_SPEC = importlib.util.spec_from_file_location("hwf_role_config", Path(__file__).with_name("role_config.py"))
+assert _RC_SPEC is not None and _RC_SPEC.loader is not None
+_RC = importlib.util.module_from_spec(_RC_SPEC)
+sys.modules.setdefault("hwf_role_config", _RC)
+_RC_SPEC.loader.exec_module(_RC)
 
 START_TIMEOUT_MS = 90000
 SHELL_RETRIES = 10
@@ -79,6 +84,9 @@ def herdr(*args: str, timeout: int = 30) -> dict[str, Any]:
 def global_config_path() -> Path:
     if os.environ.get("HWF_GLOBAL_CONFIG"):
         return Path(os.environ["HWF_GLOBAL_CONFIG"])
+    roles = _RC.roles_path()
+    if roles.is_file():
+        return roles
     result = subprocess.run([_START.HERDR, "plugin", "config-dir", "herdr-workflows"], capture_output=True,
                             text=True, timeout=10, check=False)
     if result.returncode == 0 and result.stdout.strip():
@@ -93,12 +101,34 @@ def main_repo(cwd: str) -> Optional[Path]:
     return Path(result.stdout.strip()).parent if result.returncode == 0 and result.stdout.strip() else None
 
 
+def _profiles_from_layer(path: Path) -> dict[str, Any]:
+    """同时兼容统一格式 roles.yaml（team 段）与传统 Herdr 格式（profiles 段）。"""
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, Any] = {}
+    raw_team = data.get("team")
+    if isinstance(raw_team, dict):
+        for role_name, spec in raw_team.items():
+            if not isinstance(spec, dict) or not spec.get("tool"):
+                continue
+            try:
+                out[str(role_name)] = _RC.compile_team_profile(
+                    str(role_name), spec, hwf_home=path.parent, write_settings=True
+                )
+            except _RC.RoleConfigError as exc:
+                raise ClaimError(str(exc)) from exc
+    raw_profiles = data.get("profiles")
+    if isinstance(raw_profiles, dict):
+        out.update(raw_profiles)
+    return out
+
+
 def load_profile(name: str, layers: Sequence[Path]) -> dict[str, Any]:
     profiles: dict[str, Any] = {}
     for path in layers:
         if path.is_file():
-            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            profiles.update(data.get("profiles") or {})  # 整条 entry 覆盖，不逐字段合并
+            profiles.update(_profiles_from_layer(path))  # 整条 entry 覆盖，不逐字段合并
     profile = profiles.get(name)
     if not isinstance(profile, dict) or not profile.get("kind"):
         raise ClaimError(f"配置里没有角色 {name}（查过：{', '.join(str(p) for p in layers)}）")

@@ -44,6 +44,7 @@ if _SCRIPTS_DIR not in sys.path:
 import gitlab_projects as GP
 import jev_client as JC
 import jev_gates as JG
+import role_config as RC
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 RULES_PATH = HWF_HOME / "proactive-rules.md"
@@ -52,6 +53,7 @@ INBOX_LOCAL_PATH = HWF_HOME / "gitlab-inbox.local.json"
 STATE_DIR = HWF_HOME / "state"
 
 DEFAULTS: dict[str, Any] = {
+    "tool": "omp",
     "model": "jc-gpt/gpt-6-luna", "thinking": "medium",
     "gitlab_every_s": 600,        # GitLab 每 10 分钟扫一次
     "issue_delay_s": 7200,        # issue 指派或提及满 2 小时仍未处理才触发主动接活
@@ -277,10 +279,13 @@ def is_manual_or_allowed_job(job: Mapping[str, Any]) -> bool:
 class Scout:
     def __init__(self, config: Mapping[str, Any], *, files: Optional[Files] = None, run: Runner = subprocess.run,
                  now: Callable[[], float] = time.time, rules_path: Path = RULES_PATH,
-                 jev: Optional[JC.JevClient] = None) -> None:
+                 jev: Optional[JC.JevClient] = None, hwf_home: Optional[Path] = None) -> None:
         proactive_overrides = dict(config.get("proactive") or {})
         self._explicit_proactive_keys = set(proactive_overrides)
-        self.cfg = {**DEFAULTS, **proactive_overrides}
+        self._explicit_proactive_overrides = proactive_overrides
+        # 默认跟随 rules_path 所在目录（生产为 ~/.hwf，单测为临时目录，天然避免误读本机真实 roles.yaml）。
+        self.hwf_home = Path(hwf_home) if hwf_home is not None else Path(rules_path).parent
+        self.cfg = self._resolve_cfg()
         self.host: str = config["host"]
         raw_projects = config.get("projects")
         if isinstance(raw_projects, dict):
@@ -913,53 +918,97 @@ class Scout:
             "rules": [r["id"] for r in auto_rules],
         }
 
+    def _resolve_cfg(self) -> dict[str, Any]:
+        """初始化配置，合并默认值、roles.yaml 的 services.proactive 与显式覆盖。"""
+        return RC.resolve_service_role(
+            "proactive",
+            overrides=self._explicit_proactive_overrides,
+            defaults=DEFAULTS,
+            hwf_home=self.hwf_home,
+        )
+
+    def _effective_model_cfg(self) -> dict[str, Any]:
+        """每次模型调用前热读 roles.yaml，保留 self.cfg 上的运行期字段修改。"""
+        merged = dict(self.cfg)
+        role_cfg = self._resolve_cfg()
+        for key in ("tool", "model", "thinking", "extra_args"):
+            if key in role_cfg:
+                merged[key] = role_cfg[key]
+            else:
+                merged.pop(key, None)
+        raw_role = RC.resolve_service_role("proactive", hwf_home=self.hwf_home)
+        for key, value in raw_role.items():
+            if key not in self._explicit_proactive_overrides and key not in ("tool", "model", "thinking", "extra_args"):
+                merged[key] = value
+        return merged
+
     def ask_model(self, prompt: str) -> str:
         self.files.cwd.mkdir(parents=True, exist_ok=True)
-        # 实测（omp 18.18）：--no-tools 会直接失败，因此仅开放 read 且禁用规则/skill/扩展。
-        cmd = [
-            "omp", "-p", "--model", self.cfg["model"], "--thinking", self.cfg["thinking"],
-            "--no-session", "--mode", "json", "--tools", "read",
-            "--no-context-files", "--no-skills", "--no-rules", "--no-extensions", "--no-lsp",
-            "--system-prompt", SYSTEM_PROMPT, prompt,
-        ]
+        cfg = self._effective_model_cfg()
+        tool = str(cfg.get("tool") or "omp").strip().lower()
+        try:
+            cmd = RC.build_headless_command(
+                tool,
+                model=str(cfg.get("model") or ""),
+                thinking=str(cfg.get("thinking") or ""),
+                prompt=prompt,
+                system_prompt=SYSTEM_PROMPT,
+                mode="no_tools",
+                extra_args=cfg.get("extra_args") or (),
+            )
+        except RC.RoleConfigError as e:
+            raise ScoutError(str(e)) from e
         try:
             r = self.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                         cwd=str(self.files.cwd), timeout=self.cfg["judge_timeout_s"], check=False)
+                         cwd=str(self.files.cwd), timeout=cfg["judge_timeout_s"], check=False)
         except subprocess.TimeoutExpired as e:
-            raise ScoutError(f"omp timed out after {self.cfg['judge_timeout_s']}s") from e
+            raise ScoutError(f"{tool} timed out after {cfg['judge_timeout_s']}s") from e
         except OSError as e:
-            raise ScoutError(f"omp failed to start: {e}") from e
+            raise ScoutError(f"{tool} failed to start: {e}") from e
         if r.returncode != 0:
-            raise ScoutError(f"omp exited {r.returncode}: {(r.stderr or r.stdout or '').strip()[:200]}")
-        text, usage = extract_omp_result(r.stdout or "")
+            raise ScoutError(f"{tool} exited {r.returncode}: {(r.stderr or r.stdout or '').strip()[:200]}")
+        text, usage, err = RC.parse_headless_output(tool, r.stdout or "", mode="no_tools", forbid_tools=False)
+        if err == "interrupted_turn":
+            raise ScoutError(f"{tool} ended abnormally")
         if not text:
-            raise ScoutError("omp returned no assistant text")
+            raise ScoutError(f"{tool} returned no assistant text")
         self.last_usage = usage
         return text
 
     def ask_readonly_analysis(self, prompt: str, cwd: Path) -> str:
-        """只读分析调用：只开放 read,grep,find,ls，确保 auto 档绝不修改仓库。"""
+        """只读分析调用：各工具均严格限制在只读工具/只读沙箱内，确保 auto 档绝不修改仓库。"""
         cwd.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            "omp", "-p", "--model", self.cfg["model"], "--thinking", self.cfg["thinking"],
-            "--no-session", "--mode", "json", "--tools", "read,grep,find,ls",
-            "--no-context-files", "--no-skills", "--no-rules", "--no-extensions", "--no-lsp",
-            "--system-prompt", AUTO_ANALYSIS_SYSTEM_PROMPT, prompt,
-        ]
+        cfg = self._effective_model_cfg()
+        tool = str(cfg.get("tool") or "omp").strip().lower()
+        try:
+            cmd = RC.build_headless_command(
+                tool,
+                model=str(cfg.get("model") or ""),
+                thinking=str(cfg.get("thinking") or ""),
+                prompt=prompt,
+                system_prompt=AUTO_ANALYSIS_SYSTEM_PROMPT,
+                mode="readonly",
+                cwd=cwd,
+                extra_args=cfg.get("extra_args") or (),
+            )
+        except RC.RoleConfigError as e:
+            raise ScoutError(str(e)) from e
         try:
             r = self.run(
                 cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                cwd=str(cwd), timeout=self.cfg["auto_timeout_s"], check=False,
+                cwd=str(cwd), timeout=cfg["auto_timeout_s"], check=False,
             )
         except subprocess.TimeoutExpired as e:
-            raise ScoutError(f"readonly omp timed out after {self.cfg['auto_timeout_s']}s") from e
+            raise ScoutError(f"readonly {tool} timed out after {cfg['auto_timeout_s']}s") from e
         except OSError as e:
-            raise ScoutError(f"readonly omp failed to start: {e}") from e
+            raise ScoutError(f"readonly {tool} failed to start: {e}") from e
         if r.returncode != 0:
-            raise ScoutError(f"readonly omp exited {r.returncode}: {(r.stderr or r.stdout or '').strip()[:200]}")
-        text, _usage = extract_omp_result(r.stdout or "")
+            raise ScoutError(f"readonly {tool} exited {r.returncode}: {(r.stderr or r.stdout or '').strip()[:200]}")
+        text, _usage, err = RC.parse_headless_output(tool, r.stdout or "", mode="readonly", forbid_tools=False)
+        if err == "interrupted_turn":
+            raise ScoutError(f"readonly {tool} ended abnormally")
         if not text:
-            raise ScoutError("readonly omp returned no assistant text")
+            raise ScoutError(f"readonly {tool} returned no assistant text")
         return text
 
     def record(self, ev: Mapping[str, Any], rules: Sequence[Mapping[str, Any]], verdict: str,

@@ -60,6 +60,7 @@ import gitlab_projects as GP
 import jev_client as JC
 import jev_gates as JG
 import poll_backoff as PB
+import role_config as RC
 
 JEV_GO_AUTH_MIN = 0.90
 JEV_DEBUG_FLOW_MIN = 0.80
@@ -115,8 +116,8 @@ STAGE_PREFIX = "状态:"
 WAITING_LABEL = "状态:等你处理"
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")  # omp --thinking 可选值
 # 每次投递都把通知规则放回上下文，避免调度者只在首次启动时读过、续跑后忘记。
-# 成员 skill 与 herdr 角色配置同样决定在途交付行为，改动一并提醒在途调度者。
-PROTOCOL_PATHS = ("PROTOCOL.md", "protocol/", "skills/", "herdr/")
+# 成员 skill 与角色配置（roles.yaml / herdr/）同样决定在途交付行为，改动一并提醒在途调度者。
+PROTOCOL_PATHS = ("PROTOCOL.md", "protocol/", "skills/", "roles.yaml", "herdr/")
 NOTIFY_REMINDER = (
     "\n[通知] issue 评论只用 task-record.py note，发前按 ~/.hwf/protocol/communication.md「通知模式」「发布入口」核对；"
     "落实完用户中途提问或修改指令并再次停下等待前，须发 --kind answer 回报结果。"
@@ -418,14 +419,16 @@ class Inbox:
     def scheduler_params(self, description: str) -> tuple[str, str, str]:
         """从 issue 描述读 `/model <模型>`、`/thinking <强度>` 行，返回 (模型, 思考强度, 错误说明)。
 
-        模型必须是 omp 能找到的唯一模型（完整 selector 如 jc-gpt/gpt-6.1-sol，或唯一的模型 id）；思考强度必须
-        是该模型支持的档位（没写模型时按 omp 通用档位检查）。写错时返回错误说明，不猜。
+        当调度者工具为 omp 时，用 `omp models find` 精确核验模型与可选思考档位；
+        若在 roles.yaml 中把调度者切换为其他工具，则按通用思考档位核验并透传模型名。
         """
         found = {m.group(1).lower(): m.group(2) for line in (description or "").splitlines()
                  if (m := PARAM_LINE.match(line))}
         model, thinking = found.get("model", ""), found.get("thinking", "").lower()
         levels: Sequence[str] = THINKING_LEVELS
-        if model:
+        sched_role = RC.resolve_team_role("scheduler", hwf_home=HWF_HOME) or {}
+        sched_tool = str(sched_role.get("tool") or "omp").strip().lower()
+        if model and sched_tool == "omp":
             result = self._exec(["omp", "models", "find", model, "--json"])
             if result.returncode != 0:
                 raise InboxError(f"omp models find failed: {result.stderr.strip()}")
@@ -1305,7 +1308,7 @@ class Inbox:
                 return
             text = (f"[GitLab 收件箱] ~/.hwf 的协议、成员 skill 或角色配置有更新（{old[:8]} → {rev[:8]}），你启动时读的是旧版。"
                     f"当前这一步告一段落后，运行 `git -C ~/.hwf diff {old} {rev} -- {' '.join(PROTOCOL_PATHS)}` 看改了什么，"
-                    "之后按新规则继续本交付（涉及 herdr/ 角色变更时，下次派该角色前运行 member-start.py 切换到最新配置；STATE 需补字段一并补上）。这条提醒不用发评论。")
+                    "之后按新规则继续本交付（涉及 roles.yaml / herdr/ 角色变更时，下次派该角色前运行 member-start.py 切换到最新配置；STATE 需补字段一并补上）。这条提醒不用发评论。")
             delivered = True
             for pane in panes:
                 if not self.prompt(pane, text):
@@ -1571,7 +1574,7 @@ def watched_scripts(base_dir: Path | None = None) -> tuple[Path, ...]:
         root / name
         for name in (
             "gitlab-inbox.py", "gitlab_projects.py", "find-scheduler.py", "proactive.py",
-            "retrospect.py", "jev_client.py", "jev_gates.py", "poll_backoff.py",
+            "retrospect.py", "jev_client.py", "jev_gates.py", "poll_backoff.py", "role_config.py",
         )
     )
 

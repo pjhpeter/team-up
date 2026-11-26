@@ -17,13 +17,16 @@ else
   echo "[已有]   gitlab-inbox.local.json"
 fi
 
-# 2. Herdr 插件的角色配置：指向仓库里的 herdr/config.yaml
+# 2. Herdr 插件的角色配置：先按统一总表 roles.yaml 同步生成 herdr/config.yaml，再链接给 Herdr
+if [ -f "$HWF/roles.yaml" ] && python3 -c 'import yaml' 2>/dev/null; then
+  python3 "$HWF/scripts/role_config.py" sync
+fi
 dir=$(herdr plugin config-dir herdr-workflows 2>/dev/null || echo "$HOME/.config/herdr/plugins/config/herdr-workflows")
 mkdir -p "$dir"
 target="$dir/config.yaml"
 src="$HWF/herdr/config.yaml"
 if grep -q "/Users/pengjiahui/.hwf" "$src" && [ "$HOME" != "/Users/pengjiahui" ]; then
-  # 别人的机器：路径不同，复制一份并替换路径（以后改了仓库要重跑本脚本）
+  # 别人的机器且未装 PyYAML 无法 sync：复制一份并替换路径
   [ -e "$target" ] && [ ! -L "$target" ] && cp -p "$target" "$target.bak-$(date +%Y%m%d%H%M%S)"
   rm -f "$target"
   sed "s#/Users/pengjiahui/.hwf#$HWF#g" "$src" > "$target"

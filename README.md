@@ -23,15 +23,16 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `protocol/` | 七个主题：调度、沟通、规划、实现、评审测试、交付、工作树；进入对应阶段时再读 |
 | `skills/` | 成员干活的具体做法（install.sh 链接到 `~/.agents/skills/` 和 `~/.claude/skills/`，不走团队流程时也能用）：`acceptance-test-cases` 写和评测试用例，`test-first-evidence` 测试先行留证与实现前核验，`scoped-code-review` 限定范围的代码评审与回改核验，`real-browser-acceptance` 真实浏览器或桌面验收、过程录屏与附件上传、服务清理。协议管何时做、谁做、出口，skill 管怎么做 |
 | `workflows/team-up.yaml` | Herdr 启动团队的入口 |
-| `herdr/config.yaml` | 各角色用什么工具、什么模型（install.sh 把 Herdr 插件配置链接到这里） |
-| `herdr/droid-arch.json` | 备用 droid 会话配置（架构师现已改用 `agy` + `gemini-4-neon-xhigh`；留存供交互式 droid 参考） |
+| `roles.yaml` | **全部角色的唯一配置源**：统一配置 11 个交付团队成员（`team`）和 4 个后台服务（`services`：`secretary`、`proactive`、`retrospect`、`typesafe`）的 CLI 工具、模型与思考强度；外围服务修改后免重启热生效，交付团队改完运行 `python3 ~/.hwf/scripts/role_config.py sync` 同步到 `herdr/config.yaml`（可用 `role_config.py show` 一键总览、`check` 校验同步） |
+| `herdr/config.yaml` | 由 `roles.yaml` 自动生成的 Herdr 插件配置（请勿手工编辑；`install.sh` 自动先同步再把 Herdr 插件配置链接到这里） |
+| `herdr/droid-arch.json` | 备用 droid 会话配置（架构师现已改用 `agy` + `gemini-4-neon-xhigh`；若在 `roles.yaml` 把任意角色切为 `droid`，`role_config.py sync` 会自动托管生成对应 `herdr/droid-<role>.json`） |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
 | `scripts/` | 跨项目发现与仓库自动克隆公共模块（`gitlab_projects.py`：全量非归档项目发现、缓存、自动 clone 与路径持久化）、收件箱（支持跨全部非归档项目监听本人与机器人的指派与 @、对话模式自然语言开工识别、过期跟进单定期修剪与超长空闲调度者会话自动轮转）、飞书桥（含跨项目议题关联、14 天静默话题自动归档与发言自动恢复）、常驻轮询瞬时断网退避与去重（`poll_backoff.py`）、TypeSafe Jev 公共客户端（`jev_client.py`：概率决策、钥匙串读密与图片尺寸自动归一化）、Jev 规则库与遥测演进引擎（`jev_gates.py`：读取 `jev-gates.json`、记录滚动遥测 `state/jev-gates.jsonl`、校验红线并自动演进清单）、团队铁律语义预检（`semantic-lint.py`：进代码评审前按动态清单并行扫描红线与提示项）、周期复盘（`retrospect.py`：含可勾选待办复制与核心四问自检 HTML）、主动接活（`proactive.py`：仅面向 GitLab 全量非归档项目，Jev 概率初筛 + 大模型研判 + `auto` 只读分析回帖 + 可点选批量标注 HTML 报告）、找调度者、按角色领取与跨目录复用成员（`member-start.py`，同步回收同单各角色多余空闲副本窗格）、成员监听与静默屏幕排障（`member-wait.py`）、阶段中释放空闲成员（`member-release.py`，支持待上线与长时阻塞前 `--all-idle` 释放空闲成员及已退回命令行的本单空壳窗格）、测试账号分配与套餐标签筛选（`test-account.py`：支持 `free`/`paid`/`plus-trial`/`region:*` 标签筛选、`pool` 脱敏总览与 `tag` 状态标注）、测试浏览器脱敏自动登录（`test-browser.py`：支持独立 Chrome profile 与 `ego-browser` 空间脱敏注入）、给调度者 tab 起名、成员收尾、上传方案和测试用例为 snippet 并回读核对（`upload-snippet.py`）、统一轻量录屏（`test-record.py`：网页 `ego-browser` 与 Electron 单窗口输出 `.mp4`）、测试录屏与截图上传 GitLab 附件并做空白废片/明文密码视觉拦截与回读核对（`upload-media.py`）、任务记录与评论（`task-record.py`：写 INDEX 行、STATE 顶部与进入等待态前未答用户留言核对、长记录自动归档 `STATE-history.md`、`brief-html` 一键生成 30 秒恢复现场与核心四问交互 HTML、按通知模式发评论、拦截敏感凭据外泄与长文未先写结论、拦截交卷评论缺失或折叠藏匿的逐条验收录屏对账表、请用户同意前自查权限、核对架构师的需求理解卡是否写全、核对汇总分支完整性 `release-check`）、交付收尾（`wrapup.py`：核对未答用户留言、关成员、删本单与跨仓登记 worktree、发收尾回执、写 INDEX）、跨仓库清理过期临时目录与干净陈旧 worktree（`clean-tmp.py`）、新项目接入等脚本 |
 | `templates/project/` | 新项目接入时写进仓库的文件模板 |
 | `omp-extensions/` | omp 扩展：记录守卫拦下调度者手改 INDEX、直接用 glab 发评论、裸调 `herdr agent wait` 及超 2500 字的超长派活命令；监听守卫拦下未挂 `member-wait.py` 的本团队活跃成员（install.sh 链接到 `~/.omp/agent/extensions/`） |
 | `tests/` | 脚本的单元测试，CI 每次推送都跑 |
-| `gitlab-inbox.config.json` | 收件箱共用配置：省略或清空 `projects` 时动态覆盖机器人可访问的全部非归档项目（也可显式指定列表），配置白名单、开关标签、轮询间隔；`proactive` 段是 GitLab 主动接活配置，`retrospect` 段是周二/周五中午周期复盘配置，`typesafe` 段是 TypeSafe Jev（`jev-1.14.0`）模型与钥匙串服务名配置（未配密钥时各关卡自动回退原确定性规则与大模型流程） |
+| `gitlab-inbox.config.json` | 收件箱共用配置：省略或清空 `projects` 时动态覆盖机器人可访问的全部非归档项目（也可显式指定列表），配置白名单、开关标签、轮询间隔；`proactive` 段是 GitLab 主动接活运行参数，`retrospect` 段是周二/周五中午周期复盘定时参数，`typesafe` 段是 TypeSafe Jev 钥匙串服务名配置（各服务的工具、模型与思考强度统一在 `roles.yaml` 管理；未配密钥时各关卡自动回退原确定性规则与大模型流程） |
 | `jev-gates.json` | Jev 五道决策关卡的阈值与关卡 4/5 检查清单（按文件 mtime 自动热加载，免重启生效；安全与授权红线标 `protected: true` 锁死，其余常规项由周期复盘在数据达标并通过单测后自动新增、调优或淘汰） |
 | `proactive-rules.md` | 主动接活的规则：什么情况 → 做什么，每条规则单独一档 |
 
@@ -77,7 +78,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | 每小时巡检 | 有变化或异常（等你处理、已待上线但调度者没 @你 请求授权合并、调度者卡住或退出、超过 3 小时没动静）才汇报，没变化不发；同时等你拍板或确认上线的需求达到 3 个及以上时，在顶部提醒先集中批处理完再开新任务 |
 | 快速回复 | 对某条转达点「回复」，机器人知道你指的是哪张任务；提问就回答，指令或补充才转交，`/go` 等显式命令仍可直接发 |
 | 替你传话 | 说「告诉 484 和 488，测试环境已恢复，继续工作」，秘书分别在对应 issue 下 @Agent 留言，并合并回报每项结果；不同任务的指令分别转交，不会混发。部分未完成可回复「重试未完成项」，已成功项不会重复发送；发送结果不明时先核对任务评论，不盲目重发 |
-| 回答提问 | 发「进度」看总览，发「帮助」看用法；目标已确定的单任务回复优先经 Jev 秒级快转直达对应调度者，新建、批量、追问与其余总览提问走秘书模型（`feishu-bridge.local.json` 的 `secretary.model`、`thinking`） |
+| 回答提问 | 发「进度」看总览，发「帮助」看用法；目标已确定的单任务回复优先经 Jev 秒级快转直达对应调度者，新建、批量、追问与其余总览提问走秘书模型（统一在 `roles.yaml` 的 `services.secretary` 配置，修改后免重启热生效；也可在 `feishu-bridge.local.json` 的 `secretary` 段做本机覆盖） |
 
 「需求：…」、`#编号` 和 `/go` 仍是快捷方式，不是必填格式。各需求自己的话题照常保留（默认免打扰），想看某个需求的完整经过去话题里看。自然语言开工不包含上线、合并 main 或其他原本需要单独授权的操作。
 
@@ -87,7 +88,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 ## 主动接活（仅 GitLab，开启 `auto` 只读真接活）
 
-飞书群主动观察已禁用；GitLab 主动接活开启 `auto` 档。收件箱每 10 分钟扫描机器人可访问的**全部非归档 GitLab 项目**，针对「指派给本人/机器人或 `@` 了本人/机器人且创建满 2 小时仍未处理的 issue」以及「由本人或机器人触发/合并的 `main` / `release-*` 失败流水线」，先经 Jev 概率初筛，命中候选再按 `proactive-rules.md` 交大模型逐条研判。命中 `auto` 规则后，按需自动克隆缺失仓库，调用只读工具（`omp --tools read,grep,find,ls`）完成排查并把中文结论直接写回对应 GitLab issue / MR 评论；**改代码、建分支仍严格等待白名单用户发 `/go`**。
+飞书群主动观察已禁用；GitLab 主动接活开启 `auto` 档。收件箱每 10 分钟扫描机器人可访问的**全部非归档 GitLab 项目**，针对「指派给本人/机器人或 `@` 了本人/机器人且创建满 2 小时仍未处理的 issue」以及「由本人或机器人触发/合并的 `main` / `release-*` 失败流水线」，先经 Jev 概率初筛，命中候选再按 `proactive-rules.md` 交大模型逐条研判。命中 `auto` 规则后，按需自动克隆缺失仓库，调用 `roles.yaml` 的 `services.proactive` 对应工具以只读模式完成排查并把中文结论直接写回对应 GitLab issue / MR 评论；**改代码、建分支仍严格等待白名单用户发 `/go`**。
 
 | 要做的事 | 怎么做 |
 | --- | --- |
@@ -101,7 +102,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 ## 周期复盘（每周二、周五 12:00）
 
 **问题**：日常一单接一单往前赶，像退群后还在空转拉消息、成员窗口和临时目录越积越多、状态记事本越写越厚这类慢性损耗，不集中翻账很难及时发现。
-**办法**：常驻收件箱在每周二、周五中午 12:00 自动汇总本周期「交付流程、飞书桥、收件箱、Jev 五道决策关卡」的过程历史数据，调用 `droid`（`gemini-4-carbon`，思考 `high`）对照最新规则和脚本只读核查，筛出真有证据支撑的可优化点；同时对 `jev-gates.json` 执行**受保护自动演进**——锁死安全与授权红线（`protected: true` 不可淘汰、不可放宽），而重复出现 ≥2 次的同类评审/验收低级疏漏会自动沉淀为关卡 4/5 提示项，满 30 天且评估 ≥30 次零命中（或高豁免、已被确定性脚本替代）的非红线旧规则会自动淘汰，写入后跑过回归单测才生效并自动同步仓库（单测不过自动回滚）。
+**办法**：常驻收件箱在每周二、周五中午 12:00 自动汇总本周期「交付流程、飞书桥、收件箱、Jev 五道决策关卡」的过程历史数据，按 `roles.yaml` 的 `services.retrospect` 配置（默认 `droid` + `gemini-4-carbon`，思考 `high`）对照最新规则和脚本只读核查，筛出真有证据支撑的可优化点；同时对 `jev-gates.json` 执行**受保护自动演进**——锁死安全与授权红线（`protected: true` 不可淘汰、不可放宽），而重复出现 ≥2 次的同类评审/验收低级疏漏会自动沉淀为关卡 4/5 提示项，满 30 天且评估 ≥30 次零命中（或高豁免、已被确定性脚本替代）的非红线旧规则会自动淘汰，写入后跑过回归单测才生效并自动同步仓库（单测不过自动回滚）。
 **为什么挂在收件箱里**：收件箱本来就常驻在 Herdr 窗格里，随仓库热重载；电脑在中午 12:00 合盖休眠时，72 小时内唤醒会自动补跑当期，不会漏期。
 
 每次跑完做三件事：往飞书秘书私聊窗口发一份精简优化列表与本轮已自动更新的关卡清单、在本机生成单文件图文交互报告 `~/.hwf/state/retrospect-latest.html`（支持勾选「要做 / 调整 / 先不做」一键复制待办指令给 Agent，并附「本周期核心四问自检」）、发一条 `ntfy` 提醒。常驻收件箱与飞书桥的运行日志滚动保存在 `state/gitlab-inbox-events.log` 与 `state/feishu-bridge-events.log`（单个上限 2MB），五道关卡每次判定摘要滚动保存在 `state/jev-gates.jsonl`（上限 4MB）。
@@ -118,6 +119,6 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 1. 在 `~/.hwf` 里建分支：`git switch -c <改什么>`。
 2. 按 `PROTOCOL.md`「规则维护方式」修改对应条款，不追加事故流水账；workflow 用 loader 校验，脚本只跑直接相关的测试文件或用例。
-3. 推送并开 MR，合并后其他电脑 `git -C ~/.hwf pull` 即生效（改了 `herdr/config.yaml` 且不是本人电脑的，再跑一次 `install.sh`）。
+3. 调整任意角色的工具、模型或思考强度时，直接编辑 `~/.hwf/roles.yaml`；若改动了 `team` 段，运行 `python3 ~/.hwf/scripts/role_config.py sync` 同步 `herdr/config.yaml` 并一同提交（其他电脑首次安装或更换环境跑一次 `install.sh` 即可自动同步并建软链）。
 
-协议入口、主题和 skill 在本机更新后，下次读取时生效；收件箱监听 `PROTOCOL.md`、`protocol/` 与 `skills/` 的提交变化并提醒在途调度者。新增 skill 后要再跑一次 `install.sh` 才会链接到各 Agent。常驻的 `gitlab-inbox.py` 与 `feishu-bridge.py` 检测到自身及依赖模块变化且语法检查通过后，会在空闲时自动重新加载（窗格打印 `hot-reloading ...`）；修改本机 JSON 配置仍需在原窗格重启相应进程。
+协议入口、主题、skill 与角色配置在本机更新后，下次读取时生效；收件箱监听 `PROTOCOL.md`、`protocol/`、`skills/`、`roles.yaml` 与 `herdr/` 的提交变化并提醒在途调度者。新增 skill 后要再跑一次 `install.sh` 才会链接到各 Agent。常驻的 `gitlab-inbox.py` 与 `feishu-bridge.py` 检测到自身及依赖模块（含 `role_config.py`）变化且语法检查通过后，会在空闲时自动重新加载（窗格打印 `hot-reloading ...`）；`roles.yaml` 与 `jev-gates.json` 按 mtime 热读，修改后免重启生效；修改本机 JSON 配置仍需在原窗格重启相应进程。

@@ -1,0 +1,128 @@
+# 团队全部角色的统一配置文件（唯一真相源）。
+#
+# 使用方式：
+#   - 交付团队（team 段）：改完后运行 `python3 ~/.hwf/scripts/role_config.py sync` 同步到 `herdr/config.yaml`
+#     （`member-start.py` 会直接读取本文件；同步 `herdr/config.yaml` 供 Herdr 工作流入口与兼容工具读取）。
+#   - 外围服务（services 段）：飞书秘书、GitLab 主动接活、周期复盘、Jev 概率关卡均按文件修改时间热读，
+#     修改后免重启即时生效。
+#   - 查看全部角色生效参数：`python3 ~/.hwf/scripts/role_config.py show`
+#
+# 字段说明：
+#   tool: 执行工具
+#         - team 成员支持：codex / agy / omp / claude / droid / pi
+#         - services 后台推理支持：omp / droid / codex / agy / claude
+#         - services.typesafe 固定使用：typesafe
+#   model: 模型标识（scheduler 留空表示跟随发起会话模型；其余角色必填）
+#   thinking: 思考强度（off / minimal / low / medium / high / xhigh / max / auto；留空用默认）
+#   auto_compact_tokens: 可选，自动压缩上下文词元阈值（如 codex / claude）
+#   omp_config: 可选，omp 叠加配置文件路径
+#   settings_file: 可选，交互式 droid 自定义 --settings JSON 路径（不写时由 sync 自动托管生成）
+#   timeout_s: 可选，无头后台服务单次调用超时秒数
+#   yolo: 可选，是否跳过审批（team 默认 true）
+#   extra_args: 可选，附加原始命令行参数列表
+
+default_profile: scheduler
+
+team:
+  # 调度者：默认不固定模型与思考档，按用户发起工作流时的当前会话模型运行；
+  # 仅叠加提前压缩与禁弹框配置（scheduler-omp.yml）。
+  scheduler:
+    tool: omp
+    model: null
+    thinking: null
+    omp_config: ~/.hwf/scheduler-omp.yml
+
+  # 架构师：复杂度判定、独立方案评审、关键取舍、风险终审与最终验收；不编写方案。
+  arch:
+    tool: agy
+    model: gemini-4-neon-xhigh
+    thinking: xhigh
+
+  # 方案作者：技术方案初稿、逐文件改动、回滚与验证表、评审回改；不签发不自审。
+  arch-lite:
+    tool: codex
+    model: gpt-6.2-astra
+    thinking: medium
+    auto_compact_tokens: 200000
+
+  # 开发者（不分前后端的仓库）
+  dev:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: medium
+    auto_compact_tokens: 200000
+
+  # 前端开发者
+  dev-fe:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: medium
+    auto_compact_tokens: 200000
+
+  # 后端开发者
+  dev-be:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: medium
+    auto_compact_tokens: 200000
+
+  # 测试用例作者
+  test-writer:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: high
+    auto_compact_tokens: 200000
+
+  # 自动化测试与真机/浏览器验收
+  test:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: medium
+    auto_compact_tokens: 200000
+
+  # 需要访问 herdr socket 的验证角色
+  test-herdr:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: low
+    auto_compact_tokens: 200000
+
+  # 双层评审辅审：机械取证、候选问题清单，不输出通过结论
+  precheck:
+    tool: codex
+    model: gpt-6.2-astra
+    thinking: low
+    auto_compact_tokens: 200000
+
+  # 代码评审与测试用例终审
+  code-review:
+    tool: codex
+    model: gpt-6.2-astra
+    thinking: medium
+    auto_compact_tokens: 200000
+
+services:
+  # 飞书秘书：私聊/群聊自然语言意图分类与无目标问答
+  secretary:
+    tool: omp
+    model: jc-gpt/gpt-6-luna
+    thinking: medium
+    timeout_s: 120
+
+  # GitLab 主动接活：事件分诊与 auto 档只读代码分析
+  proactive:
+    tool: omp
+    model: jc-gpt/gpt-6-luna
+    thinking: medium
+
+  # 周期复盘（每周二/周五 12:00）：汇总过程数据与规则库自动演进
+  retrospect:
+    tool: droid
+    model: gemini-4-carbon
+    thinking: high
+    timeout_s: 600
+
+  # TypeSafe Jev 概率决策模型（五道决策关卡）
+  typesafe:
+    tool: typesafe
+    model: jev-1.14.0

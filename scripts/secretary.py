@@ -77,7 +77,7 @@ NOTE_CAP = 400
 STATUS_TEXT = {"working": "正在干活", "idle": "空闲", "done": "空闲", "blocked": "卡在确认界面", "unknown": "状态不明"}
 ROLE_TEXT = {"arch": "架构师", "arch-lite": "方案作者", "precheck": "取证", "code-review": "代码评审", "test-writer": "写用例",
              "test": "测试", "test-herdr": "测试", "dev": "开发", "dev-fe": "前端开发", "dev-be": "后端开发"}
-DEFAULT_MODEL = {"model": "jc-gpt/gpt-6-luna", "thinking": "medium", "timeout_s": 120}
+DEFAULT_MODEL = {"tool": "omp", "model": "jc-gpt/gpt-6-luna", "thinking": "medium", "timeout_s": 120}
 
 INTRO = (
     "以后我也是你的秘书，所有在跑的需求都在这个窗口跟进：\n"
@@ -109,6 +109,7 @@ _GP = _load("gitlab_projects", "gitlab_projects.py")
 _INTENT = _load("hwf_task_intent", "task_intent.py")
 _JC = _load("jev_client", "jev_client.py")
 _JG = _load("jev_gates", "jev_gates.py")
+_RC = _load("role_config", "role_config.py")
 
 JEV_RELAY_PROB_MIN = 0.80
 JEV_AUTH_NOW_MIN = 0.85
@@ -145,14 +146,24 @@ class Secretary:
         self.state.setdefault("recent", [])   # 最近转达的摘要，回答提问时当材料
         self.state.setdefault("announced", {})  # 已推送到飞书的新登记提醒：canon URL → event_key
         self.merge_link_forms()
-        cfg = dict(DEFAULT_MODEL)
-        cfg.update(bridge.cfg.get("secretary") or {})
-        self.cfg = cfg
+        self._explicit_cfg: dict[str, Any] = dict(bridge.cfg.get("secretary") or {})
+        self.cfg = self.effective_model_cfg()
         bridge_cfg = getattr(bridge, "cfg", None) or {}
         self.jev = getattr(bridge, "jev", None) or _JC.JevClient(
             bridge_cfg.get("typesafe") if "typesafe" in bridge_cfg else None
         )
         self.intent_error: str | None = None
+
+    def effective_model_cfg(self) -> dict[str, Any]:
+        """每次调用前热读 roles.yaml 的 services.secretary，本地显式覆盖优先，修改后免重启生效。"""
+        cfg = _RC.resolve_service_role(
+            "secretary",
+            overrides=self._explicit_cfg,
+            defaults=DEFAULT_MODEL,
+            hwf_home=self.home,
+        )
+        self.cfg = cfg
+        return cfg
 
     def ref(self, project: str, iid: int) -> str:
         return _GP.format_issue_ref(project, iid, getattr(self.bridge, "project", ""))
@@ -949,15 +960,23 @@ class Secretary:
 
     def ask_model(self, material: str) -> Optional[str]:
         self.intent_error = None
-        # 沿用秘书既有的只读工具权限：当前模型通道在 --no-tools 下会返回空响应。
-        # 分类提示禁止工具，下面还会拒绝任何实际使用过工具的分类结果。
-        tools = ["--tools", "read"]
-        cmd = ["omp", "-p", "--model", self.cfg["model"], "--thinking", self.cfg["thinking"], "--no-session",
-               "--mode", "json", *tools, "--no-context-files", "--no-skills", "--no-rules",
-               "--no-extensions", "--no-lsp", "--system-prompt",
-               _INTENT.INTENT_PROMPT, material]
+        cfg = self.effective_model_cfg()
+        tool = str(cfg.get("tool") or "omp").strip().lower()
         try:
-            r = self.bridge.run(cmd, capture_output=True, text=True, timeout=int(self.cfg["timeout_s"]),
+            cmd = _RC.build_headless_command(
+                tool,
+                model=str(cfg.get("model") or ""),
+                thinking=str(cfg.get("thinking") or ""),
+                prompt=material,
+                system_prompt=_INTENT.INTENT_PROMPT,
+                mode="no_tools",
+                extra_args=cfg.get("extra_args") or (),
+            )
+        except _RC.RoleConfigError:
+            self.intent_error = "start_error"
+            return None
+        try:
+            r = self.bridge.run(cmd, capture_output=True, text=True, timeout=int(cfg["timeout_s"]),
                                 check=False, stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:
             self.intent_error = "timeout"
@@ -971,45 +990,11 @@ class Secretary:
         if r.returncode != 0:
             self.intent_error = "process_exit"
             return None
-        reply = ""
-        for line in (r.stdout or "").splitlines():
-            try:
-                ev = json.loads(line)
-            except ValueError:
-                self.intent_error = "invalid_event"
-                return None
-            if isinstance(ev, dict) and ev.get("type") in (
-                "tool_execution_start", "tool_execution_end",
-            ):
-                self.intent_error = "tool_used"
-                return None
-            if not isinstance(ev, dict) or not isinstance(ev.get("type"), str):
-                self.intent_error = "invalid_event"
-                return None
-            if ev["type"] != "turn_end":
-                continue
-            message = ev.get("message")
-            if not isinstance(message, dict):
-                self.intent_error = "invalid_event"
-                return None
-            if message.get("stopReason") not in (None, "stop"):
-                self.intent_error = "interrupted_turn"
-                return None
-            content = message.get("content")
-            if not isinstance(content, list) or any(
-                    not isinstance(c, dict) or not isinstance(c.get("type"), str) for c in content):
-                self.intent_error = "invalid_event"
-                return None
-            if any(c.get("type") in {"toolCall", "tool_use", "tool_call"} for c in content):
-                self.intent_error = "tool_used"
-                return None
-            texts = [c.get("text") for c in content if c.get("type") == "text"]
-            if any(not isinstance(text, str) for text in texts):
-                self.intent_error = "invalid_event"
-                return None
-            reply = "".join(texts)
-        if not reply.strip():
-            self.intent_error = "empty_response"
+        reply, _usage, err = _RC.parse_headless_output(
+            tool, r.stdout or "", mode="no_tools", forbid_tools=True
+        )
+        if err is not None or not reply:
+            self.intent_error = err or "empty_response"
             return None
-        return reply.strip()
+        return reply
 

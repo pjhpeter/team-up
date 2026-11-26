@@ -20,6 +20,11 @@ import urllib.error
 import urllib.request
 import uuid
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+import role_config as RC
+
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 DEFAULT_BASE_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_MODEL = "jev-1.14.0"
@@ -445,10 +450,11 @@ def default_http_transport(url: str, body: bytes, headers: Mapping[str, str], ti
 
 
 def load_local_typesafe_config(home: Path = HWF_HOME) -> dict[str, Any]:
-    """合并本机 local 配置中的 typesafe 段；未写配置时沿用官方默认参数与默认钥匙串项。"""
+    """合并 roles.yaml 的 services.typesafe 与本机 local 配置；未写配置时沿用官方默认参数与默认钥匙串项。"""
+    role_cfg = RC.resolve_service_role("typesafe", defaults={"model": DEFAULT_MODEL}, hwf_home=home)
     merged: dict[str, Any] = {
         "base_url": DEFAULT_BASE_URL,
-        "model": DEFAULT_MODEL,
+        "model": str(role_cfg.get("model") or DEFAULT_MODEL).strip(),
         "timeout_s": DEFAULT_TIMEOUT_S,
         "retries": DEFAULT_RETRIES,
         "api_key_keychain": {"service": "typesafe-jev-api", "account": "default"},
@@ -479,12 +485,19 @@ class JevClient:
         transport: Optional[Transport] = None,
         key_loader: Optional[KeyLoader] = None,
         sleep_fn: Callable[[float], None] = time.sleep,
+        hwf_home: Optional[Path] = None,
     ) -> None:
         # 单元测试未注入假 transport/显式配置时禁止隐式读取本机真实钥匙串打外网，保证离线回归确定性。
         isolated_unittest = config is None and transport is None and key_loader is None and _running_under_unittest()
-        cfg = {} if isolated_unittest else dict(load_local_typesafe_config() if config is None else config)
+        self._hwf_home = Path(hwf_home) if hwf_home is not None else HWF_HOME
+        self._explicit_model = str(config.get("model") or "").strip() if isinstance(config, Mapping) else ""
+        cfg = {} if isolated_unittest else dict(load_local_typesafe_config(self._hwf_home) if config is None else config)
         self.base_url = str(cfg.get("base_url") or DEFAULT_BASE_URL).strip()
-        self.model = str(cfg.get("model") or DEFAULT_MODEL).strip()
+        if not self._explicit_model and not isolated_unittest:
+            role_cfg = RC.resolve_service_role("typesafe", defaults={"model": DEFAULT_MODEL}, hwf_home=self._hwf_home)
+            self.model = str(cfg.get("model") or role_cfg.get("model") or DEFAULT_MODEL).strip()
+        else:
+            self.model = str(cfg.get("model") or DEFAULT_MODEL).strip()
         self.timeout_s = float(cfg.get("timeout_s") or DEFAULT_TIMEOUT_S)
         self.retries = max(int(cfg.get("retries", DEFAULT_RETRIES)), 0)
         self._explicit_key = str(cfg.get("api_key") or "").strip()
@@ -495,6 +508,14 @@ class JevClient:
         self._transport = transport or default_http_transport
         self._key_loader = key_loader or load_keychain_secret
         self._sleep = sleep_fn
+
+    def _effective_model(self, override: Optional[str] = None) -> str:
+        if override:
+            return override
+        if self._explicit_model or self._isolated_unittest:
+            return self.model
+        role_cfg = RC.resolve_service_role("typesafe", defaults={"model": self.model}, hwf_home=self._hwf_home)
+        return str(role_cfg.get("model") or self.model).strip()
 
     def _resolve_api_key(self) -> str:
         if self._isolated_unittest:
@@ -565,7 +586,7 @@ class JevClient:
                     final_state = {"value": state, "_attached_images": missing}
 
         payload: dict[str, Any] = {
-            "model": model or self.model,
+            "model": self._effective_model(model),
             "state": final_state,
             "questions": q_payload,
         }

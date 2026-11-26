@@ -33,6 +33,7 @@ _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 import jev_gates as JG
+import role_config as RC
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 INBOX_CONFIG_PATH = HWF_HOME / "gitlab-inbox.config.json"
@@ -47,7 +48,9 @@ DEFAULTS: dict[str, Any] = {
     "catchup_max_hours": 72,      # 合盖休眠唤醒后 72 小时内自动补跑本期
     "default_lookback_days": 3.5, # 无上次运行时间时默认回看 3.5 天
     "max_lookback_days": 14.0,
+    "tool": "droid",
     "model": "gemini-4-carbon",
+    "thinking": "high",
     "reasoning_effort": "high",
     "model_timeout_s": 600,
     "max_attempts_per_slot": 3,
@@ -946,9 +949,11 @@ def render_html_report(
     generated_at: float,
     *,
     gate_evolution: Optional[Mapping[str, Any]] = None,
+    model_label: Optional[str] = None,
 ) -> str:
     e = html.escape
     win = digest["window"]
+    model_label_text = model_label or "droid (gemini-4-carbon, high)"
     items: Sequence[Mapping[str, str]] = analysis["items"]
     evo = gate_evolution or {"applied": [], "rejected": []}
     applied_list = list(evo.get("applied") or [])
@@ -1118,6 +1123,7 @@ def render_html_report(
     return HTML_TEMPLATE.format(
         period=e(period_text),
         when=e(fmt_local(generated_at)),
+        model_label=e(model_label_text),
         headline=e(analysis["headline"]),
         problem=e(analysis["problem_plain"]),
         solution=e(analysis["solution_plain"]),
@@ -1316,7 +1322,7 @@ code {{ font: 12px ui-monospace, Menlo, monospace; background: var(--tag-bg); pa
 <body>
 <main>
   <h1>Herdr 交付链路周期复盘</h1>
-  <p class="sub">统计周期：{period} · 生成于 {when} · 分析模型：droid (gemini-4-carbon, high)</p>
+  <p class="sub">统计周期：{period} · 生成于 {when} · 分析模型：{model_label}</p>
 
   <div class="box headline"><b>一句话结论</b>{headline}</div>
 
@@ -1516,17 +1522,52 @@ class Retrospect:
         send_ntfy_fn: Optional[Callable[[str, str], bool]] = None,
     ) -> None:
         self.raw_config = config
-        self.cfg = {**DEFAULTS, **dict(config.get("retrospect") or {})}
+        self._explicit_retrospect_overrides = dict(config.get("retrospect") or {})
         self.files = files or Files()
         self.run = run
         self.now = now
-        self.hwf_home = hwf_home
+        self.hwf_home = Path(hwf_home)
+        self.cfg = RC.resolve_service_role(
+            "retrospect",
+            overrides=self._explicit_retrospect_overrides,
+            defaults=DEFAULTS,
+            hwf_home=self.hwf_home,
+        )
         self._send_ntfy_fn = send_ntfy_fn
         self.state = self.files.load_state()
         for k, default in (("last_slot", ""), ("last_run_at", 0.0), ("attempts", {}), ("pending_notify", None)):
             self.state.setdefault(k, default)
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
+
+    def effective_model_cfg(self) -> dict[str, Any]:
+        """热读 roles.yaml 的 services.retrospect，并与显式配置覆盖合并（保留运行期对 self.cfg 的修改）。"""
+        merged = dict(self.cfg)
+        role_cfg = RC.resolve_service_role(
+            "retrospect",
+            overrides=self._explicit_retrospect_overrides,
+            defaults=DEFAULTS,
+            hwf_home=self.hwf_home,
+        )
+        for key in ("tool", "model", "thinking", "reasoning_effort", "extra_args"):
+            if key in role_cfg:
+                merged[key] = role_cfg[key]
+            else:
+                merged.pop(key, None)
+        raw_role = RC.resolve_service_role("retrospect", hwf_home=self.hwf_home)
+        for key, value in raw_role.items():
+            if key not in self._explicit_retrospect_overrides and key not in (
+                "tool", "model", "thinking", "reasoning_effort", "extra_args"
+            ):
+                merged[key] = value
+        return merged
+
+    def _model_label(self, cfg: Optional[Mapping[str, Any]] = None) -> str:
+        cur = cfg or self.effective_model_cfg()
+        tool = str(cur.get("tool") or "droid")
+        model = str(cur.get("model") or "")
+        thinking = str(cur.get("thinking") or cur.get("reasoning_effort") or "")
+        return f"{tool} ({model}, {thinking})" if thinking else f"{tool} ({model})"
 
     def tick_in_background(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1627,6 +1668,7 @@ class Retrospect:
         prompt_path = self.files.cwd / "prompt.txt"
         prompt_path.write_text(prompt_text)
 
+        active_cfg = self.effective_model_cfg()
         raw = self.ask_droid(prompt_path)
         analysis = parse_analysis_json(raw)
 
@@ -1651,7 +1693,13 @@ class Retrospect:
         self.files.reports_dir.mkdir(parents=True, exist_ok=True)
         stamp = datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d-%H%M")
         report_path = self.files.reports_dir / f"retrospect-{stamp}.html"
-        html_doc = render_html_report(digest, analysis, now_ts, gate_evolution=gate_evolution)
+        html_doc = render_html_report(
+            digest,
+            analysis,
+            now_ts,
+            gate_evolution=gate_evolution,
+            model_label=self._model_label(active_cfg),
+        )
         report_path.write_text(html_doc)
         self.files.latest_report.write_text(html_doc)
 
@@ -1701,30 +1749,44 @@ class Retrospect:
             "report_path": str(report_path),
         }
 
-    def ask_droid(self, prompt_path: Path) -> str:
-        droid_bin = find_executable("droid", (Path.home() / ".local" / "bin" / "droid",))
-        cmd = [
-            droid_bin,
-            "exec",
-            "-m",
-            str(self.cfg["model"]),
-            "-r",
-            str(self.cfg["reasoning_effort"]),
-            "--cwd",
-            str(self.files.cwd),
-            "-f",
-            str(prompt_path),
-        ]
+    def ask_model(self, prompt_path: Path) -> str:
+        """按 roles.yaml 的 services.retrospect 调用已配置的工具、模型与思考强度执行只读分析。"""
+        cfg = self.effective_model_cfg()
+        tool = str(cfg.get("tool") or "droid").strip().lower()
+        thinking = str(cfg.get("thinking") or cfg.get("reasoning_effort") or "").strip()
+        timeout_s = int(cfg.get("model_timeout_s") or cfg.get("timeout_s") or 600)
         try:
-            res = self.run(
-                cmd, capture_output=True, text=True, timeout=int(self.cfg["model_timeout_s"])
+            cmd = RC.build_headless_command(
+                tool,
+                model=str(cfg["model"]),
+                thinking=thinking,
+                prompt_file=prompt_path,
+                mode="retrospect",
+                cwd=self.files.cwd,
+                extra_args=cfg.get("extra_args") or (),
+                bin_resolver=find_executable,
             )
+        except RC.RoleConfigError as err:
+            raise RetrospectError(str(err)) from err
+        run_kwargs: dict[str, Any] = {"capture_output": True, "text": True, "timeout": timeout_s}
+        # 非 droid 工具走子进程工作目录读取 digest-input.json；droid 自身通过 --cwd 传递。
+        if tool != "droid":
+            run_kwargs["cwd"] = str(self.files.cwd)
+        try:
+            res = self.run(cmd, **run_kwargs)
         except subprocess.TimeoutExpired as err:
-            raise RetrospectError(f"droid exec 超时（>{self.cfg['model_timeout_s']}s）") from err
+            raise RetrospectError(f"{tool} exec 超时（>{timeout_s}s）") from err
         if res.returncode != 0:
             detail = (res.stderr or res.stdout or "").strip()[:300]
-            raise RetrospectError(f"droid exec 退出码 {res.returncode}：{detail}")
-        return res.stdout
+            raise RetrospectError(f"{tool} exec 退出码 {res.returncode}：{detail}")
+        if tool == "droid":
+            return res.stdout
+        text, _usage, parse_err = RC.parse_headless_output(tool, res.stdout or "", mode="retrospect", forbid_tools=False)
+        if parse_err is not None or not text:
+            raise RetrospectError(f"{tool} 返回内容无法解析（{parse_err or 'empty_response'}）")
+        return text
+
+    ask_droid = ask_model
 
     def _flush_pending_notify(self) -> None:
         pending = self.state.get("pending_notify")

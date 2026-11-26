@@ -1591,7 +1591,7 @@ def watched_scripts(base_dir: Optional[Path] = None) -> tuple[Path, ...]:
     root = base_dir or Path(__file__).resolve().parent
     return tuple(root / name for name in (
         "feishu-bridge.py", "gitlab_projects.py", "secretary.py", "task_intent.py", "feishu_topics.py",
-        "jev_client.py", "jev_gates.py", "poll_backoff.py",
+        "jev_client.py", "jev_gates.py", "poll_backoff.py", "role_config.py",
     ))
 
 

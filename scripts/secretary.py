@@ -111,9 +111,10 @@ _JC = _load("jev_client", "jev_client.py")
 _JG = _load("jev_gates", "jev_gates.py")
 _RC = _load("role_config", "role_config.py")
 
-JEV_RELAY_PROB_MIN = 0.80
+JEV_RELAY_PROB_MIN = 0.76
 JEV_AUTH_NOW_MIN = 0.85
 JEV_QUIET_FORWARD_MIN = 0.50
+RECENT_QUESTION_WINDOW_S = 2 * 3600  # 最近 2 小时内向用户提问/发待办的在途单在路由时优先权重更高
 
 
 def _ts(value: Any) -> float:
@@ -387,7 +388,11 @@ class Secretary:
                 issue = self.bridge.api(f"projects/{pid}/issues/{w['iid']}")
                 if issue.get("state") == "closed":
                     continue  # 已关闭的单子不再纳入活跃跟踪
+                issue_labels = list(issue.get("labels") or [])
                 issues[url] = {**w, "title": issue.get("title", "") or w.get("title", ""),
+                               "state": issue.get("state", "opened"),
+                               "labels": issue_labels,
+                               "waiting_user": WAITING_LABEL in issue_labels,
                                "last_note": max([n["id"] for n in notes] or [0]),
                                "last_agent_at": self.bridge.now()}
                 continue  # 第一次看到只记水位，不回放旧评论
@@ -466,9 +471,18 @@ class Secretary:
         fresh = []
         verbose = self.is_verbose(known)
         for n in sorted((n for n in notes if n["id"] > known["last_note"]), key=lambda n: n["id"]):
-            clean_body, _ = strip_kind_tag(n.get("body") or "")
+            clean_body, kind = strip_kind_tag(n.get("body") or "")
             if not n.get("system") and (n.get("author") or {}).get("username") == self.bridge.agent and not RECEIPT.match(clean_body):
-                known["last_agent_at"] = self.bridge.now()
+                now_ts = self.bridge.now()
+                known["last_agent_at"] = now_ts
+                summary_text = FOLDED.sub("", clean_body).strip()
+                if (
+                    kind in ("todo", "risk")
+                    or USER_ACTION_HINT.search(summary_text)
+                    or "?" in summary_text
+                    or "？" in summary_text
+                ):
+                    known["last_question_at"] = now_ts
             if forward and self.should_forward(n, include_users=known.get("private_thread", False), verbose=verbose):
                 fresh.append(n)
             known["last_note"] = n["id"]
@@ -628,9 +642,14 @@ class Secretary:
     def task_line(self, url: str, issue: Mapping[str, Any]) -> str:
         pid = quote(issue["project"], safe="")
         info = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}")
+        all_labels = list(info.get("labels") or [])
+        if isinstance(issue, dict):
+            issue["state"] = info.get("state") or issue.get("state", "")
+            issue["labels"] = all_labels
+            issue["waiting_user"] = WAITING_LABEL in all_labels
         if info.get("state") == "closed":
             return ""
-        labels = [l for l in info.get("labels", []) if l.startswith("状态:")]
+        labels = [l for l in all_labels if l.startswith("状态:")]
         ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
         if issue.get("standby"):
             parts = ["、".join(labels) or "待你发话启动"]
@@ -818,16 +837,132 @@ class Secretary:
                 projects_by_iid.setdefault(iid, set()).add(str(item.get("project") or ""))
         return {iid for iid, projs in projects_by_iid.items() if len(projs) > 1}
 
+    @staticmethod
+    def _is_explicitly_referenced(text: str, iid: int, linked_issue: int | None) -> bool:
+        """判断当前原话或引用回复是否显式点名了指定编号（用于决定是否允许命中已关闭的历史单）。"""
+        if linked_issue == iid:
+            return True
+        if not text or iid <= 0:
+            return False
+        if re.search(rf"https?://[^\s<>()\[\]\"，。；！？]+/-/(?:issues|work_items)/{iid}(?![0-9])", text):
+            return True
+        if re.search(rf"(?<![A-Za-z0-9_./-])[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+#{iid}(?![0-9])", text):
+            return True
+        for match in re.finditer(rf"(?<![0-9A-Za-z_.])#?{iid}(?![0-9A-Za-z_.])", text):
+            token = match.group(0)
+            if token.startswith("#") or not _INTENT._QUANTITY_SUFFIX_RE.match(text[match.end():]):
+                return True
+        return False
+
+    def _task_state_sets(self) -> tuple[set[str], set[str]]:
+        """汇总收件箱与飞书桥里已关闭与仍活跃的任务 URL，避免已关闭旧单混入路由候选。"""
+        inbox = self._inbox_state()
+        active_urls = {canon(u) for u in (inbox.get("origins") or {})}
+        active_urls |= {canon(u) for u in (inbox.get("watched_issues") or {})}
+        closed_urls = {canon(u) for u in (inbox.get("closed_origins") or {})}
+        for thread in (self.bridge.state.get("threads") or {}).values():
+            if not isinstance(thread, Mapping) or not thread.get("project") or not thread.get("iid"):
+                continue
+            url = canon(self.bridge.issue_url(str(thread["project"]), int(thread["iid"])))
+            if thread.get("closed"):
+                closed_urls.add(url)
+            else:
+                active_urls.add(url)
+        return closed_urls, active_urls
+
+    def _is_candidate_closed(self, item: Mapping[str, Any], closed_urls: set[str], active_urls: set[str]) -> bool:
+        if item.get("closed") is True:
+            return True
+        state = str(item.get("state") or "").strip().lower()
+        if state == "closed":
+            return True
+        if state == "opened":
+            return False
+        proj = str(item.get("project") or getattr(self.bridge, "project", "") or "")
+        iid = item.get("iid")
+        if proj and type(iid) is int and iid > 0 and hasattr(self.bridge, "issue_url"):
+            url = canon(self.bridge.issue_url(proj, iid))
+            if url in closed_urls and url not in active_urls:
+                return True
+        return False
+
+    def _prepare_routing_candidates(
+        self,
+        text: str,
+        candidates: list[dict],
+        linked_issue: int | None,
+        recent: list[dict],
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        """路由前剔除未显式点名的已关闭旧单，并为待回复/近期发问的在途单标注优先权重。"""
+        closed_urls, active_urls = self._task_state_sets()
+        known_by_key: dict[tuple[str, int], Mapping[str, Any]] = {}
+        known_by_iid: dict[int, Mapping[str, Any]] = {}
+        for info in self.state.get("issues", {}).values():
+            if not isinstance(info, Mapping) or type(info.get("iid")) is not int:
+                continue
+            proj = str(info.get("project") or getattr(self.bridge, "project", "") or "")
+            known_by_key[(proj, info["iid"])] = info
+            known_by_iid.setdefault(info["iid"], info)
+
+        now_ts = self.bridge.now() if hasattr(self.bridge, "now") else time.time()
+        filtered_candidates: list[dict] = []
+        dropped_closed_iids: set[int] = set()
+        for item in candidates:
+            iid = item.get("iid")
+            explicit = type(iid) is int and self._is_explicitly_referenced(text, iid, linked_issue)
+            if not explicit and self._is_candidate_closed(item, closed_urls, active_urls):
+                if type(iid) is int:
+                    dropped_closed_iids.add(iid)
+                continue
+            filtered_candidates.append(item)
+
+        filtered_recent: list[dict] = []
+        for item in recent:
+            iid = item.get("iid")
+            explicit = type(iid) is int and self._is_explicitly_referenced(text, iid, linked_issue)
+            if not explicit and (
+                (type(iid) is int and iid in dropped_closed_iids)
+                or self._is_candidate_closed(item, closed_urls, active_urls)
+            ):
+                continue
+            filtered_recent.append(item)
+
+        enriched: list[tuple[int, int, dict, dict]] = []
+        for idx, item in enumerate(filtered_candidates):
+            iid = item.get("iid")
+            proj = str(item.get("project") or getattr(self.bridge, "project", "") or "")
+            known = known_by_key.get((proj, iid)) if type(iid) is int else None
+            if known is None and type(iid) is int:
+                known = known_by_iid.get(iid)
+            labels = list(item.get("labels") or (known.get("labels") if known else None) or [])
+            waiting = bool(item.get("waiting_user") or (known and known.get("waiting_user")) or WAITING_LABEL in labels)
+            last_q = float(item.get("last_question_at") or (known.get("last_question_at") if known else 0) or 0)
+            recent_q = bool(last_q > 0 and (now_ts - last_q) <= RECENT_QUESTION_WINDOW_S)
+            ident = {key: item[key] for key in ("iid", "title", "project") if key in item}
+            if waiting:
+                ident["waiting_user"] = True
+            if recent_q:
+                ident["recent_question"] = True
+            if waiting or recent_q:
+                ident["priority"] = "high"
+            # 在途等待用户回复或近期刚发过问句的任务排在前列，降低与无关旧单撞名的概率。
+            rank = 0 if (waiting and recent_q) else (1 if (waiting or recent_q) else 2)
+            enriched.append((rank, idx, item, ident))
+
+        enriched.sort(key=lambda row: (row[0], row[1]))
+        ordered_candidates = [row[2] for row in enriched]
+        ordered_identities = [row[3] for row in enriched]
+        return ordered_candidates, filtered_recent, ordered_identities
+
     def classify_intent(self, text: str, context: str = "", *, candidates: list[dict] | None = None,
                         linked_issue: int | None = None, recent: list[dict] | None = None) -> dict | None:
         """高频明确单任务转交优先由 Jev 毫秒级判定并经 validate_intent 核验；建单/总览/追问/拆批回退 omp。"""
         self.intent_error = None
         # 显式空候选是调用方限制范围，不能回退到秘书的全量登记。
-        candidates = list(self.known_tasks().values()) if candidates is None else candidates
-        recent = [] if recent is None else recent
+        raw_candidates = list(self.known_tasks().values()) if candidates is None else candidates
+        raw_recent = [] if recent is None else recent
+        candidates, recent, identities = self._prepare_routing_candidates(text, raw_candidates, linked_issue, raw_recent)
         ambiguous_issues = self._ambiguous_iids(candidates)
-        identities = [{key: item[key] for key in ("iid", "title", "project") if key in item}
-                      for item in candidates]
         fast = self._fast_relay_with_jev(text, context, candidates=candidates, identities=identities,
                                          linked_issue=linked_issue, recent=recent,
                                          ambiguous_issues=ambiguous_issues)
@@ -873,7 +1008,13 @@ class Secretary:
         for item in identities:
             iid = item.get("iid")
             if type(iid) is int and iid > 0:
-                target_options[str(iid)] = f"Existing task #{iid}: {item.get('title') or ''}"
+                tags: list[str] = []
+                if item.get("waiting_user"):
+                    tags.append("waiting_user")
+                if item.get("recent_question"):
+                    tags.append("recent_question")
+                suffix = f" [ACTIVE PRIORITY: {', '.join(tags)}]" if tags else ""
+                target_options[str(iid)] = f"Existing task #{iid}: {item.get('title') or ''}{suffix}"
         if type(linked_issue) is int and linked_issue > 0 and str(linked_issue) not in target_options:
             target_options[str(linked_issue)] = f"Directly replied-to task #{linked_issue}"
         if not target_options:
@@ -909,7 +1050,8 @@ class Secretary:
                     "or unique task title in `current_message` (numbers used as counts/quantities like '484 samples' "
                     "are NOT issue numbers); (2) `linked_issue` when replying without naming another task; (3) the "
                     "sole task in `recent_tasks` when `current_message` refers to 'that one just now' and "
-                    "`recent_tasks` has length 1."
+                    "`recent_tasks` has length 1; (4) among active tasks, prefer one marked waiting_user or "
+                    "recent_question when the user is answering a pending prompt."
                 ),
                 target_options,
             ),

@@ -268,7 +268,8 @@ class HeadlessAdapterTests(unittest.TestCase):
                 ],
             )
             cmd_omp_ro = RC.build_headless_command("omp", model="m1", prompt="hi", mode="readonly")
-            self.assertIn("read,grep,find,ls", cmd_omp_ro)
+            self.assertIn("read,grep,glob", cmd_omp_ro)
+            self.assertNotIn("read,grep,find,ls", cmd_omp_ro)
 
             # droid
             fake_bin = lambda name, _fb: f"/fake/{name}"

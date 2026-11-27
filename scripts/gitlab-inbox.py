@@ -71,6 +71,7 @@ LOCAL_CONFIG_PATH = HWF_HOME / "gitlab-inbox.local.json"
 STATE_PATH = HWF_HOME / "state" / "gitlab-inbox.json"
 FIND_SCHEDULER = HWF_HOME / "scripts" / "find-scheduler.py"
 RESET_SESSION = HWF_HOME / "scripts" / "reset-session.py"
+CLEAN_TMP = HWF_HOME / "scripts" / "clean-tmp.py"
 
 CMD_TIMEOUT_S = 30
 LAUNCH_TIMEOUT_S = 60
@@ -100,8 +101,12 @@ FOLLOWED_CAP = 100  # 用户 @ 过本账号的非发起 issue，一次 iids[] �
 FOLLOWED_CLOSED_RETENTION_S = 7 * 86400  # 已关闭满 7 天的跟进 issue 自动移出 followed，再次 @ 时会自动接回
 FOLLOWED_PRUNE_INTERVAL_S = 3600  # 低频批量巡检久未更新的已关跟进单
 WATCHED_PRUNE_INTERVAL_S = 60  # 每分钟批量核对非发起 watched_issues，关闭后立刻停推秘书巡检
+CLEAN_TMP_INTERVAL_S = 86400  # 每天低频触发一次 clean-tmp.py，回收过期 tmp 目录与干净/纯缓存卡死的旧 worktree
+CLEAN_TMP_TIMEOUT_S = 120
 MAX_IDLE_SCHEDULER_SESSION_BYTES = 30 * 1024 * 1024  # 完全空闲且无在途任务的调度者会话超过 30MB 时自动轮换
 CLOSED_CAP = 200  # 已关闭的发起 issue 只为“用户重开后接着跟踪”保留，留最近的即可。
+CLOSED_ORIGIN_RETENTION_S = 14 * 86400  # 关闭满 14 天的发起 issue 自动移出重开巡检；之后若重开并 @机器人 仍可接回
+CLOSED_ORIGIN_QUERY_BATCH = 40  # 单次 iids[] 批量上限，防止超长 URL 引发 414 或超时
 # 发起 issue 描述里指定调度者参数的行：`/model jc-gpt/gpt-6.1-sol`、`/thinking high`（2026-10-22 用户指示）。
 PARAM_LINE = re.compile(r"^\s*/(model|thinking)\s+(\S+)\s*$", re.IGNORECASE)
 # 卡住界面的单选题：选项行是「编号.」或「○ ●」开头，光标行前有「❯」等标记；外框「│」先去掉。
@@ -1159,8 +1164,86 @@ class Inbox:
             save_state(self.state)
         return True
 
+    def prune_closed_origins(self, now: float) -> None:
+        """为旧版未记录关闭时间的 closed_origins 补齐时间戳，并剔除关闭满 14 天的旧单避免重开查询膨胀。"""
+        closed: dict[str, Any] = self.state["closed_origins"]
+        if not closed:
+            return
+        changed = False
+        missing_by_proj: dict[str, list[tuple[str, int]]] = {}
+        for url, origin in list(closed.items()):
+            if not isinstance(origin, dict):
+                del closed[url]
+                changed = True
+                continue
+            if "closed_at" not in origin:
+                proj = origin.get("project") or GP.extract_project_from_web_url(url)
+                iid = origin.get("iid")
+                if self.dynamic_projects and proj and isinstance(iid, int) and self.is_project_allowed(proj):
+                    missing_by_proj.setdefault(proj, []).append((url, iid))
+                else:
+                    origin["closed_at"] = now
+                    changed = True
+
+        # 存量未带 closed_at 的历史关闭单仅补查一次真实关闭/更新时间，避免旧单滞留重开巡检。
+        for project, items in missing_by_proj.items():
+            iid_to_urls: dict[int, list[str]] = {}
+            for url, iid in items:
+                iid_to_urls.setdefault(iid, []).append(url)
+            all_iids = sorted(iid_to_urls)
+            for idx in range(0, len(all_iids), CLOSED_ORIGIN_QUERY_BATCH):
+                chunk = all_iids[idx : idx + CLOSED_ORIGIN_QUERY_BATCH]
+                try:
+                    rows = self.api(
+                        f"projects/{quote(project, safe='')}/issues?state=closed&per_page=100"
+                        + "".join(f"&iids[]={iid}" for iid in chunk)
+                    ) or []
+                except InboxError as exc:
+                    log(f"backfill closed_origins failed for {project}: {exc}")
+                    rows = []
+                seen_iids: set[int] = set()
+                for row in rows:
+                    iid = row.get("iid")
+                    if not isinstance(iid, int) or iid not in iid_to_urls:
+                        continue
+                    seen_iids.add(iid)
+                    ts_text = str(row.get("closed_at") or row.get("updated_at") or "").strip()
+                    try:
+                        ts_val = parse_time(ts_text) if ts_text else now
+                    except ValueError:
+                        ts_val = now
+                    for url in iid_to_urls[iid]:
+                        if url in closed:
+                            closed[url]["closed_at"] = ts_val
+                            changed = True
+                for iid in chunk:
+                    if iid not in seen_iids:
+                        for url in iid_to_urls[iid]:
+                            if url in closed and "closed_at" not in closed[url]:
+                                closed[url]["closed_at"] = now
+                                changed = True
+
+        evicted = 0
+        for url, origin in list(closed.items()):
+            try:
+                closed_at = float(origin.get("closed_at"))
+            except (TypeError, ValueError):
+                closed_at = now
+                origin["closed_at"] = now
+                changed = True
+            if now - closed_at >= CLOSED_ORIGIN_RETENTION_S:
+                del closed[url]
+                evicted += 1
+                changed = True
+        if changed:
+            save_state(self.state)
+            if evicted:
+                log(f"pruned {evicted} closed_origins older than {CLOSED_ORIGIN_RETENTION_S // 86400}d")
+
     def track_reopened(self) -> None:
         """把被用户重新打开的发起 issue 接回跟踪（关闭时移到 closed_origins 保留水位）。"""
+        now = time.time()
+        self.prune_closed_origins(now)
         if not self.dynamic_projects:
             for project, repo in self.projects.items():
                 issues = self.api(f"projects/{quote(project, safe='')}/issues?state=opened&assignee_username={self.me}"
@@ -1172,6 +1255,7 @@ class Inbox:
                     origin = self.state["closed_origins"].pop(url, None)
                     if origin is None:
                         continue  # 不是关闭过的发起 issue：新指派交给指派待办处理。
+                    origin.pop("closed_at", None)
                     self.state["origins"][url] = origin
                     save_state(self.state)
                     log(f"origin reopened by user: {url}")
@@ -1184,23 +1268,39 @@ class Inbox:
             iid = origin.get("iid")
             if proj and isinstance(iid, int):
                 by_proj.setdefault(proj, []).append(iid)
+        if not by_proj:
+            if "reopen_since" not in self.state:
+                self.state["reopen_since"] = now
+                save_state(self.state)
+            return
+        since = self.state.get("reopen_since")
+        after_param = ""
+        if isinstance(since, (int, float)) and since > 0:
+            after_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(max(0.0, float(since) - FOLLOW_OVERLAP_S)))
+            after_param = f"&updated_after={quote(after_iso)}"
         for project, iids in by_proj.items():
             if not self.is_project_allowed(project):
                 continue
-            issues = self.api(
-                f"projects/{quote(project, safe='')}/issues?state=opened&per_page=100"
-                + "".join(f"&iids[]={iid}" for iid in sorted(set(iids)))
-            ) or []
-            for issue in issues:
-                url = GP.canon_issue_url(str(issue.get("web_url") or ""))
-                if not url or url in self.state["origins"]:
-                    continue
-                origin = self.state["closed_origins"].pop(url, None)
-                if origin is None:
-                    continue
-                self.state["origins"][url] = origin
-                save_state(self.state)
-                log(f"origin reopened by user: {url}")
+            unique_iids = sorted(set(iids))
+            for idx in range(0, len(unique_iids), CLOSED_ORIGIN_QUERY_BATCH):
+                chunk = unique_iids[idx : idx + CLOSED_ORIGIN_QUERY_BATCH]
+                issues = self.api(
+                    f"projects/{quote(project, safe='')}/issues?state=opened&per_page=100{after_param}"
+                    + "".join(f"&iids[]={iid}" for iid in chunk)
+                ) or []
+                for issue in issues:
+                    url = GP.canon_issue_url(str(issue.get("web_url") or ""))
+                    if not url or url in self.state["origins"]:
+                        continue
+                    origin = self.state["closed_origins"].pop(url, None)
+                    if origin is None:
+                        continue
+                    origin.pop("closed_at", None)
+                    self.state["origins"][url] = origin
+                    save_state(self.state)
+                    log(f"origin reopened by user: {url}")
+        self.state["reopen_since"] = now
+        save_state(self.state)
 
     def poll_origin(self, url: str, origin: dict[str, Any]) -> None:
         base = f"projects/{origin['project_id']}/issues/{origin['iid']}"
@@ -1240,7 +1340,9 @@ class Inbox:
                                       "INDEX 保持 blocked，保留成员与 worktree；测试服务仍按每轮规则清理。"
                                       "只有确认交付完成或用户明确取消后，才执行 §9「成员收尾与收尾回执」。")
             closed: dict[str, Any] = self.state["closed_origins"]
-            closed[url] = self.state["origins"].pop(url)  # 保留水位：用户重开后接着处理关闭后的评论。
+            closed_origin = self.state["origins"].pop(url)
+            closed_origin["closed_at"] = time.time()
+            closed[url] = closed_origin  # 保留水位：用户重开后接着处理关闭后的评论。
             self.state["watched_issues"].pop(GP.canon_issue_url(url), None)
             for stale in list(closed)[:-CLOSED_CAP]:
                 del closed[stale]
@@ -1498,6 +1600,59 @@ class Inbox:
         if changed:
             save_state(self.state)
 
+    def maybe_clean_tmp(self, now: float) -> None:
+        """每天低频执行一次 clean-tmp.py，回收过期任务目录与可安全清理的旧 worktree；任何异常均不影响收件箱。"""
+        last = self.state.get("clean_tmp_last_run")
+        if last is None:
+            self.state["clean_tmp_last_run"] = now
+            save_state(self.state)
+            return
+        if now - float(last) < CLEAN_TMP_INTERVAL_S:
+            return
+        self.state["clean_tmp_last_run"] = now
+        save_state(self.state)
+        if not CLEAN_TMP.is_file():
+            return
+        repo_paths: list[str] = []
+        seen_real: set[str] = set()
+        candidates = list(self.projects.values()) + [
+            str(origin.get("repo")) for origin in self.state["origins"].values() if origin.get("repo")
+        ]
+        for raw in candidates:
+            if not raw:
+                continue
+            p = Path(str(raw))
+            if not (p / ".git").exists():
+                continue
+            real = os.path.realpath(p)
+            if real not in seen_real:
+                seen_real.add(real)
+                repo_paths.append(real)
+        if not repo_paths:
+            return
+        removed_total = 0
+        skipped_summary = ""
+        for idx, repo in enumerate(sorted(repo_paths)):
+            cmd = [sys.executable, str(CLEAN_TMP), repo]
+            if idx > 0:
+                cmd.append("--no-worktrees")  # 首个仓库已跨全量 ~/.herdr/worktrees 扫描，其余只清自身 .hwf/tmp
+            try:
+                res = self._exec(cmd, timeout=CLEAN_TMP_TIMEOUT_S)
+            except Exception as exc:
+                log(f"daily clean-tmp failed for {repo}: {exc!r}")
+                continue
+            out_lines = [line.strip() for line in (res.stdout or "").splitlines() if line.strip()]
+            removed_total += sum(1 for line in out_lines if line.startswith("removed "))
+            for line in out_lines:
+                if line.startswith("skipped worktrees "):
+                    skipped_summary = line
+            if res.returncode != 0:
+                err = (res.stderr or "").strip()[:160]
+                log(f"daily clean-tmp exited {res.returncode} for {repo}: {err}")
+        if removed_total or skipped_summary:
+            suffix = f" ({skipped_summary})" if skipped_summary else ""
+            log(f"daily clean-tmp finished across {len(repo_paths)} repo(s): removed={removed_total}{suffix}")
+
     # ---- 一轮 ----
 
     def poll(self) -> None:
@@ -1528,6 +1683,7 @@ class Inbox:
         self.poll_user_items()
         self.prune_closed_watched(time.time())
         self.rotate_oversized_idle_schedulers()
+        self.maybe_clean_tmp(time.time())
 
 
 def parse_dialog(screen: str) -> dict[str, Any] | None:

@@ -44,7 +44,7 @@ description: 在真实浏览器或 Electron 窗口按验收点做端到端自动
   1. **核对同站点并发**：本地专属端口按 `origin` 天然隔离可直接切换；共享测试域名先查 `listTaskSpaces()` 中其他活跃空间的标签页 URL（团队任务同时查 `python3 ~/.hwf/scripts/test-account.py list` 是否有其他在途任务正持有同站点账号），确认没有其他任务正在使用同一测试域名。若同一测试域名正被其他在途任务使用，报并发占用等待，不清对方会话。
   2. **仅清当前测试站点登录态**：在该测试页执行 `localStorage.clear(); sessionStorage.clear()`，调用 `Storage.clearDataForOrigin`（`origin` 仅传当前测试站，`storageTypes: "cookies,local_storage"`），并用 `Network.getAllCookies` 过滤出 `domain`（去前导点后）等于当前测试站 hostname 或其专属测试子域（如 `develop.bootingai.net`、`app.develop.lookai.app`、`develop.lookai.app`）的 Cookie 逐条 `Network.deleteCookies`，刷新后登录本轮账号。**严禁**调用 `Network.clearBrowserCookies`、`Network.clearBrowserCache` 或无 `browserContextId` 的 `Storage.clearCookies`，严禁删除一级根域、生产域名（如 `look-ai.cn`、`lookfashion.ai`）或其他子域（如 `git.bootingai.net`、`admin.lookai.cc`）的 Cookie。
 
-**直接停下回报的问题**：代码缺陷；账号、积分、权限不足；后端未部署或接口报未部署；测试工具本身不可用。
+**直接停下回报的问题**：代码缺陷；账号、积分、权限不足；后端未部署或接口报未部署；测试工具本身不可用。**例外（外部沙盒固有受限）**：若延伸任务继承了关联前置单已证实的第三方沙盒限制，或预检/首轮实测确认某分支因外部沙盒固有机制（如一次性测试卡、绑卡阶段风控拦截、三方验证码/额度限流等）无法重复触发，按 `~/.hwf/protocol/review-testing.md` §8 自动切入降级闭环（真实接口契约核对 + 定向单测模拟响应 + 报告如实披露未覆盖生产分支；涉及前端界面交互时挂载同版本已审组件夹具补录 `.mp4` 并注明模拟边界），不得发 `todo` 向用户重复索要新沙盒窗口或真卡。
 
 预检第 1–3 项处理后仍不成立，或所有验收点都造不出条件：不跑验收点，按第 6 步清理，以「阻塞」结尾，附对应预检项、报错原文、现场录屏或截图、已试过的办法。只有部分验收点造不出条件，就逐点标阻塞，其余继续；正式测试中某点造条件连续失败 2 次，同样跳到下一点。预检失败不等于免测，真实运行取证门禁仍未满足。
 

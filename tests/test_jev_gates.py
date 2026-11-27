@@ -12,6 +12,7 @@ import sys
 import tempfile
 from typing import Any
 import unittest
+import unittest.mock
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -282,6 +283,36 @@ class JevGatesTests(unittest.TestCase):
         self.assertEqual(rows[-1]["gate"], "gate5_note_guard")
         self.assertEqual(rows[-1]["outcome"], "blocked")
         self.assertIn("missing_top_conclusion", rows[-1]["trig"])
+
+    def test_default_verify_suite_uses_module_names_and_repo_cwd(self) -> None:
+        tests_dir = self.home / "tests"
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("test_jev_gates.py", "test_semantic_lint.py"):
+            (tests_dir / name).write_text("", encoding="utf-8")
+        captured: dict[str, object] = {}
+
+        def fake_run(cmd, **kwargs):
+            captured["cmd"] = list(cmd)
+            captured["cwd"] = kwargs.get("cwd")
+            return unittest.mock.MagicMock(returncode=0, stdout="", stderr="Ran 2 tests\nOK")
+
+        with unittest.mock.patch.object(JG.subprocess, "run", side_effect=fake_run):
+            ok, detail = JG._default_verify_suite(self.home)
+        self.assertTrue(ok)
+        self.assertIn("OK", detail)
+        self.assertEqual(captured["cwd"], str(self.home))
+        self.assertEqual(
+            captured["cmd"][1:],
+            ["-m", "unittest", "tests.test_jev_gates", "tests.test_semantic_lint"],
+        )
+
+    def test_repo_jev_gates_json_has_tuned_secretary_fast_relay_and_locked_auth_redline(self) -> None:
+        repo_home = Path(__file__).resolve().parents[1]
+        self.assertAlmostEqual(JG.threshold_of("secretary_fast_relay_min", 0.0, repo_home), 0.76)
+        self.assertAlmostEqual(JG.threshold_of("secretary_auth_now_min", 0.0, repo_home), 0.85)
+        cfg = JG.load_gates_config(repo_home)
+        self.assertTrue(cfg["thresholds"]["secretary_auth_now_min"]["protected"])
+        self.assertFalse(cfg["thresholds"]["secretary_fast_relay_min"]["protected"])
 
 
 if __name__ == "__main__":

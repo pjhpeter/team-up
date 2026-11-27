@@ -589,6 +589,34 @@ class WrapupTest(Case):
         self.assertEqual(code2, 0, out2)
         self.assertEqual(self.glab.issue_state, "closed")
 
+    def test_unanswered_user_note_paginates_desc_across_over_100_system_notes(self) -> None:
+        queries: list[str] = []
+        # 第 1 页满 100 条系统动态，第 2 页才是最新用户留言（模拟超百条系统事件的长工单）。
+        page1 = [
+            {"id": 300 - i, "author": {"username": "pjhagent"}, "system": True, "body": "changed labels"}
+            for i in range(100)
+        ]
+        page2 = [
+            {"id": 190, "author": {"username": "pengjh"}, "system": False, "body": "这里还要确认一下"},
+            {"id": 180, "author": {"username": "pjhagent"}, "system": False, "body": "此前回复\n<!-- hwf-kind:answer -->"},
+        ]
+
+        def fake_api(host: str, method: str, path: str, *fields: str):
+            queries.append(path)
+            if path == "user":
+                return {"username": "pjhagent"}
+            if "page=2" in path:
+                return page2
+            return page1
+
+        issue = WR.parse_issue(ISSUE)
+        with patch.object(WR, "glab_api", side_effect=fake_api):
+            found = WR.unanswered_user_note(issue)
+        self.assertIsNotNone(found)
+        self.assertEqual(found["id"], 190)
+        self.assertTrue(any("sort=desc&per_page=100" in q for q in queries))
+        self.assertTrue(any("page=2" in q for q in queries))
+
 
 if __name__ == "__main__":
     unittest.main()

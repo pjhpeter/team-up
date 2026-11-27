@@ -702,6 +702,8 @@ class Bridge:
                 proj = str(item.get("project") or self.project)
                 known[(proj, int(item["iid"]))] = dict(item, project=proj)
         for item in self.state["threads"].values():
+            if item.get("closed"):
+                continue  # 已关闭话题默认不进路由候选；若用户显式点名编号或回复原消息，下方 explicit_refs 会再查回。
             proj = str(item.get("project") or self.project)
             if item.get("chat_id") == msg.get("chat_id") and self.is_project_allowed(proj):
                 known[(proj, int(item["iid"]))] = dict(item, project=proj)

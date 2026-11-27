@@ -1976,6 +1976,103 @@ class DynamicAllProjectAndAuthBoundaryTests(unittest.TestCase):
         self.assertNotIn(recent_url, state["watched_issues"])
         self.assertIn(recent_url, state["followed"])
 
+    def test_track_reopened_prunes_old_closed_origins_and_uses_batched_incremental_queries(self) -> None:
+        now = 1_800_000_000.0
+        old_iso = INBOX.time.strftime("%Y-%m-%dT%H:%M:%SZ", INBOX.time.gmtime(now - 20 * 86400))
+        fresh_iso = INBOX.time.strftime("%Y-%m-%dT%H:%M:%SZ", INBOX.time.gmtime(now - 2 * 86400))
+        queries: list[str] = []
+
+        # 构造：1 条超过 14 天的已关闭单 + 1 条未带 closed_at 的历史旧单（应自动补查并淘汰）
+        # + 45 条 14 天内关闭的新单（超过单批 40 条，应自动拆成 2 批并携带 updated_after）。
+        closed_origins: dict[str, Any] = {
+            "https://git.example/frontend/web-v1/-/issues/10": {
+                "project": "frontend/web-v1", "project_id": 10, "iid": 10, "repo": "/r",
+                "initiator": "pengjh", "last_note_id": 1, "closed_at": now - 15 * 86400,
+            },
+            "https://git.example/frontend/web-v1/-/issues/11": {
+                "project": "frontend/web-v1", "project_id": 10, "iid": 11, "repo": "/r",
+                "initiator": "pengjh", "last_note_id": 1,  # 存量历史条目无 closed_at
+            },
+        }
+        for iid in range(100, 145):
+            closed_origins[f"https://git.example/frontend/web-v1/-/issues/{iid}"] = {
+                "project": "frontend/web-v1", "project_id": 10, "iid": iid, "repo": "/r",
+                "initiator": "pengjh", "last_note_id": 5, "closed_at": now - 2 * 86400,
+            }
+
+        def fake_run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+            if argv[:2] == ["glab", "api"]:
+                path = argv[6]
+                queries.append(path)
+                if "/issues?state=closed" in path:
+                    return subprocess.CompletedProcess(
+                        argv, 0,
+                        json.dumps([{"iid": 11, "closed_at": old_iso, "updated_at": old_iso}]),
+                        "",
+                    )
+                if "/issues?state=opened" in path:
+                    reopened = (
+                        [{"iid": 105, "web_url": "https://git.example/frontend/web-v1/-/issues/105", "updated_at": fresh_iso}]
+                        if "iids[]=105" in path
+                        else []
+                    )
+                    return subprocess.CompletedProcess(argv, 0, json.dumps(reopened), "")
+                if path == "projects/frontend%2Fweb-v1":
+                    return subprocess.CompletedProcess(argv, 0, json.dumps({"path_with_namespace": "frontend/web-v1", "archived": False}), "")
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+
+        cfg = {**CONFIG, "dynamic_projects": True}
+        state: dict[str, Any] = {"closed_origins": closed_origins, "reopen_since": now - 120}
+        inbox = INBOX.Inbox(cfg, state, run=fake_run, jev=None)
+        with patch.object(INBOX.time, "time", return_value=now):
+            inbox.track_reopened()
+
+        # 超过 14 天的 #10 和补查确认超过 14 天的历史单 #11 均被自动移出
+        self.assertNotIn("https://git.example/frontend/web-v1/-/issues/10", state["closed_origins"])
+        self.assertNotIn("https://git.example/frontend/web-v1/-/issues/11", state["closed_origins"])
+        # 重开的 #105 接回 origins 且清除了 closed_at
+        self.assertIn("https://git.example/frontend/web-v1/-/issues/105", state["origins"])
+        self.assertNotIn("closed_at", state["origins"]["https://git.example/frontend/web-v1/-/issues/105"])
+        # 45 条按 40 条/批拆为 2 次查询，且全部携带 updated_after 增量窗口
+        open_queries = [q for q in queries if "/issues?state=opened" in q]
+        self.assertEqual(len(open_queries), 2)
+        self.assertTrue(all("updated_after=" in q for q in open_queries))
+        self.assertTrue(all(q.count("iids[]=") <= INBOX.CLOSED_ORIGIN_QUERY_BATCH for q in open_queries))
+
+    def test_maybe_clean_tmp_runs_once_daily_without_crashing_inbox(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hwf-daily-clean-") as tmp:
+            repo1 = Path(tmp) / "repo1"
+            repo2 = Path(tmp) / "repo2"
+            (repo1 / ".git").mkdir(parents=True)
+            (repo2 / ".git").mkdir(parents=True)
+            calls: list[list[str]] = []
+
+            def fake_run(argv: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+                calls.append(list(argv))
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    "removed worktree /tmp/old\nskipped worktrees (total=2): active_task=2\n",
+                    "",
+                )
+
+            cfg = {**CONFIG, "projects": {"g/r1": str(repo1), "g/r2": str(repo2)}}
+            state: dict[str, Any] = {}
+            inbox = INBOX.Inbox(cfg, state, run=fake_run, jev=None)
+            t0 = 1_800_000_000.0
+            # 首次仅记水位不执行，避免启动或测试首轮意外触发磁盘扫描
+            inbox.maybe_clean_tmp(t0)
+            self.assertEqual(calls, [])
+            self.assertEqual(state["clean_tmp_last_run"], t0)
+            # 未满 24 小时不触发
+            inbox.maybe_clean_tmp(t0 + 3600)
+            self.assertEqual(calls, [])
+            # 满 24 小时触发：首个仓库带 worktree 扫描，其余带 --no-worktrees
+            inbox.maybe_clean_tmp(t0 + INBOX.CLEAN_TMP_INTERVAL_S + 1)
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(calls[0][1].endswith("clean-tmp.py"))
+            self.assertNotIn("--no-worktrees", calls[0])
+            self.assertIn("--no-worktrees", calls[1])
+
 
 
 

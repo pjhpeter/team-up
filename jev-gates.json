@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-11-24T11:30:00+08:00",
+  "updated_at": "2026-11-27T13:00:00+08:00",
   "thresholds": {
     "proactive_hit_min": {
       "value": 0.2,
@@ -17,7 +17,7 @@
       "description": "关卡1：飞书观察群判定为旧事件延续的最低概率"
     },
     "secretary_fast_relay_min": {
-      "value": 0.8,
+      "value": 0.76,
       "min": 0.7,
       "max": 0.95,
       "protected": false,

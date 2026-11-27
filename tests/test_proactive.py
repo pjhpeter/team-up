@@ -90,7 +90,10 @@ class World:
         self.judge = lambda prompt: {"summary": "一件事", "rules": [], "plan": ""}  # 默认漏判 → 算判不了
         self.auto_reply = lambda prompt: "只读分析结论：在 src/app.ts 定位到空指针问题，尚未修改代码。"
         self.omp_fail = 0
-        self.auto_fail = False
+        self.auto_fail = 0
+        self.auto_fail_stderr = "auto boom"
+        self.post_fail = 0
+        self.post_fail_stderr = "glab: 502 Bad Gateway"
         self.prompts: list[str] = []
         self.auto_prompts: list[str] = []
         self.ntfys: list[str] = []
@@ -103,17 +106,23 @@ class World:
             if method != "GET":
                 assert self.allow_writes, f"observe 档不许写 GitLab：{cmd}"
                 fields = dict(cmd[i + 1].split("=", 1) for i, c in enumerate(cmd) if c == "-f")
+                if self.post_fail:
+                    if isinstance(self.post_fail, int) and not isinstance(self.post_fail, bool):
+                        self.post_fail -= 1
+                    return subprocess.CompletedProcess(cmd, 1, "", self.post_fail_stderr)
                 self.writes.append((method, path.split("?")[0], fields))
                 return ok(json.dumps({"id": 900 + len(self.writes), "body": fields.get("body", "")}))
             as_user = bool(env and env.get("GITLAB_TOKEN") == "user-tok")
             return self.gitlab_get(path, as_user=as_user)
         if cmd[0] == "omp":
             prompt = cmd[-1]
-            is_readonly_auto = "--tools" in cmd and cmd[cmd.index("--tools") + 1] == "read,grep,find,ls"
+            is_readonly_auto = "--tools" in cmd and cmd[cmd.index("--tools") + 1] == "read,grep,glob"
             if is_readonly_auto:
                 self.auto_prompts.append(prompt)
                 if self.auto_fail:
-                    return subprocess.CompletedProcess(cmd, 1, "", "auto boom")
+                    if isinstance(self.auto_fail, int) and not isinstance(self.auto_fail, bool):
+                        self.auto_fail -= 1
+                    return subprocess.CompletedProcess(cmd, 1, "", self.auto_fail_stderr)
                 return ok(omp_text(self.auto_reply(prompt)))
             self.prompts.append(prompt)
             if self.omp_fail:
@@ -369,9 +378,9 @@ class ScoutTest(unittest.TestCase):
         self.assertIn("只读分析结论", fields["body"])
         self.assertIn("/go", fields["body"])
         self.assertIn(f"<!-- hwf-proactive:auto:{recs[0]['id']} -->", fields["body"])
-        # 确认只读 omp 用 --tools read,grep,find,ls 调用
-        auto_cmd = [c for c in self.w.calls if c[0] == "omp" and "--tools" in c and c[c.index("--tools") + 1] == "read,grep,find,ls"][0]
-        self.assertEqual(auto_cmd[auto_cmd.index("--tools") + 1], "read,grep,find,ls")
+        # 确认只读 omp 用 --tools read,grep,glob 调用（不含未知工具 ls 或不可用工具 find）
+        auto_cmd = [c for c in self.w.calls if c[0] == "omp" and "--tools" in c and c[c.index("--tools") + 1] == "read,grep,glob"][0]
+        self.assertEqual(auto_cmd[auto_cmd.index("--tools") + 1], "read,grep,glob")
 
     def test_auto_mode_pipeline_posts_to_mr_without_at_mentions_and_without_go_hint(self) -> None:
         self.rules.write_text(RULES_AUTO)
@@ -401,11 +410,87 @@ class ScoutTest(unittest.TestCase):
         self.first_tick()
         self.w.issue(52, self.t - 3 * HOUR)
         self.w.judge = hits("R3")
+        # 首次执行 + 最多 2 次瞬时重试（共 3 轮），期间保留分诊结果不重跑分诊
+        self.scout.tick()
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.scout.state["attempts"].get("issue:frontend/web-v1#52"), 1)
+        self.scout.tick()
+        self.assertEqual(self.records(), [])
+        self.assertEqual(self.scout.state["attempts"].get("issue:frontend/web-v1#52"), 2)
         self.scout.tick()
         recs = self.records()
+        self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0]["verdict"], "auto_failed")
         self.assertIn("auto_error", recs[0])
         self.assertEqual(self.w.writes, [])
+        self.assertEqual(len(self.w.prompts), 1)
+        self.assertEqual(len(self.w.auto_prompts), 3)
+        self.assertNotIn("issue:frontend/web-v1#52", self.scout.state["attempts"])
+
+    def test_auto_mode_transient_analysis_failure_recovers_within_two_retries(self) -> None:
+        self.rules.write_text(RULES_AUTO)
+        self.w.allow_writes = True
+        self.w.auto_fail = 2
+        self.first_tick()
+        self.w.issue(53, self.t - 3 * HOUR)
+        self.w.judge = hits("R3")
+        self.scout.tick()
+        self.scout.tick()
+        self.assertEqual(self.records(), [])
+        self.scout.tick()
+        recs = self.records()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["verdict"], "accepted")
+        self.assertEqual(len(self.w.prompts), 1)
+        self.assertEqual(len(self.w.auto_prompts), 3)
+        self.assertEqual(len(self.w.writes), 1)
+        self.assertEqual(self.scout.state["daily"]["judged"], 1)
+        self.assertNotIn("issue:frontend/web-v1#53", self.scout.state["attempts"])
+
+    def test_auto_mode_post_failure_retries_comment_only_without_rerunning_llm(self) -> None:
+        self.rules.write_text(RULES_AUTO)
+        self.w.allow_writes = True
+        self.w.post_fail = 1
+        self.first_tick()
+        self.w.issue(54, self.t - 3 * HOUR)
+        self.w.judge = hits("R3")
+        self.scout.tick()
+        self.assertEqual(self.records(), [])
+        self.assertEqual(len(self.w.auto_prompts), 1)
+        self.assertEqual(self.w.writes, [])
+        # 第二轮只补发已缓存评论，不再重新调用只读大模型或分诊模型
+        self.scout.tick()
+        recs = self.records()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["verdict"], "accepted")
+        self.assertEqual(len(self.w.prompts), 1)
+        self.assertEqual(len(self.w.auto_prompts), 1)
+        self.assertEqual(len(self.w.writes), 1)
+        self.assertIn("只读分析结论", self.w.writes[0][2]["body"])
+
+    def test_auto_mode_non_retryable_error_fails_fast_without_retrying(self) -> None:
+        self.rules.write_text(RULES_AUTO)
+        self.w.allow_writes = True
+        self.w.auto_fail = True
+        self.w.auto_fail_stderr = "Error: Unknown tool in --tools: ls"
+        self.first_tick()
+        self.w.issue(55, self.t - 3 * HOUR)
+        self.w.judge = hits("R3")
+        self.scout.tick()
+        recs = self.records()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["verdict"], "auto_failed")
+        self.assertEqual(len(self.w.auto_prompts), 1)
+        self.assertEqual(self.scout.state["ready"], [])
+        self.assertNotIn("issue:frontend/web-v1#55", self.scout.state["attempts"])
+
+    def test_issue_already_handled_queries_notes_in_descending_order(self) -> None:
+        self.first_tick()
+        self.w.issue(56, self.t - 3 * HOUR)
+        self.scout.tick()
+        note_calls = [c for c in self.w.calls if c[0] == "glab" and any("/issues/56/notes" in arg for arg in c)]
+        self.assertTrue(note_calls)
+        self.assertTrue(any("sort=desc&per_page=100" in arg for arg in note_calls[0]))
 
     # ---- 判断失败、超额 ----
 

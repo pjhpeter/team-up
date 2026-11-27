@@ -331,8 +331,8 @@ def summarize_gate_telemetry(
 # ---------- 受保护自动演进引擎 ----------
 
 def _default_verify_suite(hwf_home: Path) -> tuple[bool, str]:
-    test_files = [
-        hwf_home / "tests" / name
+    test_modules = [
+        f"tests.{Path(name).stem}"
         for name in (
             "test_jev_gates.py",
             "test_semantic_lint.py",
@@ -341,10 +341,12 @@ def _default_verify_suite(hwf_home: Path) -> tuple[bool, str]:
         )
         if (hwf_home / "tests" / name).is_file()
     ]
-    if not test_files:
+    if not test_modules:
         return True, "no target test files found"
+    # Python 3.9 unittest 命令行不接受绝对文件路径，须在仓库根目录按模块名加载。
     proc = subprocess.run(
-        [sys.executable, "-m", "unittest", *[str(p) for p in test_files]],
+        [sys.executable, "-m", "unittest", *test_modules],
+        cwd=str(hwf_home),
         capture_output=True,
         text=True,
         timeout=60,

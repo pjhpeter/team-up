@@ -215,6 +215,80 @@ class ExpiredWorktreesTest(unittest.TestCase):
 
         self.assertEqual(pairs, [(expired_be, str(be_repo))])
 
+    def test_strips_only_known_regenerable_caches_and_reports_skipped_summary(self) -> None:
+        cache_blocked = self._make_wt("frontend-web-v1-105-cache-only", age_days=20)
+        (cache_blocked / ".cache" / "vite").mkdir(parents=True)
+        (cache_blocked / ".cache" / "vite" / "dep.js").write_text("x", encoding="utf-8")
+        (cache_blocked / "tsconfig.tsbuildinfo").write_text("{}", encoding="utf-8")
+        old_stamp = self.now - 20 * DAY
+        for p in (
+            cache_blocked / ".cache" / "vite" / "dep.js",
+            cache_blocked / ".cache" / "vite",
+            cache_blocked / ".cache",
+            cache_blocked / "tsconfig.tsbuildinfo",
+            cache_blocked,
+        ):
+            os.utime(p, (old_stamp, old_stamp))
+
+        source_blocked = self._make_wt("frontend-web-v1-106-real-untracked", age_days=20)
+        (source_blocked / "src").mkdir(parents=True)
+        (source_blocked / "src" / "draft.ts").write_text("export const x = 1\n", encoding="utf-8")
+        for p in (source_blocked / "src" / "draft.ts", source_blocked / "src", source_blocked):
+            os.utime(p, (old_stamp, old_stamp))
+
+        all_wts = [cache_blocked, source_blocked]
+        stripped_paths: set[str] = set()
+
+        def fake_list_wts(_path: str):
+            return [(str(self.repo), "h", "main", False)] + [(str(p), "h", "feat", False) for p in all_wts]
+
+        def fake_git(path: str, *args: str):
+            if args[:3] == ("ls-files", "--others", "--exclude-standard"):
+                if path == str(cache_blocked):
+                    if not (cache_blocked / "tsconfig.tsbuildinfo").exists() and not (cache_blocked / ".cache").exists():
+                        return subprocess.CompletedProcess([], 0, "", "")
+                    return subprocess.CompletedProcess([], 0, ".cache/vite/dep.js\0tsconfig.tsbuildinfo\0", "")
+                if path == str(source_blocked):
+                    return subprocess.CompletedProcess([], 0, "src/draft.ts\0.cache/vite/dep.js\0", "")
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        def fake_unsaved(path: str):
+            if path == str(cache_blocked):
+                if (cache_blocked / "tsconfig.tsbuildinfo").exists() or (cache_blocked / ".cache").exists():
+                    return "有未跟踪文件"
+                stripped_paths.add(path)
+                return None
+            if path == str(source_blocked):
+                return "有未跟踪文件"
+            return None
+
+        with (
+            patch.object(CLEAN.DISCOVERY, "open_origin_tasks", return_value=frozenset()),
+            patch.object(CLEAN._WR, "list_worktrees", side_effect=fake_list_wts),
+            patch.object(CLEAN._WR, "herdr", return_value={"result": {"panes": []}}),
+            patch.object(CLEAN._WR, "git", side_effect=fake_git),
+            patch.object(CLEAN._WR, "unsaved_reason", side_effect=fake_unsaved),
+            patch.object(CLEAN._WR, "saved_ref", return_value="origin/develop"),
+        ):
+            # dry-run 模式不删除缓存文件，但识别 cache_blocked 可回收、source_blocked 保留
+            dry_rm, dry_skip = CLEAN.inspect_worktrees(str(self.repo), 10, self.now, strip_caches=False)
+            self.assertEqual([p for p, _ in dry_rm], [cache_blocked])
+            self.assertTrue((cache_blocked / "tsconfig.tsbuildinfo").exists())
+            self.assertEqual(len(dry_skip), 1)
+            self.assertEqual(dry_skip[0][1], "unsaved")
+            self.assertIn("src/draft.ts", dry_skip[0][2])
+
+            # 真实清理模式会剥离纯缓存未跟踪文件并放行回收，同时绝不动 source_blocked 里的任何文件
+            real_rm, real_skip = CLEAN.inspect_worktrees(str(self.repo), 10, self.now, strip_caches=True)
+            self.assertEqual([p for p, _ in real_rm], [cache_blocked])
+            self.assertFalse((cache_blocked / "tsconfig.tsbuildinfo").exists())
+            self.assertFalse((cache_blocked / ".cache").exists())
+            self.assertTrue((source_blocked / "src" / "draft.ts").exists())
+            self.assertIn(str(cache_blocked), stripped_paths)
+            summary_lines = CLEAN.format_skipped_summary(real_skip)
+            self.assertTrue(any("skipped worktrees (total=1): unsaved=1" in ln for ln in summary_lines))
+            self.assertTrue(any("src/draft.ts" in ln for ln in summary_lines))
+
 
 if __name__ == "__main__":
     unittest.main()

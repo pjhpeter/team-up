@@ -108,7 +108,7 @@ scheduler 回收实际输出，核对：
 
 **main 的 MR 永不自动合并、永不夹带自动关单，只有用户明确授权才可合并**；遵守全局 main MR 禁止自动合并铁律。main 合入后若有 develop 没有的提交，再把 main 合回 develop。
 
-根 issue 关闭表示已上线：全部步骤/子 issue、整体验收、完整性核对通过，main MR 经用户授权合并后，先评论合并 MR/SHA 再关闭。此前保持 open、`状态:待上线`；进入 `状态:待上线` 等待用户合并 `main` 或等待跨团队前置上线期间，须先运行 `stop-test-services.py` 与 `member-release.py --issue <编号> --all-idle` 释放测试服务与本单空闲成员窗格（代码分支与需保留的 worktree 保留，用户后续评论时按需重领）。整体作废经用户确认写原因关闭。收件箱发起 issue 另须满足「发起 issue 的关闭授权」。
+根 issue 关闭表示已上线：全部步骤/子 issue、整体验收、完整性核对通过，main MR 经用户授权合并后，先评论合并 MR/SHA 再关闭。此前保持 open、`状态:待上线`；进入 `状态:待上线` 等待用户合并 `main` 或等待跨团队前置上线期间，须先运行 `stop-test-services.py` 与 `member-release.py --issue <编号> --all-idle` 释放测试服务与本单空闲成员窗格，并同步清掉已合入 `develop`（或已完整保存在远端）、无未保存改动且无独有 `.hwf/tmp` 证据的临时集成或验证 worktree（如 `*-develop*`、`*-integration*`、`*-verify*`、`*-precheck*`、`*-baseline*`，删完运行 `git worktree prune` 并回读列表），仅保留仍需用于上线/补改的主 worktree 与分支（用户后续评论时按需重领）。整体作废经用户确认写原因关闭。收件箱发起 issue 另须满足「发起 issue 的关闭授权」。
 
 main MR 创建后，完成汇报逐条列根待定清单未处理项，各一句并建议做/不做，请用户挑选。点名项在本交付派成员处理、复核、测试后标已处理；未点名保持原样，不开 issue、不排期、不影响收尾，不谎称已处理。
 

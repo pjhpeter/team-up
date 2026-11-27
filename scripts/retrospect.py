@@ -523,6 +523,49 @@ def _summarize_inbox_logs(lines: Sequence[str]) -> dict[str, Any]:
     }
 
 
+def _fetch_issue_notes_recent(
+    glab_bin: str, host: str, pid: str, iid: int, since_ts: float, run: Runner, *, max_pages: int = 5
+) -> Optional[list[dict[str, Any]]]:
+    """倒序分页拉取 issue 评论，覆盖窗口内全部最新动态并按时间升序还原，避免超百条系统动态截断最新回复。"""
+    collected: list[dict[str, Any]] = []
+    seen_ids: set[int] = set()
+    for page in range(1, max_pages + 1):
+        query = f"projects/{pid}/issues/{iid}/notes?sort=desc&per_page=100"
+        if page > 1:
+            query += f"&page={page}"
+        nr = run(
+            [glab_bin, "api", "--hostname", host, "-X", "GET", query],
+            capture_output=True, text=True, timeout=20,
+        )
+        if nr.returncode != 0:
+            return collected if page > 1 else None
+        raw = json.loads(nr.stdout)
+        if not isinstance(raw, list) or not raw:
+            break
+        added = 0
+        oldest_ts: Optional[float] = None
+        for note in raw:
+            if not isinstance(note, dict):
+                continue
+            nid = int(note.get("id") or 0)
+            if nid > 0:
+                if nid in seen_ids:
+                    continue
+                seen_ids.add(nid)
+            added += 1
+            nts = parse_any_ts(str(note.get("created_at") or ""))
+            if nts is not None and (oldest_ts is None or nts < oldest_ts):
+                oldest_ts = nts
+            if not note.get("system"):
+                collected.append(note)
+        if len(raw) < 100 or added == 0:
+            break
+        if oldest_ts is not None and oldest_ts < since_ts:
+            break
+    collected.sort(key=lambda n: (parse_any_ts(str(n.get("created_at") or "")) or 0.0, int(n.get("id") or 0)))
+    return collected
+
+
 def _collect_gitlab_issues(host: str, projects: Mapping[str, str], allowed_users: set[str],
                            active_iids_by_proj: Mapping[str, set[int]], since_ts: float, now_ts: float,
                            run: Runner) -> list[dict[str, Any]]:
@@ -535,13 +578,12 @@ def _collect_gitlab_issues(host: str, projects: Mapping[str, str], allowed_users
             try:
                 ir = run([glab_bin, "api", "--hostname", host, "-X", "GET", f"projects/{pid}/issues/{iid}"],
                          capture_output=True, text=True, timeout=20)
-                nr = run([glab_bin, "api", "--hostname", host, "-X", "GET",
-                          f"projects/{pid}/issues/{iid}/notes?sort=asc&per_page=80"],
-                         capture_output=True, text=True, timeout=20)
-                if ir.returncode != 0 or nr.returncode != 0:
+                if ir.returncode != 0:
                     continue
                 issue = json.loads(ir.stdout)
-                notes = [n for n in json.loads(nr.stdout) if not n.get("system")]
+                notes = _fetch_issue_notes_recent(glab_bin, host, pid, iid, since_ts, run)
+                if notes is None:
+                    continue
             except Exception:
                 continue
 

@@ -45,6 +45,76 @@ SKIP_WALK_DIRS = frozenset({
 })
 SKIP_WALK_SUFFIXES = (".app", ".asar.unpacked", ".framework", ".dSYM")
 SKIP_WALK_PREFIXES = ("asar-", "unpacked-", "hwf-inspect-")
+# 已过期且无任何已跟踪改动的 worktree 若仅剩可再生构建/测试缓存，允许先剥离缓存再走干净校验回收。
+KNOWN_CACHE_DIRS = frozenset({
+    ".cache", ".vite", ".nuxt", ".output", ".next", ".turbo",
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    "coverage", ".nyc_output",
+})
+KNOWN_CACHE_FILENAMES = frozenset({".eslintcache", ".stylelintcache", ".DS_Store", "Thumbs.db"})
+KNOWN_CACHE_SUFFIXES = (".tsbuildinfo",)
+
+
+def _is_known_cache_relpath(rel_path: str) -> bool:
+    clean = rel_path.strip().strip("/")
+    if not clean:
+        return False
+    parts = Path(clean).parts
+    if any(part in KNOWN_CACHE_DIRS for part in parts):
+        return True
+    name = parts[-1]
+    return name in KNOWN_CACHE_FILENAMES or name.endswith(KNOWN_CACHE_SUFFIXES)
+
+
+def _untracked_relpaths(wt_p: str) -> Optional[list[str]]:
+    res = _WR.git(wt_p, "ls-files", "--others", "--exclude-standard", "-z")
+    if res.returncode != 0:
+        return None
+    return [item for item in res.stdout.split("\0") if item]
+
+
+def _classify_untracked_caches(wt_p: str) -> tuple[bool, list[str], list[str]]:
+    """返回 (是否全为已知可再生缓存, 缓存相对路径列表, 非缓存未跟踪路径示例)。"""
+    untracked = _untracked_relpaths(wt_p)
+    if not untracked:
+        return False, [], []
+    non_cache = [p for p in untracked if not _is_known_cache_relpath(p)]
+    if non_cache:
+        return False, [], non_cache[:5]
+    return True, untracked, []
+
+
+def _strip_known_cache_paths(wt_p: str, relpaths: list[str]) -> bool:
+    """仅删除已过期 worktree 内确认属于构建/测试缓存的未跟踪文件与空缓存目录，绝不越出 worktree 根目录。"""
+    root = Path(wt_p).resolve()
+    removed_parents: set[Path] = set()
+    for rel in relpaths:
+        target = root / rel
+        try:
+            parent_real = target.parent.resolve()
+            if parent_real != root and root not in parent_real.parents:
+                return False
+            if target.is_symlink() or target.is_file():
+                target.unlink(missing_ok=True)
+            elif target.is_dir():
+                shutil.rmtree(target)
+            # 顺着嵌套子目录向上收集直到最外层已知缓存目录（例如 .cache/vite -> .cache），自底向上清掉空目录。
+            chain: list[Path] = []
+            cur = target.parent
+            while cur != root and root in cur.parents:
+                chain.append(cur)
+                if cur.name in KNOWN_CACHE_DIRS:
+                    removed_parents.update(chain)
+                cur = cur.parent
+        except OSError:
+            return False
+    for cache_dir in sorted(removed_parents, key=lambda p: len(p.parts), reverse=True):
+        try:
+            if cache_dir.is_dir() and not any(cache_dir.iterdir()):
+                cache_dir.rmdir()
+        except OSError:
+            pass
+    return _WR.unsaved_reason(wt_p) is None
 
 
 def _should_skip_walk_dir(name: str) -> bool:
@@ -146,26 +216,37 @@ def _active_sets_for_repo(repo_path: str) -> tuple[set[str], set[str]]:
     return tasks, iids
 
 
-def expired_worktrees_with_repos(repo: str, days: int, now: float) -> list[tuple[Path, str]]:
-    """跨 `~/.herdr/worktrees/` 全部仓库子目录筛选超过 N 天未改动且满足六重安全门禁的干净 worktree。"""
+def inspect_worktrees(
+    repo: str,
+    days: int,
+    now: float,
+    *,
+    strip_caches: bool = False,
+) -> tuple[list[tuple[Path, str]], list[tuple[Path, str, str]]]:
+    """跨 `~/.herdr/worktrees/` 筛选可回收 worktree，同时返回被保留目录的具体卡点明细。
+
+    仅当 worktree 已过保留期、非在途、无窗格占用、无独有 `.hwf/tmp`、HEAD 已推远端，且仅被已知构建/测试缓存卡住时，
+    按 `strip_caches` 决定是否先剥离这些可再生缓存再复验干净状态。
+    """
     root = _WR.worktree_root()
     if not root.is_dir():
-        return []
+        return [], []
     real_repo = os.path.realpath(repo)
     if not (Path(real_repo) / ".git").exists():
-        return []
+        return [], []
 
     try:
         panes = _WR.herdr("pane", "list")["result"]["panes"]
-    except Exception:
+    except Exception as exc:
         # 无法核验实时窗格占用时绝不盲删任何 worktree。
-        return []
+        return [], [(root, "pane_list_failed", str(exc))]
 
     primary_tasks, primary_iids = _active_sets_for_repo(real_repo)
     active_cache: dict[str, tuple[set[str], set[str]]] = {real_repo: (primary_tasks, primary_iids)}
     fetched_repos: dict[str, bool] = {}
     cutoff = now - days * 86400
     removable: dict[Path, str] = {}
+    skipped: list[tuple[Path, str, str]] = []
 
     for repo_dir in sorted(root.iterdir()):
         if not repo_dir.is_dir() or repo_dir.is_symlink():
@@ -174,27 +255,33 @@ def expired_worktrees_with_repos(repo: str, days: int, now: float) -> list[tuple
             if not sub.is_dir() or sub.is_symlink():
                 continue
             if _matches_active_task(sub.name, primary_tasks, primary_iids):
+                skipped.append((sub, "active_task", "INDEX 仍登记为在途任务"))
                 continue
             if latest_mtime(sub) >= cutoff:
+                skipped.append((sub, "recent", f"未满 {days} 天"))
                 continue
             real_sub = os.path.realpath(sub)
             if real_sub == real_repo:
                 continue
             try:
                 entries = _WR.list_worktrees(real_sub)
-            except Exception:
+            except Exception as exc:
+                skipped.append((sub, "not_git_worktree", str(exc)[:120]))
                 continue
             if not entries:
+                skipped.append((sub, "not_git_worktree", "非有效 git worktree"))
                 continue
             wt_main_repo = os.path.realpath(entries[0][0])
             # 独立 git clone 的首项是它自身，不属于 linked worktree，绝不清理。
             if real_sub == wt_main_repo or not (Path(wt_main_repo) / ".git").exists():
+                skipped.append((sub, "standalone_clone", "独立克隆仓库"))
                 continue
             if wt_main_repo not in active_cache:
                 wt_tasks, wt_iids = _active_sets_for_repo(wt_main_repo)
                 active_cache[wt_main_repo] = (wt_tasks | primary_tasks, wt_iids | primary_iids)
             repo_tasks, repo_iids = active_cache[wt_main_repo]
             if _matches_active_task(sub.name, repo_tasks, repo_iids):
+                skipped.append((sub, "active_task", "所属仓库 INDEX 仍登记为在途任务"))
                 continue
             # 检查该目录及其嵌套子 worktree，且永不把主工作树自身加入删除候选。
             sub_entries = [
@@ -202,32 +289,85 @@ def expired_worktrees_with_repos(repo: str, days: int, now: float) -> list[tuple
                 for p, _head, _branch, bare in entries
                 if (p == real_sub or p.startswith(real_sub + os.sep)) and p != wt_main_repo
             ]
-            if not sub_entries or any(bare for _, bare in sub_entries):
+            if not sub_entries:
+                skipped.append((sub, "not_git_worktree", "未登记在主仓库 worktree 列表"))
+                continue
+            if any(bare for _, bare in sub_entries):
+                skipped.append((sub, "bare_worktree", "含 bare 工作树"))
                 continue
             if wt_main_repo not in fetched_repos:
                 fetched_repos[wt_main_repo] = _WR.git(wt_main_repo, "fetch", "--quiet", "origin").returncode == 0
             if not fetched_repos[wt_main_repo]:
+                skipped.append((sub, "fetch_failed", f"fetch origin 失败 ({wt_main_repo})"))
                 continue
-            all_safe = True
+            blocker: Optional[tuple[str, str]] = None
+            cache_targets: list[tuple[str, list[str]]] = []
             for wt_p, _ in sub_entries:
-                if (
-                    _pane_uses_path(panes, wt_p)
-                    or has_unique_tmp_files(Path(wt_p), Path(wt_main_repo))
-                    or _WR.unsaved_reason(wt_p) is not None
-                    or _WR.saved_ref(wt_p, "") is None
-                ):
-                    all_safe = False
+                if _pane_uses_path(panes, wt_p):
+                    blocker = ("pane_busy", "仍有窗格位于该目录")
                     break
-            if all_safe:
+                if has_unique_tmp_files(Path(wt_p), Path(wt_main_repo)):
+                    blocker = ("unique_hwf_tmp", "目录内 .hwf/tmp 含主仓库不存在的独有文件")
+                    break
+                if _WR.saved_ref(wt_p, "") is None:
+                    blocker = ("head_not_in_remote", "HEAD 尚未保存在 origin/*")
+                    break
+                reason = _WR.unsaved_reason(wt_p)
+                if reason is not None:
+                    if reason == "有未跟踪文件":
+                        only_cache, cache_paths, non_cache_samples = _classify_untracked_caches(wt_p)
+                        if only_cache:
+                            cache_targets.append((wt_p, cache_paths))
+                            continue
+                        detail = (
+                            f"{reason} ({', '.join(non_cache_samples)})"
+                            if non_cache_samples
+                            else reason
+                        )
+                        blocker = ("unsaved", detail)
+                    else:
+                        blocker = ("unsaved", reason)
+                    break
+            if blocker is None and strip_caches and cache_targets:
+                for wt_p, cache_paths in cache_targets:
+                    if not _strip_known_cache_paths(wt_p, cache_paths):
+                        blocker = ("cache_strip_failed", "剥离可再生缓存后仍不干净")
+                        break
+            if blocker is None:
                 for wt_p, _ in sub_entries:
                     removable[Path(wt_p)] = wt_main_repo
+            else:
+                skipped.append((sub, blocker[0], blocker[1]))
 
     ordered = sorted(removable.items(), key=lambda item: str(item[0]).count(os.sep), reverse=True)
-    return ordered
+    return ordered, skipped
+
+
+def expired_worktrees_with_repos(repo: str, days: int, now: float) -> list[tuple[Path, str]]:
+    """跨 `~/.herdr/worktrees/` 全部仓库子目录筛选超过 N 天未改动且满足安全门禁的干净 worktree。"""
+    removable, _ = inspect_worktrees(repo, days, now, strip_caches=False)
+    return removable
 
 
 def expired_worktrees(repo: str, days: int, now: float) -> list[Path]:
     return [wt_path for wt_path, _ in expired_worktrees_with_repos(repo, days, now)]
+
+
+def format_skipped_summary(skipped: list[tuple[Path, str, str]], *, max_details: int = 20) -> list[str]:
+    """格式化保留 worktree 的卡点汇总，便于定位未能自动清理的根因。"""
+    if not skipped:
+        return []
+    counts: dict[str, int] = {}
+    for _, category, _ in skipped:
+        counts[category] = counts.get(category, 0) + 1
+    parts = ", ".join(f"{k}={counts[k]}" for k in sorted(counts))
+    lines = [f"skipped worktrees (total={len(skipped)}): {parts}"]
+    non_recent = [item for item in skipped if item[1] != "recent"]
+    for path, category, detail in non_recent[:max_details]:
+        lines.append(f"kept worktree {path}: {category} ({detail})")
+    if len(non_recent) > max_details:
+        lines.append(f"... and {len(non_recent) - max_details} more expired kept worktree(s)")
+    return lines
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -252,7 +392,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             print(f"failed {path}: {error}", file=sys.stderr)
 
     if not args.no_worktrees:
-        wts = expired_worktrees_with_repos(args.repo, args.days, now)
+        wts, skipped = inspect_worktrees(args.repo, args.days, now, strip_caches=not args.dry_run)
         pruned_repos: set[str] = set()
         for wt_path, wt_repo in wts:
             if args.dry_run:
@@ -267,6 +407,8 @@ def main(argv: Optional[list[str]] = None) -> int:
                 print(f"failed worktree {wt_path}: {res.stderr.strip()}", file=sys.stderr)
         for wt_repo in sorted(pruned_repos):
             _WR.git(wt_repo, "worktree", "prune")
+        for line in format_skipped_summary(skipped):
+            print(line)
 
     return 1 if failed else 0
 

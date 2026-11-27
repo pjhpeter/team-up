@@ -181,28 +181,45 @@ def unanswered_user_note(issue: Issue, *, exclude_note_ids: Sequence[int] = ()) 
     me = str((user_info or {}).get("username") or "") if isinstance(user_info, dict) else ""
     if not me:
         return None
-    notes = glab_api(issue.host, "GET", f"projects/{quote(issue.project, safe='')}/issues/{issue.iid}/notes?sort=desc&per_page=20")
-    if not isinstance(notes, list) or not notes:
-        return None
     excluded = {int(nid) for nid in exclude_note_ids}
+    pid = quote(issue.project, safe="")
+    # 倒序按每页 100 条拉取，避免超百条系统动态把最新用户留言或实质回复挤出窗口；
+    # 仅在整页全为系统动态/收件回执时继续向旧翻页（最多 5 页）。
+    seen_ids: set[int] = set()
     latest_user: Optional[dict[str, Any]] = None
     latest_agent_id = 0
-    for item in sorted(notes, key=lambda n: int(n.get("id") or 0), reverse=True):
-        nid = int(item.get("id") or 0)
-        if nid <= 0 or item.get("system"):
-            continue
-        author = str((item.get("author") or {}).get("username") or "")
-        body = str(item.get("body") or "")
-        if not author:
-            continue
-        if author == me:
-            if nid > latest_agent_id and _is_substantive_agent_note(body):
-                latest_agent_id = nid
-            continue
-        if nid in excluded or _is_pure_inbox_command(body, me):
-            continue
-        if latest_user is None:
-            latest_user = item
+    for page in range(1, 6):
+        query = f"projects/{pid}/issues/{issue.iid}/notes?sort=desc&per_page=100"
+        if page > 1:
+            query += f"&page={page}"
+        notes = glab_api(issue.host, "GET", query)
+        if not isinstance(notes, list) or not notes:
+            break
+        added = 0
+        for item in sorted(notes, key=lambda n: int(n.get("id") or 0), reverse=True):
+            nid = int(item.get("id") or 0)
+            if nid <= 0 or nid in seen_ids:
+                continue
+            seen_ids.add(nid)
+            added += 1
+            if item.get("system"):
+                continue
+            author = str((item.get("author") or {}).get("username") or "")
+            body = str(item.get("body") or "")
+            if not author:
+                continue
+            if author == me:
+                if nid > latest_agent_id and _is_substantive_agent_note(body):
+                    latest_agent_id = nid
+                continue
+            if nid in excluded or _is_pure_inbox_command(body, me):
+                continue
+            if latest_user is None or nid > int(latest_user.get("id") or 0):
+                latest_user = item
+        if latest_user is not None or latest_agent_id > 0:
+            break
+        if len(notes) < 100 or added == 0:
+            break
     if latest_user is not None and int(latest_user["id"]) > latest_agent_id:
         return latest_user
     return None

@@ -16,7 +16,7 @@
     既没指派人也没 @ 本人/机器人的 issue 一律忽略；已由收件箱接管的 issue 跳过。
   - 流水线：只看本人/机器人触发或合并引入的 main / release-* 失败流水线（排除允许失败和手动任务）。
   - observe 档：对 GitLab 只发 GET（ReadOnlyGitLab），只记录结果，不写评论。
-  - auto 档：定位或按需自动 clone 本地仓，以只读 tools（read,grep,find,ls）调用 omp 产出根因/复现分析，
+  - auto 档：定位或按需自动 clone 本地仓，以只读 tools（read,grep,glob）调用 omp 产出根因/复现分析，
     把中文结论写回 GitLab 评论；绝不改代码或开 MR，改代码仍等待本人发 /go。
 """
 
@@ -60,7 +60,7 @@ DEFAULTS: dict[str, Any] = {
     "overlap_s": 300,             # 增量查询往回多看一段，抵消时钟差；重复靠 judged 去重
     "release_ref": r"^(main|release-.+)$",
     "daily_cap": 200,             # 每天最多判多少个事件
-    "judge_timeout_s": 90, "retries": 3, "judge_per_tick": 10,
+    "judge_timeout_s": 90, "retries": 3, "auto_retries": 2, "judge_per_tick": 10,
     "auto_timeout_s": 300,        # auto 档只读代码分析单次超时
     "auto_max_comment_chars": 4000,
     "inputs_keep_days": 14,
@@ -95,8 +95,33 @@ def log(message: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} [proactive] {message}", flush=True)
 
 
+_NON_RETRYABLE_ERROR_MARKERS = (
+    "unknown tool",
+    "built-in tool unavailable",
+    "unknown option",
+    "invalid option",
+    "invalid argument",
+    "http 400",
+    "http 401",
+    "http 403",
+    "http 404",
+    "400 bad request",
+    "401 unauthorized",
+    "403 forbidden",
+    "404 not found",
+)
+
+
+def _is_non_retryable_error(text: str) -> bool:
+    """区分明确的配置/参数/权限错误与瞬时故障，避免对必败错误浪费重试次数。"""
+    low = (text or "").lower()
+    return any(marker in low for marker in _NON_RETRYABLE_ERROR_MARKERS)
+
+
 class ScoutError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 # ---------- 文件 ----------
@@ -229,12 +254,21 @@ class GitLabWriter:
         self.host, self.run = host, run
 
     def post_note(self, path: str, field: str, body: str) -> dict[str, Any]:
-        r = self.run(
-            ["glab", "api", "--hostname", self.host, "-X", "POST", path, "-f", f"{field}={body}"],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
+        try:
+            r = self.run(
+                ["glab", "api", "--hostname", self.host, "-X", "POST", path, "-f", f"{field}={body}"],
+                capture_output=True, text=True, timeout=30, check=False,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise ScoutError(f"glab api POST {path} timed out after 30s", retryable=True) from e
+        except OSError as e:
+            raise ScoutError(f"glab api POST {path} failed to start: {e}", retryable=True) from e
         if r.returncode != 0:
-            raise ScoutError(f"glab api POST {path} failed: {(r.stderr or '').strip()[:200]}")
+            err = (r.stderr or r.stdout or "").strip()[:200]
+            raise ScoutError(
+                f"glab api POST {path} failed: {err}",
+                retryable=not _is_non_retryable_error(err),
+            )
         try:
             return json.loads(r.stdout) if (r.stdout or "").strip() else {}
         except ValueError:
@@ -613,7 +647,7 @@ class Scout:
     def _issue_already_handled(self, pid: str, iid: int, trigger_ts: float, watch: set[str]) -> bool:
         """检查该 issue 是否已有主动接活评论，或触发后本人/机器人已实质回复。"""
         try:
-            notes = self.gitlab.json(f"projects/{pid}/issues/{iid}/notes?per_page=100") or []
+            notes = self.gitlab.json(f"projects/{pid}/issues/{iid}/notes?sort=desc&per_page=100") or []
         except (ScoutError, ValueError):
             return False
         for note in notes:
@@ -727,60 +761,98 @@ class Scout:
 
     def judge_ready(self, active: list[dict[str, Any]]) -> None:
         done = 0
+        deferred: list[dict[str, Any]] = []
         while self.state["ready"] and done < self.cfg["judge_per_tick"]:
             ev = self.state["ready"].pop(0)
             rules = [r for r in active if ev["kind"] in r["sources"]]
             if not rules:
+                self.state["attempts"].pop(ev["key"], None)
                 continue
             done += 1
-            if self.state["daily"]["judged"] >= self.cfg["daily_cap"]:
-                self.record(ev, rules, "skipped_cap", [], "超过今天判断上限")
-                continue
-            self.last_usage = 0
-            prescreen, jev_tokens = self.prescreen_with_jev(ev, rules)
-            if prescreen is not None:
-                self.state["attempts"].pop(ev["key"], None)
-                self.state["daily"]["judged"] += 1
-                self.last_usage = jev_tokens
-                self.record(
-                    ev, rules, "ignore", prescreen["rules"], prescreen["summary"],
-                    flag=prescreen.get("flag", ""), tokens=jev_tokens,
-                )
-                continue
-            try:
-                out = self.ask_model(build_prompt(ev, rules))
-                res = parse_judgement(out, rules)
-            except ScoutError as e:
-                n = self.state["attempts"].get(ev["key"], 0) + 1
-                self.state["attempts"][ev["key"]] = n
-                if n < self.cfg["retries"]:
-                    self.state["ready"].append(ev)  # 下轮重试
-                    log(f"retry {ev['key']} ({n}/{self.cfg['retries']}): {e}")
-                else:
+            progress = ev.get("_auto_progress") if isinstance(ev.get("_auto_progress"), dict) else None
+            if progress is not None:
+                res = progress["res"]
+                flag = str(res.get("flag") or "")
+                total_tokens = int(progress.get("tokens") or 0)
+                auto_ids = set(progress.get("auto_rule_ids") or [])
+                auto_rules = [r for r in rules if r["id"] in auto_ids and r["mode"] == "auto"]
+                if not auto_rules:
+                    # 重试等待期间规则档位已降级，不再执行写评论动作。
                     self.state["attempts"].pop(ev["key"], None)
-                    self.state["daily"]["unavailable"] += 1
-                    self.record(ev, rules, "unavailable", [], str(e))
-                continue
-            total_tokens = int(getattr(self, "last_usage", 0)) + jev_tokens
-            self.state["attempts"].pop(ev["key"], None)
-            self.state["daily"]["judged"] += 1
-            hits = [r for r in res["rules"] if r["hit"]]
-            flag = res["flag"]
-            if not hits:
-                if ev["kind"] == "gitlab_issue" and not flag:
-                    flag = "issue 一条都没命中"
-                self.record(ev, rules, "ignore", res["rules"], res["summary"], res["plan"], flag, tokens=total_tokens)
-                continue
-            hit_ids = {h["id"] for h in hits}
-            auto_rules = [r for r in rules if r["id"] in hit_ids and r["mode"] == "auto"]
-            if not auto_rules:
-                self.state["daily"]["would"] += 1
-                self.record(ev, rules, "would_accept", res["rules"], res["summary"], res["plan"], flag, tokens=total_tokens)
-                continue
-            rid = f"O-{self.state['seq'] + 1:04d}"
+                    ev.pop("_auto_progress", None)
+                    self.state["daily"]["would"] += 1
+                    self.record(ev, rules, "would_accept", res["rules"], res["summary"], res["plan"], flag, tokens=total_tokens)
+                    continue
+                rid = str(progress.get("rid") or f"O-{self.state['seq'] + 1:04d}")
+            else:
+                if self.state["daily"]["judged"] >= self.cfg["daily_cap"]:
+                    self.record(ev, rules, "skipped_cap", [], "超过今天判断上限")
+                    continue
+                self.last_usage = 0
+                prescreen, jev_tokens = self.prescreen_with_jev(ev, rules)
+                if prescreen is not None:
+                    self.state["attempts"].pop(ev["key"], None)
+                    self.state["daily"]["judged"] += 1
+                    self.last_usage = jev_tokens
+                    self.record(
+                        ev, rules, "ignore", prescreen["rules"], prescreen["summary"],
+                        flag=prescreen.get("flag", ""), tokens=jev_tokens,
+                    )
+                    continue
+                try:
+                    out = self.ask_model(build_prompt(ev, rules))
+                    res = parse_judgement(out, rules)
+                except ScoutError as e:
+                    n = self.state["attempts"].get(ev["key"], 0) + 1
+                    self.state["attempts"][ev["key"]] = n
+                    if n < self.cfg["retries"]:
+                        self.state["ready"].append(ev)  # 下轮重试
+                        log(f"retry {ev['key']} ({n}/{self.cfg['retries']}): {e}")
+                    else:
+                        self.state["attempts"].pop(ev["key"], None)
+                        self.state["daily"]["unavailable"] += 1
+                        self.record(ev, rules, "unavailable", [], str(e))
+                    continue
+                total_tokens = int(getattr(self, "last_usage", 0)) + jev_tokens
+                self.state["daily"]["judged"] += 1
+                hits = [r for r in res["rules"] if r["hit"]]
+                flag = res["flag"]
+                if not hits:
+                    self.state["attempts"].pop(ev["key"], None)
+                    if ev["kind"] == "gitlab_issue" and not flag:
+                        flag = "issue 一条都没命中"
+                    self.record(ev, rules, "ignore", res["rules"], res["summary"], res["plan"], flag, tokens=total_tokens)
+                    continue
+                hit_ids = {h["id"] for h in hits}
+                auto_rules = [r for r in rules if r["id"] in hit_ids and r["mode"] == "auto"]
+                if not auto_rules:
+                    self.state["attempts"].pop(ev["key"], None)
+                    self.state["daily"]["would"] += 1
+                    self.record(ev, rules, "would_accept", res["rules"], res["summary"], res["plan"], flag, tokens=total_tokens)
+                    continue
+                rid = f"O-{self.state['seq'] + 1:04d}"
+                progress = {
+                    "res": res,
+                    "auto_rule_ids": [r["id"] for r in auto_rules],
+                    "tokens": total_tokens,
+                    "rid": rid,
+                    "retries": 0,
+                }
             try:
-                action = self.execute_auto(ev, auto_rules, res, rid)
+                action = self.execute_auto(ev, auto_rules, res, rid, progress=progress)
             except ScoutError as e:
+                max_auto_retries = max(0, int(self.cfg.get("auto_retries", 2)))
+                next_retry = int(progress.get("retries", 0)) + 1
+                if e.retryable and next_retry <= max_auto_retries:
+                    progress["retries"] = next_retry
+                    ev["_auto_progress"] = progress
+                    self.state["attempts"][ev["key"]] = next_retry
+                    deferred.append(ev)
+                    stage = "comment-post" if progress.get("prepared") else "readonly-analysis"
+                    log(f"retry auto {stage} for {ev['key']} ({next_retry}/{max_auto_retries}): {e}")
+                    continue
+                self.state["attempts"].pop(ev["key"], None)
+                ev.pop("_auto_progress", None)
                 log(f"auto execution failed for {ev['key']}: {e}")
                 self.state["daily"]["unavailable"] += 1
                 self.record(
@@ -789,11 +861,15 @@ class Scout:
                     tokens=total_tokens, auto_error=str(e),
                 )
                 continue
+            self.state["attempts"].pop(ev["key"], None)
+            ev.pop("_auto_progress", None)
             self.state["daily"]["accepted"] += 1
             self.record(
                 ev, rules, "accepted", res["rules"], res["summary"], res["plan"], flag,
                 auto_action=action, auto_rule=auto_rules[0]["id"], tokens=total_tokens,
             )
+        if deferred:
+            self.state["ready"].extend(deferred)
 
     def prescreen_with_jev(
         self,
@@ -864,50 +940,76 @@ class Scout:
         auto_rules: Sequence[Mapping[str, Any]],
         judgement: Mapping[str, Any],
         rid: str,
+        *,
+        progress: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
         """执行 auto 档动作：只读分析代码并写回 GitLab 评论，绝不改代码或开 MR。"""
-        project = str(ev.get("project") or "")
-        pid = quote(project, safe="")
-        repo = self.repo_resolver.find_existing(project) if project else ""
-        if not repo and project and self.auto_clone:
-            repo = self.repo_resolver.ensure(project)
-        analysis_cwd = Path(repo) if repo and Path(repo).is_dir() else self.files.cwd
-        prompt = build_auto_analysis_prompt(ev, auto_rules, judgement, bool(repo))
-        body = self.ask_readonly_analysis(prompt, analysis_cwd).strip()
-        if not body:
-            raise ScoutError("readonly analysis returned empty comment")
-        if ev["kind"] == "gitlab_pipeline":
-            body = strip_mentions(body)
-        elif "/go" not in body:
-            body += "\n\n---\n当前仅完成自动只读分析，尚未改动代码；如需开始修改与交付，请在此回复 `/go`。"
-        body = body[: int(self.cfg["auto_max_comment_chars"])]
-        body = f"{body}\n\n{PROACTIVE_MARKER}:{rid} -->"
-
-        if ev["kind"] == "gitlab_issue":
-            iid = ev.get("iid")
-            if not isinstance(iid, int):
-                raise ScoutError(f"missing issue iid for {ev.get('key')}")
-            target_path = f"projects/{pid}/issues/{iid}/notes"
-            note = self.gitlab_writer.post_note(target_path, "body", body)
-            note_id = note.get("id")
-            comment_url = f"{ev.get('url', '')}#note_{note_id}" if note_id and ev.get("url") else str(ev.get("url", ""))
-        elif ev["kind"] == "gitlab_pipeline":
-            mr_iid = ev.get("mr_iid")
-            sha = str(ev.get("sha") or "").strip()
-            if isinstance(mr_iid, int):
-                target_path = f"projects/{pid}/merge_requests/{mr_iid}/notes"
-                note = self.gitlab_writer.post_note(target_path, "body", body)
-                note_id = note.get("id")
-                base = f"https://{self.host}/{project}/-/merge_requests/{mr_iid}"
-                comment_url = f"{base}#note_{note_id}" if note_id else base
-            elif sha:
-                target_path = f"projects/{pid}/repository/commits/{sha}/comments"
-                self.gitlab_writer.post_note(target_path, "note", body)
-                comment_url = f"https://{self.host}/{project}/-/commit/{sha}"
+        prepared = progress.get("prepared") if isinstance(progress, dict) and isinstance(progress.get("prepared"), dict) else None
+        if prepared is None:
+            project = str(ev.get("project") or "")
+            pid = quote(project, safe="")
+            if ev["kind"] == "gitlab_issue":
+                iid = ev.get("iid")
+                if not isinstance(iid, int):
+                    raise ScoutError(f"missing issue iid for {ev.get('key')}")
+                target_path = f"projects/{pid}/issues/{iid}/notes"
+                field = "body"
+                url_base = str(ev.get("url") or "")
+                append_note_anchor = bool(url_base)
+            elif ev["kind"] == "gitlab_pipeline":
+                mr_iid = ev.get("mr_iid")
+                sha = str(ev.get("sha") or "").strip()
+                if isinstance(mr_iid, int):
+                    target_path = f"projects/{pid}/merge_requests/{mr_iid}/notes"
+                    field = "body"
+                    url_base = f"https://{self.host}/{project}/-/merge_requests/{mr_iid}"
+                    append_note_anchor = True
+                elif sha:
+                    target_path = f"projects/{pid}/repository/commits/{sha}/comments"
+                    field = "note"
+                    url_base = f"https://{self.host}/{project}/-/commit/{sha}"
+                    append_note_anchor = False
+                else:
+                    raise ScoutError(f"pipeline {ev.get('key')} has neither mr_iid nor sha")
             else:
-                raise ScoutError(f"pipeline {ev.get('key')} has neither mr_iid nor sha")
-        else:
-            raise ScoutError(f"unsupported auto kind: {ev.get('kind')}")
+                raise ScoutError(f"unsupported auto kind: {ev.get('kind')}")
+
+            repo = self.repo_resolver.find_existing(project) if project else ""
+            if not repo and project and self.auto_clone:
+                repo = self.repo_resolver.ensure(project)
+            analysis_cwd = Path(repo) if repo and Path(repo).is_dir() else self.files.cwd
+            prompt = build_auto_analysis_prompt(ev, auto_rules, judgement, bool(repo))
+            body = self.ask_readonly_analysis(prompt, analysis_cwd).strip()
+            if not body:
+                raise ScoutError("readonly analysis returned empty comment", retryable=True)
+            if ev["kind"] == "gitlab_pipeline":
+                body = strip_mentions(body)
+            elif "/go" not in body:
+                body += "\n\n---\n当前仅完成自动只读分析，尚未改动代码；如需开始修改与交付，请在此回复 `/go`。"
+            body = body[: int(self.cfg["auto_max_comment_chars"])]
+            body = f"{body}\n\n{PROACTIVE_MARKER}:{rid} -->"
+            prepared = {
+                "target_path": target_path,
+                "field": field,
+                "body": body,
+                "url_base": url_base,
+                "append_note_anchor": append_note_anchor,
+                "repo": repo,
+            }
+            if isinstance(progress, dict):
+                # 评论正文已产出后立即缓存；若写 GitLab 评论瞬时失败，重试只补发评论不重跑大模型。
+                progress["prepared"] = prepared
+
+        target_path = str(prepared["target_path"])
+        field = str(prepared["field"])
+        body = str(prepared["body"])
+        url_base = str(prepared["url_base"])
+        append_note_anchor = bool(prepared["append_note_anchor"])
+        repo = str(prepared.get("repo") or "")
+
+        note = self.gitlab_writer.post_note(target_path, field, body)
+        note_id = note.get("id")
+        comment_url = f"{url_base}#note_{note_id}" if (append_note_anchor and note_id and url_base) else url_base
 
         log(f"auto comment posted for {ev.get('key')} -> {target_path} (repo={repo or 'none'})")
         return {
@@ -999,16 +1101,20 @@ class Scout:
                 cwd=str(cwd), timeout=cfg["auto_timeout_s"], check=False,
             )
         except subprocess.TimeoutExpired as e:
-            raise ScoutError(f"readonly {tool} timed out after {cfg['auto_timeout_s']}s") from e
+            raise ScoutError(f"readonly {tool} timed out after {cfg['auto_timeout_s']}s", retryable=True) from e
         except OSError as e:
-            raise ScoutError(f"readonly {tool} failed to start: {e}") from e
+            raise ScoutError(f"readonly {tool} failed to start: {e}", retryable=True) from e
         if r.returncode != 0:
-            raise ScoutError(f"readonly {tool} exited {r.returncode}: {(r.stderr or r.stdout or '').strip()[:200]}")
+            err_msg = (r.stderr or r.stdout or "").strip()[:200]
+            raise ScoutError(
+                f"readonly {tool} exited {r.returncode}: {err_msg}",
+                retryable=not _is_non_retryable_error(err_msg),
+            )
         text, _usage, err = RC.parse_headless_output(tool, r.stdout or "", mode="readonly", forbid_tools=False)
         if err == "interrupted_turn":
-            raise ScoutError(f"readonly {tool} ended abnormally")
+            raise ScoutError(f"readonly {tool} ended abnormally", retryable=True)
         if not text:
-            raise ScoutError(f"readonly {tool} returned no assistant text")
+            raise ScoutError(f"readonly {tool} returned no assistant text", retryable=True)
         return text
 
     def record(self, ev: Mapping[str, Any], rules: Sequence[Mapping[str, Any]], verdict: str,
@@ -1031,7 +1137,8 @@ class Scout:
             row["auto_error"] = auto_error
         self.files.append(self.files.records, row)
         if verdict not in ("unavailable", "skipped_cap"):
-            self.files.append(self.files.inputs, {"id": rid, "at": at, "kind": ev["kind"], "event": ev})
+            clean_ev = {k: v for k, v in ev.items() if k != "_auto_progress"}
+            self.files.append(self.files.inputs, {"id": rid, "at": at, "kind": ev["kind"], "event": clean_ev})
 
     # ---- 日常与通知 ----
 

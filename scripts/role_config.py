@@ -468,7 +468,8 @@ def build_headless_command(
             # omp 在 --no-tools 下会返回空响应，沿用 --tools read 并由解析器拦截任何实际工具调用。
             cmd.extend(["--tools", "read"])
         else:
-            cmd.extend(["--tools", "read,grep,find,ls"])
+            # omp headless 会话可用的只读内置工具为 read/grep/glob（ls 未知、find 不可用，传错会直接退出码 2）。
+            cmd.extend(["--tools", "read,grep,glob"])
         if mode in ("no_tools", "readonly"):
             cmd.extend(["--no-context-files", "--no-skills", "--no-rules", "--no-extensions", "--no-lsp"])
         if system_prompt:

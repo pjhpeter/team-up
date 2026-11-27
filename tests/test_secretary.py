@@ -740,6 +740,72 @@ class SecretaryTest(unittest.TestCase):
         self.assertTrue(any("最终关单说明" in s["text"] for s in self.forwarded()))
         self.assertNotIn(URL7, self.sec.state["issues"])
 
+    def test_routing_filters_closed_tasks_unless_explicitly_referenced_and_prioritizes_waiting_active_tasks(self) -> None:
+        # 466 已关闭且标题与在途单 502 相近；不点名 466 时应过滤已关闭单，避免与在途 502 发生名称歧义。
+        closed_url = "https://git.example.com/frontend/web-v1/-/issues/466"
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({
+            "origins": {URL7: {"project": "frontend/web-v1", "iid": 7, "repo": str(self.home / "repo")}},
+            "closed_origins": {closed_url: {"project": "frontend/web-v1", "iid": 466}},
+        }))
+        self.state["secretary"]["issues"][URL7]["waiting_user"] = True
+        self.state["secretary"]["issues"][URL7]["last_question_at"] = self.now - 300
+
+        candidates = [
+            {"iid": 466, "project": "frontend/web-v1", "title": "支付卡失败弹窗优化", "state": "closed"},
+            {"iid": 502, "project": "frontend/web-v1", "title": "支付卡失败弹窗样式修复", "state": "opened", "labels": []},
+            {"iid": 7, "project": "frontend/web-v1", "title": "老任务七号", "state": "opened", "labels": ["状态:等你处理"]},
+        ]
+        recent = [
+            {"iid": 466, "project": "frontend/web-v1", "title": "支付卡失败弹窗优化"},
+            {"iid": 502, "project": "frontend/web-v1", "title": "支付卡失败弹窗样式修复"},
+        ]
+
+        # 1. 不点名 466：466 被剔除，502 成为唯一名称匹配且 recent 也只剩 502；在途等待回复的 #7 排在候选首位并带优先标记。
+        f_cands, f_recent, idents = self.sec._prepare_routing_candidates("继续改支付卡失败弹窗", candidates, None, recent)
+        self.assertEqual([c["iid"] for c in f_cands], [7, 502])
+        self.assertEqual([r["iid"] for r in f_recent], [502])
+        self.assertTrue(idents[0].get("waiting_user"))
+        self.assertTrue(idents[0].get("recent_question"))
+        self.assertEqual(idents[0].get("priority"), "high")
+        self.assertNotIn("priority", idents[1])
+
+        # 2. 显式点名 #466 时保留该历史单供用户查询/重开。
+        f_cands_explicit, _, _ = self.sec._prepare_routing_candidates("帮我看下 #466 之前的结论", candidates, None, recent)
+        self.assertIn(466, [c["iid"] for c in f_cands_explicit])
+
+        # 3. 阈值微调到 0.76 后：0.78 命中 Jev 直转，0.72 回退 omp；且 auth_now 低于 0.85 仍强制降级 analyze。
+        captured_payloads: list[dict] = []
+
+        def make_jev(action_p: float, target_p: float, mode: str = "analyze", auth_p: float = 0.2):
+            def transport(url, body, headers, timeout_s):
+                captured_payloads.append(body)
+                return {
+                    "model": "jev-1.14.0",
+                    "answers": {
+                        "action": {"type": "choice", "choice": "relay", "probabilities": {"relay": action_p, "clarify": 1 - action_p}},
+                        "target": {"type": "choice", "choice": "502", "probabilities": {"502": target_p, "ambiguous": 1 - target_p}},
+                        "mode": {"type": "choice", "choice": mode, "probabilities": {mode: 0.90}},
+                        "auth_now": {"type": "noul", "noul": auth_p},
+                    },
+                    "usage": {},
+                }
+            return SEC._JC.JevClient({"api_key": "ts-test"}, transport=transport, sleep_fn=lambda _: None)
+
+        self.sec.jev = make_jev(0.78, 0.78, mode="deliver", auth_p=0.80)
+        res = self.sec.classify_intent("支付卡失败弹窗继续按刚才方案看下", candidates=candidates, recent=recent)
+        self.assertIsNotNone(res)
+        self.assertEqual(res["action"], "relay")
+        self.assertEqual(res["issue"], 502)
+        # auth_now=0.80 < 0.85 红线，必须降级为 analyze 保护不开工红线
+        self.assertEqual(res["mode"], "analyze")
+
+        # 0.72 低于 0.76 门槛，应回退 omp
+        self.sec.jev = make_jev(0.72, 0.72)
+        self.w.respond({"action": "clarify", "issue": None, "mode": "analyze", "reply": "请问指哪个？", "reference": "none", "evidence": ""})
+        res_low = self.sec.classify_intent("支付卡失败弹窗怎么样了", candidates=candidates, recent=recent)
+        self.assertIsNotNone(res_low)
+        self.assertEqual(res_low["action"], "clarify")
+
 
 
 

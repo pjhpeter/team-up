@@ -379,6 +379,90 @@ class RetrospectTests(unittest.TestCase):
         svg_part = html_doc.split("<svg", 1)[1].split("</svg>", 1)[0]
         self.assertNotIn("#", svg_part.replace("url(#arrow)", ""))
 
+    def test_collect_gitlab_issues_fetches_notes_desc_paginated_for_long_threads(self) -> None:
+        since_ts = ts_of(2026, 11, 24, 12, 0)
+        now_ts = ts_of(2026, 11, 27, 12, 0)
+        queries: list[str] = []
+
+        # 模拟超过 100 条系统动态的长工单：第 1 页含最新用户问题与 Agent 实质回复 + 98 条系统动态，
+        # 第 2 页含更早期的窗口内互动；若仍用旧版 sort=asc&per_page=80 会完全截断掉最新回复并误报漏回。
+        page1 = [
+            {
+                "id": 502,
+                "system": False,
+                "created_at": "2026-11-27T10:15:00+08:00",
+                "author": {"username": "pjhagent"},
+                "body": "已完成验证并附录屏证据。",
+            },
+            {
+                "id": 501,
+                "system": False,
+                "created_at": "2026-11-27T10:00:00+08:00",
+                "author": {"username": "pengjh"},
+                "body": "请补充一下验证结果",
+            },
+        ] + [
+            {
+                "id": 500 - i,
+                "system": True,
+                "created_at": "2026-11-26T12:00:00+08:00",
+                "author": {"username": "pjhagent"},
+                "body": "changed labels",
+            }
+            for i in range(98)
+        ]
+        page2 = [
+            {
+                "id": 301,
+                "system": False,
+                "created_at": "2026-11-23T09:05:00+08:00",
+                "author": {"username": "pjhagent"},
+                "body": "窗口前已答复",
+            },
+            {
+                "id": 300,
+                "system": False,
+                "created_at": "2026-11-23T09:00:00+08:00",
+                "author": {"username": "pengjh"},
+                "body": "窗口前的早期留言",
+            },
+        ]
+
+        def fake_run(cmd, **kwargs):
+            path = cmd[-1]
+            queries.append(path)
+            if path.endswith("/issues/504"):
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    stdout=json.dumps({
+                        "iid": 504, "title": "长评论单", "state": "opened",
+                        "labels": ["状态:待上线"], "web_url": "https://git.example/frontend/web-v1/-/issues/504",
+                    }),
+                    stderr="",
+                )
+            if "page=2" in path:
+                return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(page2), stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(page1), stderr="")
+
+        rows = retro_mod._collect_gitlab_issues(
+            "git.example",
+            {"frontend/web-v1": str(self.repo_dir)},
+            {"pengjh"},
+            {"frontend/web-v1": {504}},
+            since_ts,
+            now_ts,
+            fake_run,
+        )
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["user_notes_in_window"], 1)
+        self.assertEqual(row["agent_substantive_notes_in_window"], 1)
+        self.assertIsNone(row["unanswered_user_note_id"])
+        self.assertAlmostEqual(row["reply_latency_median_min"], 15.0, places=1)
+        note_queries = [q for q in queries if "/notes?" in q]
+        self.assertTrue(any("sort=desc&per_page=100" in q for q in note_queries))
+        self.assertTrue(any("page=2" in q for q in note_queries))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -296,6 +296,16 @@ class Inbox:
         for stale in list(watched)[:-200]:
             del watched[stale]
 
+    def promote_watched_active(self, url: str) -> bool:
+        """已交由调度者接手或投递的 issue 解除旧 standby 状态；保留原 event_key 避免重弹飞书接活通知。"""
+        canon_url = GP.canon_issue_url(url)
+        item = self.state["watched_issues"].get(canon_url)
+        if isinstance(item, dict) and item.get("status") == "standby":
+            item["status"] = "active"
+            item["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            return True
+        return False
+
     def owner(self, repo: str, url: str) -> tuple[str | None, str | None]:
         """返回 (任务标识, 在线调度者 pane)，都可能为 None；发现失败抛错（fail closed）。"""
         info = self.owner_info(repo, url)
@@ -482,9 +492,13 @@ class Inbox:
         if pane:
             if not self.prompt(pane, text):
                 return None
+            if self.promote_watched_active(url):
+                save_state(self.state)
             return f"已收到，已转交目标 issue {url} 的消息，等待调度者回复。"
         if not self.launch(repo, self.entry_task(text, mode), task or url, url):
             return None
+        if self.promote_watched_active(url):
+            save_state(self.state)
         return f"已收到目标 issue {url} 的消息。目前没有在线负责人，已转交调度入口，等待接手后回复。"
 
     @staticmethod
@@ -612,6 +626,7 @@ class Inbox:
                 del self.state["origins"][url]
             return False
         origin["mode"] = DELIVER
+        self.promote_watched_active(url)
         save_state(self.state)
         self.comment(where, f"@{user} 开始跑交付流程{'（debug 模式：普通开发角色保留单测，develop 部署后自动化验收，通过后提交 release MR）' if debug else ''}。{receipt}")
         return True
@@ -826,6 +841,8 @@ class Inbox:
                 title=str(issue.get("title") or ""), kind="assigned_agent", actor=actor,
                 event_key=f"todo:{todo['id']}", status="active",
             )
+        else:
+            self.promote_watched_active(url)
         save_state(self.state)
         self.api(f"todos/{todo['id']}/mark_as_done", "POST")
         if launched:
@@ -931,6 +948,8 @@ class Inbox:
                         event_key=f"todo:{todo['id']}", status="active",
                         note_url=f"{url}#note_{note_id}", excerpt=note_body,
                     )
+                elif not note_is_status:
+                    self.promote_watched_active(url)
             save_state(self.state)
         self.api(f"todos/{todo['id']}/mark_as_done", "POST")
 
@@ -1509,6 +1528,8 @@ class Inbox:
         except InboxError as exc:
             log(f"poll user todos failed: {exc}")
             todos = []
+        origins_canon = {GP.canon_issue_url(u) for u in self.state["origins"]}
+        followed_canon = {GP.canon_issue_url(u) for u in self.state["followed"]}
         watermark = self.state.get("user_todo_watermark")
         ids = [int(t["id"]) for t in todos if isinstance(t, dict) and isinstance(t.get("id"), int)]
         if watermark is None:
@@ -1533,7 +1554,12 @@ class Inbox:
                     continue
                 raw_url = str(target.get("web_url") or item.get("target_url") or "")
                 url = GP.canon_issue_url(raw_url)
-                if not url or url in self.state["origins"]:
+                if (
+                    not url
+                    or url in origins_canon
+                    or url in followed_canon
+                    or (self.state["watched_issues"].get(url) or {}).get("status") == "active"
+                ):
                     continue
                 project = ((item.get("project") or {}).get("path_with_namespace")
                            or GP.extract_project_from_web_url(url))
@@ -1577,7 +1603,12 @@ class Inbox:
                     if not isinstance(issue, dict) or issue.get("state") != "opened":
                         continue
                     url = GP.canon_issue_url(str(issue.get("web_url") or ""))
-                    if not url or url in self.state["origins"] or url in self.state["watched_issues"]:
+                    if (
+                        not url
+                        or url in origins_canon
+                        or url in followed_canon
+                        or url in self.state["watched_issues"]
+                    ):
                         continue
                     project = GP.extract_project_from_web_url(url)
                     if not self.is_project_allowed(project):

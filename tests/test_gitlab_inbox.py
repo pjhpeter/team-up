@@ -2073,6 +2073,122 @@ class DynamicAllProjectAndAuthBoundaryTests(unittest.TestCase):
             self.assertNotIn("--no-worktrees", calls[0])
             self.assertIn("--no-worktrees", calls[1])
 
+    def test_standby_promoted_to_active_on_mention_without_reannouncing_and_not_downgraded(self) -> None:
+        url = "https://git.example/frontend/web-v1/-/issues/514"
+        standby_only_url = "https://git.example/frontend/web-v1/-/issues/515"
+        repo_dir = self.tmp / "web-v1"
+        repo_dir.mkdir(exist_ok=True)
+        done_todos: list[int] = []
+
+        def fake_run(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+            if cmd[:2] == ["glab", "api"]:
+                endpoint = cmd[-1]
+                if endpoint == "projects/frontend%2Fweb-v1":
+                    return subprocess.CompletedProcess(
+                        cmd, 0, json.dumps({"path_with_namespace": "frontend/web-v1", "archived": False}), ""
+                    )
+                if endpoint == "projects/10/issues/514/notes/3010":
+                    return subprocess.CompletedProcess(
+                        cmd, 0,
+                        json.dumps({"id": 3010, "body": "@pjhagent 先做只读分析\n\n_（来自飞书秘书）_",
+                                    "author": {"username": "pengjh"}}),
+                        "",
+                    )
+                if endpoint == "projects/10/issues/515/notes/3011":
+                    return subprocess.CompletedProcess(
+                        cmd, 0,
+                        json.dumps({"id": 3011, "body": "@pjhagent /status",
+                                    "author": {"username": "pengjh"}}),
+                        "",
+                    )
+                if endpoint == "todos?state=pending&type=Issue&per_page=100":
+                    return subprocess.CompletedProcess(
+                        cmd, 0,
+                        json.dumps([{
+                            "id": 9001,
+                            "action_name": "mentioned",
+                            "author": {"username": "colleague"},
+                            "target_url": f"{url}#note_3012",
+                            "body": "@pengjh 补充一下上下文",
+                            "project": {"path_with_namespace": "frontend/web-v1"},
+                            "target": {"iid": 514, "project_id": 10, "title": "前端基建", "state": "opened", "web_url": url},
+                        }]),
+                        "",
+                    )
+                if endpoint.endswith("/mark_as_done"):
+                    done_todos.append(int(endpoint.split("/")[1]))
+                    return subprocess.CompletedProcess(cmd, 0, "{}", "")
+            return subprocess.CompletedProcess(cmd, 0, "[]", "")
+
+        cfg = {
+            "host": "git.example",
+            "agent_user": "pjhagent",
+            "allowed_users": ["pengjh"],
+            "label": "herdr-auto",
+            "projects": {},
+            "dynamic_projects": True,
+            "code_root": str(self.tmp),
+            "local_config_path": str(self.tmp / "local.json"),
+        }
+        (self.tmp / "local.json").write_text(
+            json.dumps({"projects": {"frontend/web-v1": str(repo_dir)}}), encoding="utf-8"
+        )
+        state: dict[str, Any] = {
+            "user_todo_watermark": 8000,
+            "user_assigned_since": "2026-11-27T00:00:00Z",
+            "watched_issues": {
+                url: {
+                    "url": url, "project": "frontend/web-v1", "project_id": 10, "iid": 514,
+                    "title": "前端基建", "kind": "assigned_user", "actor": "nmagent",
+                    "event_key": "user-todo:4800", "status": "standby",
+                },
+                standby_only_url: {
+                    "url": standby_only_url, "project": "frontend/web-v1", "project_id": 10, "iid": 515,
+                    "title": "仅查状态", "kind": "assigned_user", "actor": "nmagent",
+                    "event_key": "user-todo:4801", "status": "standby",
+                },
+            },
+        }
+        inbox = INBOX.Inbox(cfg, state, run=fake_run, jev=None)
+        inbox.me = "pjhagent"
+        inbox._user_token = lambda: "user-tok"  # type: ignore[method-assign]
+        inbox.handle_note = lambda *_a, **_kw: True  # type: ignore[method-assign]
+
+        # 1. 从飞书回流 @pjhagent 接手原 standby 单：解除 standby 为 active，且保留原 event_key 不重弹通知
+        inbox.handle_mention({
+            "id": 5100,
+            "action_name": "mentioned",
+            "target_type": "Issue",
+            "target_url": f"{url}#note_3010",
+            "body": "@pjhagent 先做只读分析\n\n_（来自飞书秘书）_",
+            "author": {"username": "pengjh"},
+            "project": {"id": 10, "path_with_namespace": "frontend/web-v1"},
+            "target": {"id": 5140, "iid": 514, "project_id": 10, "title": "前端基建", "state": "opened", "web_url": url},
+        })
+        self.assertEqual(state["watched_issues"][url]["status"], "active")
+        self.assertEqual(state["watched_issues"][url]["event_key"], "user-todo:4800")
+        self.assertIn(url, state["followed"])
+
+        # 2. 纯 /status 查询不应误解除 standby
+        inbox.handle_mention({
+            "id": 5101,
+            "action_name": "mentioned",
+            "target_type": "Issue",
+            "target_url": f"{standby_only_url}#note_3011",
+            "body": "@pjhagent /status",
+            "author": {"username": "pengjh"},
+            "project": {"id": 10, "path_with_namespace": "frontend/web-v1"},
+            "target": {"id": 5150, "iid": 515, "project_id": 10, "title": "仅查状态", "state": "opened", "web_url": standby_only_url},
+        })
+        self.assertEqual(state["watched_issues"][standby_only_url]["status"], "standby")
+
+        # 3. 后续同事在已 active/followed 单中再 @本人，poll_user_items 不得将其降回 standby
+        inbox.poll_user_items()
+        self.assertEqual(state["watched_issues"][url]["status"], "active")
+        self.assertEqual(state["watched_issues"][url]["event_key"], "user-todo:4800")
+        self.assertEqual(done_todos, [5100, 5101])
+
+
 
 
 

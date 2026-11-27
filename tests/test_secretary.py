@@ -806,7 +806,123 @@ class SecretaryTest(unittest.TestCase):
         self.assertIsNotNone(res_low)
         self.assertEqual(res_low["action"], "clarify")
 
+    def test_standby_overridden_when_followed_or_live_scheduler_exists(self) -> None:
+        # 1. 收件箱里仍残留 standby，但已在 followed 中 -> watched() 直接视作非 standby
+        (self.home / "state/gitlab-inbox.json").write_text(json.dumps({
+            "origins": {},
+            "followed": {URL7: {"project": "frontend/web-v1", "iid": 7}},
+            "watched_issues": {
+                URL7: {
+                    "project": "frontend/web-v1", "iid": 7, "title": "老任务",
+                    "status": "standby", "kind": "assigned_user", "actor": "nmagent",
+                    "event_key": "user-todo:1",
+                }
+            },
+        }))
+        (self.home / "gitlab-inbox.local.json").write_text(json.dumps({
+            "projects": {"frontend/web-v1": str(self.home / "repo")}
+        }))
+        watched = self.sec.watched()
+        self.assertFalse(watched[URL7]["standby"])
 
+        # 2. 即使内存里仍标着 standby=True，只要本机仓库查到在线调度者，task_line 不得误报「暂未拉起 Agent」
+        self.state["secretary"]["issues"][URL7]["standby"] = True
+        self.state["secretary"]["issues"][URL7]["repo"] = str(self.home / "repo")
+        line = self.sec.task_line(URL7, self.state["secretary"]["issues"][URL7])
+        self.assertNotIn("暂未拉起 Agent", line)
+        self.assertIn("调度者正在干活", line)
+        self.assertFalse(self.state["secretary"]["issues"][URL7]["standby"])
+
+    def test_fast_idle_stall_alert_and_exemptions(self) -> None:
+        state_file = self.home / "repo/.hwf/tmp/frontend-web-v1-7/STATE.md"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        state_file.write_text(
+            "# #7\n\n<!-- hwf:top 本段只由 task-record.py 改 -->\n"
+            "- 通知模式：免打扰\n"
+            "- 当前阶段：P0 继续推进\n"
+            "- 下一动作：等待复核\n"
+            "- 待用户事项：无\n"
+            "<!-- /hwf:top -->\n",
+            encoding="utf-8",
+        )
+        # 将 STATE.md 的 mtime 对齐到模拟当前时间，避免真实墙钟干扰
+        import os
+        os.utime(state_file, (self.now, self.now))
+
+        self.w.agent_status = "idle"
+        self.w.agents = [{"pane_id": "w1:p1", "name": "delivery-scheduler-w1-p1", "agent_status": "idle"}]
+        sent_before = len(self.w.sent)
+
+        # 1. 刚静默 10 分钟（< 15 分钟）：不触发空转告警
+        self.now += 10 * 60
+        self.assertIsNone(self.sec.patrol())
+        self.assertEqual(len(self.w.sent), sent_before)
+
+        # 2. 静默满 16 分钟（未到 1 小时整点巡检）：立刻推送空转告警，并可回复路由回原单
+        self.now += 6 * 60
+        self.assertIsNone(self.sec.patrol())
+        self.assertEqual(len(self.w.sent), sent_before + 1)
+        alert_text = self.w.sent[-1]["text"]
+        self.assertIn("调度者疑似空转", alert_text)
+        self.assertIn("#7", alert_text)
+        self.assertIn("已静默 16 分钟", alert_text)
+        self.assertIn(URL7, self.sec.state["msgs"].values())
+
+        # 3. 同一轮空转未恢复前，5 分钟后不再重复刷屏
+        self.now += 6 * 60
+        self.assertIsNone(self.sec.patrol())
+        self.assertEqual(len(self.w.sent), sent_before + 1)
+
+        # 4. 整点巡检总览也会明确标出空转告警
+        self.now += 3600
+        patrol_text = self.sec.patrol()
+        self.assertIsNotNone(patrol_text)
+        self.assertIn("进行中但调度者空闲且无活跃成员，已超过 15 分钟没有动静", patrol_text)
+
+        # 5. 成员恢复干活后刷新活跃时间，之后若再次空转满 16 分钟会重新告警
+        (self.home / "state/members.json").write_text(json.dumps({
+            "w1:p2": {"scheduler": "delivery-scheduler-w1-p1", "profile": "dev-fe"}
+        }))
+        self.w.agents = [
+            {"pane_id": "w1:p1", "name": "delivery-scheduler-w1-p1", "agent_status": "idle"},
+            {"pane_id": "w1:p2", "name": "i7-dev-fe", "agent_status": "working"},
+        ]
+        self.now += 6 * 60
+        sent_after_patrol = len(self.w.sent)
+        self.assertIsNone(self.sec.patrol())
+        self.assertEqual(len(self.w.sent), sent_after_patrol)
+
+        # 成员停工后 10 分钟不报警，满 16 分钟再次报警
+        self.w.agents[1]["agent_status"] = "idle"
+        self.now += 10 * 60
+        self.assertIsNone(self.sec.patrol())
+        self.assertEqual(len(self.w.sent), sent_after_patrol)
+        self.now += 6 * 60
+        self.assertIsNone(self.sec.patrol())
+        self.assertEqual(len(self.w.sent), sent_after_patrol + 1)
+        self.assertIn("调度者疑似空转", self.w.sent[-1]["text"])
+
+        # 6. 豁免场景：chat 对话模式、状态:等你处理、状态:待上线、STATE 待用户事项非无 均不报警
+        sent_exempt_base = len(self.w.sent)
+        for case in ("chat", "waiting_label", "ship_label", "state_todo"):
+            self.state["secretary"]["issues"][URL7].pop("stall_alerted_activity", None)
+            self.w.owner = {"task": "frontend-web-v1-7", "live_pane": "w1:p1",
+                            "status": "chat（已答复）" if case == "chat" else "in-progress"}
+            self.w.issues[7]["labels"] = (
+                ["状态:等你处理"] if case == "waiting_label"
+                else ["状态:待上线"] if case == "ship_label"
+                else ["状态:开发中"]
+            )
+            todo_val = "请拍板方案 1 或 2" if case == "state_todo" else "无"
+            state_file.write_text(
+                f"# #7\n\n<!-- hwf:top 本段只由 task-record.py 改 -->\n"
+                f"- 当前阶段：P0 继续推进\n- 待用户事项：{todo_val}\n<!-- /hwf:top -->\n",
+                encoding="utf-8",
+            )
+            os.utime(state_file, (self.now - 3600, self.now - 3600))
+            self.now += 6 * 60
+            self.sec.check_idle_stalls(force=True)
+            self.assertEqual(len(self.w.sent), sent_exempt_base, f"unexpected stall alert for case={case}")
 
 
 if __name__ == "__main__":

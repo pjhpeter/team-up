@@ -59,13 +59,13 @@
 
 ### 等待与完成判定
 
-1. `herdr agent prompt <明确target>` 不带 `--wait`；同一轮立即用后台作业运行 `python3 ~/.hwf/scripts/member-wait.py <成员> --repo <主仓库> --task <任务标识>`。不先回复用户再挂等待。回合结束前本团队每个 working/blocked 成员都须有后台等待；不使用前台等待、轮询、sleep 循环或周期性监控替代。禁用裸 `herdr agent wait`（2026-11-19 #484：成员断网后 herdr 仍报 working，干等约 2 小时），记录守卫会拦下。
+1. `herdr agent prompt <明确target>` 不带 `--wait`；同一轮立即用后台作业运行 `python3 ~/.hwf/scripts/member-wait.py <成员> --repo <主仓库> --task <任务标识>`。不先回复用户再挂等待。回合结束前本团队每个 working/blocked 成员都须有后台等待；进行中交付任务（非对话模式、非待上线/等你处理）且 `待用户事项：无` 时，禁止在零活跃成员、零后台等待的情况下单方面于终端或本地 STATE 写「暂停/收口」就结束回合——能继续的授权工作须当回合派发下一环并挂等待，确需暂停或等用户决策须先按 [communication.md](communication.md)「需要用户决定」走完整阻塞通知流程。不使用前台等待、轮询、sleep 循环或周期性监控替代。禁用裸 `herdr agent wait`，记录守卫会拦下。
 2. member-wait 单次最多等 10 分钟，边等边看屏幕。按退出码处理，同一次处理中做完：
    - `0` 到达目标状态：解析 `agent_status`，仍需等待的续挂或派下一环。blocked 用 `--until working --until idle --until done`。
    - `3` 等满 10 分钟仍在干活、屏幕在变：评审类问一次 checkpoint（“还有哪条验收没结论；没有则收敛输出”）后续挂；其他角色直接续挂。checkpoint 只核范围，不要求降严重度或放行，不计轮。**常规退出码 `3` 续挂（及 `member-settle` 的 `finished: no` 续挂）禁止逐次往 `STATE.md` 追加过程流水**，只在派活、收取最终结论或退出码 `4`/`5` 异常换会话时记 STATE。
    - `4` 卡住（报错停留 5 分钟，或 working 但屏幕 15 分钟没变）：脚本已把「⚠ 卡住、正在换新会话」写进 issue 正文。关掉该 pane，用 member-start 开新会话，把原派活内容原样重发，再挂 member-wait；STATE 记旧 session 与原因。不要接着等旧会话。
    - `5` 卡住且需要用户处理（登录、代理、额度，或同一任务 60 分钟内第二次卡住）：脚本已写「等你处理」并发 ntfy。停下等用户，不再自己换会话重试；用户处理后先 `state-set 待用户事项 无`，再重派。
-3. 后台 shell 返回假超时或未响应不代表成员完成；一次 `agent get` 核对后原样续挂，不写等待循环。watch-guard 拦下时补齐等待；成员确已不属本任务则在 STATE 记录，不猜测忽略。
+3. 后台 shell 返回假超时或未响应不代表成员完成；一次 `agent get` 核对后原样续挂，不写等待循环。watch-guard 在「成员未挂等待」或「进行中任务零活跃成员且无待用户事项却准备静默停止」时均会拦下回合结束：按提示补齐等待、当回合继续派活，或发 `todo` 评论＋贴 `状态:等你处理`＋发 ntfy＋写清 STATE「待用户事项」后再停；成员确已不属本任务则在 STATE 记录，不猜测忽略。
 4. 卡住恢复后，`state-set 当前阶段` 把「⚠ …」那句换成新的实际结果，不留过时警告。
 5. 用 `scripts/member-settle.py <成员> <落盘路径>` 收取并核验：读到本轮最终结论，间隔至少 15 秒两次状态均 idle/done 且读屏稳定才算完成。`finished: no` 续挂，不能把 settled、idle 或 prompt 返回当完成。结论与交付物都收齐才算阶段结束。
 6. prompt 超时或 `agent_prompt_stalled` 不证明未送达。先核状态与读屏；仅当本次原文仍停在输入行且最后 12 行无审批短语，才可按实际 CLI 语法补一次 Enter。不重发整段 prompt，不重跑入口。

@@ -34,6 +34,8 @@ from urllib.parse import quote
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 PATROL_S = 3600
 IDLE_ALERT_S = 3 * 3600  # 在途交付超过这么久没有任何动静，巡检里标出来
+STALL_ALERT_S = 15 * 60  # 进行中交付的调度者空闲且 0 活跃成员超过此时长，发出空转告警
+STALL_CHECK_S = 5 * 60  # 未到整点巡检时，按 5 分钟间隔快检调度者空转
 REVIEW_WIP_LIMIT = 3  # 同时等待用户拍板或确认上线的任务达到此阈值时，在总览与巡检顶部发出审核过载提醒
 MSG_MAP_CAP = 500
 RECENT_CAP = 20
@@ -66,6 +68,10 @@ QUIET_ARCHIVE_NOTE = re.compile(
 )
 USER_ACTION_HINT = re.compile(r"需要你决定|等你确认|待你确认|请确认|请回复|请授权|请合并|请测试|请处理|选一个")
 STATE_VERBOSE_RE = re.compile(r"^- 通知模式：详尽", re.M)
+STATE_TOP_OPEN_RE = re.compile(r"<!--\s*hwf:top\b[^>]*-->")
+STATE_TOP_CLOSE = "<!-- /hwf:top -->"
+NO_USER_TODO_RE = re.compile(r"^(?:无|暂无|none|n/a|-)(?:[。.;；\s]|（[^）]*）|\([^)]*\))*$", re.I)
+WAITING_STAGE_RE = re.compile(r"待上线|等待?(?:用户|发起人)|等你处理|待用户|对话模式|只读分析|已交付|已关闭|已取消|收尾完成")
 FOLDED = re.compile(r"<details>.*?</details>", re.S)
 BARE_ISSUE = re.compile(r"(?<![\[\w/&])#(\d+)(?!\d)")  # 已在链接里的「[#12]」、网址里的不算
 WAITING_LABEL = "状态:等你处理"
@@ -286,6 +292,7 @@ class Secretary:
                 "notify": o.get("notify", ""), "initiator": o.get("initiator", ""), "standby": False,
             }
         watched_issues = inbox.get("watched_issues") or {}
+        followed_urls = {canon(u) for u in (inbox.get("followed") or {})}
         for url, item in watched_issues.items():
             if not isinstance(item, Mapping):
                 continue
@@ -299,7 +306,7 @@ class Secretary:
             found[cu] = {
                 "project": project, "iid": iid, "repo": repos.get(project, ""),
                 "title": str(item.get("title") or ""),
-                "standby": item.get("status") == "standby",
+                "standby": item.get("status") == "standby" and cu not in followed_urls,
                 "watch_kind": str(item.get("kind") or ""),
                 "watch_actor": str(item.get("actor") or ""),
             }
@@ -610,12 +617,15 @@ class Secretary:
         )
 
     def patrol(self, force: bool = False) -> Optional[str]:
-        """到点（或 force）就看一遍；内容和上次发的不同才发。返回发出的文本。"""
+        """到点（或 force）就看一遍；内容和上次发的不同才发。未到整点时按 5 分钟间隔快检进行中任务的调度者空转。"""
         if not self.chat:
             return None
-        if not force and self.bridge.now() - float(self.state.get("last_patrol") or 0) < PATROL_S:
+        now = self.bridge.now()
+        if not force and now - float(self.state.get("last_patrol") or 0) < PATROL_S:
+            self.check_idle_stalls()
             return None
-        self.state["last_patrol"] = self.bridge.now()
+        self.state["last_patrol"] = now
+        self.state["last_stall_check"] = now
         lines = self.overview()
         banner = self.review_load_banner(lines)
         body_lines = ([banner, *lines] if banner else lines)
@@ -623,9 +633,71 @@ class Secretary:
         if digest == self.state.get("last_digest"):
             return None
         self.state["last_digest"] = digest
-        text = f"**每小时巡检（{time.strftime('%H:%M', time.localtime(self.bridge.now()))}）**\n" + (digest or "现在没有在跑的需求。")
-        self.say(text, f"sec-patrol-{int(self.bridge.now())}")
+        text = f"**每小时巡检（{time.strftime('%H:%M', time.localtime(now))}）**\n" + (digest or "现在没有在跑的需求。")
+        self.say(text, f"sec-patrol-{int(now)}")
         return text
+
+    def check_idle_stalls(self, force: bool = False) -> list[str]:
+        """每 5 分钟快检进行中交付：调度者空闲且 0 活跃成员超过 15 分钟（未打等你处理/待上线）即立刻告警。"""
+        if not self.chat:
+            return []
+        now = self.bridge.now()
+        if not force and now - float(self.state.get("last_stall_check") or 0) < STALL_CHECK_S:
+            return []
+        self.state["last_stall_check"] = now
+        alerts: list[str] = []
+        for url, issue in sorted(self.state["issues"].items(), key=lambda kv: (kv[1].get("project", ""), kv[1]["iid"])):
+            if issue.get("state") == "closed" or not issue.get("repo"):
+                continue
+            try:
+                is_standby, owner = self._resolve_standby_owner(url, issue)
+                if is_standby:
+                    continue
+                if owner is None:
+                    owner = self.owner(issue.get("repo") or "", url)
+            except Exception:
+                continue
+            if not owner.get("task"):
+                continue
+            pane = owner.get("live_pane")
+            if not pane:
+                continue
+            status = self.agent_status(pane)
+            busy_opt = self._query_busy_members(pane)
+            stalled, last_activity = self._eval_idle_stall(issue, owner, status, busy_opt, now)
+            if not stalled or issue.get("stall_alerted_activity") == last_activity:
+                continue
+            pid = quote(issue["project"], safe="")
+            try:
+                info = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}")
+            except Exception:
+                continue
+            all_labels = list(info.get("labels") or [])
+            issue["state"] = info.get("state") or issue.get("state", "")
+            issue["labels"] = all_labels
+            issue["waiting_user"] = WAITING_LABEL in all_labels
+            if info.get("state") != "opened" or WAITING_LABEL in all_labels or SHIP_LABEL in all_labels:
+                continue
+            labels = [l for l in all_labels if l.startswith("状态:")]
+            mins = max(1, int((now - last_activity) // 60))
+            ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
+            label_text = "、".join(labels) or "没有进度标签"
+            text = (
+                f"⚠️ **调度者疑似空转：[{ref}]({url}) {issue.get('title', '')}**\n"
+                f"当前标签：{label_text}；调度者空闲且没有在干活的成员，已静默 {mins} 分钟（未打「等你处理」或「待上线」）。\n"
+                "直接回复本条消息可让调度者说明情况或继续推进。"
+            )
+            key = f"sec-stall-{hashlib.sha256(f'{url}:{int(last_activity)}'.encode()).hexdigest()[:16]}"
+            mid = self.say(text, key)
+            issue["stall_alerted_activity"] = last_activity
+            if mid:
+                msgs = self.state["msgs"]
+                msgs[mid] = url
+                for old in list(msgs)[:-MSG_MAP_CAP]:
+                    del msgs[old]
+            alerts.append(text)
+        return alerts
+
     def overview(self) -> list[str]:
         lines = []
         for url, issue in sorted(self.state["issues"].items(), key=lambda kv: (kv[1].get("project", ""), kv[1]["iid"])):
@@ -639,6 +711,82 @@ class Secretary:
                 lines.append(line)
         return lines
 
+    def _resolve_standby_owner(self, url: str, issue: Mapping[str, Any]) -> tuple[bool, Optional[dict[str, Any]]]:
+        """核实 standby 是否已有在线/未收尾调度者：有则解除 standby 并复用本次 owner 查询结果。"""
+        if not issue.get("standby"):
+            return False, None
+        repo = issue.get("repo") or ""
+        if not repo:
+            return True, None
+        owner = self.owner(repo, url)
+        has_live_or_open = bool(owner.get("task")) and (
+            bool(owner.get("live_pane"))
+            or not str(owner.get("status") or "").lower().startswith(find_scheduler().TERMINAL_STATUS)
+        )
+        if has_live_or_open:
+            if isinstance(issue, dict):
+                issue["standby"] = False
+            return False, owner
+        return True, owner
+
+    @staticmethod
+    def _is_active_delivery_owner(owner: Mapping[str, Any]) -> bool:
+        status = str(owner.get("status") or "").strip().lower()
+        return bool(owner.get("task")) and (status.startswith("in-progress") or status.startswith("active"))
+
+    @staticmethod
+    def _state_indicates_waiting(repo: str, task: str) -> bool:
+        """读取本机 STATE.md 顶部，判断是否已明确处于待用户/待上线/对话模式/已收尾。"""
+        if not repo or not task:
+            return False
+        path = Path(repo) / ".hwf" / "tmp" / task / "STATE.md"
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        open_match = STATE_TOP_OPEN_RE.search(text)
+        if not open_match:
+            return False
+        end = text.find(STATE_TOP_CLOSE, open_match.end())
+        if end < 0:
+            return False
+        fields: dict[str, str] = {}
+        for line in text[open_match.end():end].splitlines():
+            m = re.match(r"^\s*-\s*([^：:]+)[：:](.*)$", line)
+            if m:
+                fields[m.group(1).strip()] = m.group(2).strip()
+        todo = fields.get("待用户事项", "").strip()
+        if todo and not NO_USER_TODO_RE.match(todo):
+            return True
+        return bool(WAITING_STAGE_RE.search(fields.get("当前阶段", "")))
+
+    def _eval_idle_stall(
+        self,
+        issue: Mapping[str, Any],
+        owner: Mapping[str, Any],
+        status: str,
+        busy: Optional[list[str]],
+        now: float,
+    ) -> tuple[bool, float]:
+        """判断进行中交付的调度者是否进入「空闲 + 0 活跃成员」静默空转，同时顺手刷新活跃时间戳。"""
+        if status == "working" or (busy is not None and len(busy) > 0):
+            if isinstance(issue, dict):
+                issue["last_active_at"] = now
+                issue.pop("stall_alerted_activity", None)
+            return False, 0.0
+        if not self._is_active_delivery_owner(owner) or status not in ("idle", "done") or busy is None:
+            return False, 0.0
+        if self._state_indicates_waiting(issue.get("repo") or "", str(owner["task"])):
+            if isinstance(issue, dict):
+                issue.pop("stall_alerted_activity", None)
+            return False, 0.0
+        last_activity = max(
+            float(issue.get("last_agent_at") or 0),
+            float(issue.get("last_active_at") or 0),
+            self.state_mtime(issue.get("repo") or "", str(owner["task"])),
+        )
+        return (now - last_activity >= STALL_ALERT_S), last_activity
+
     def task_line(self, url: str, issue: Mapping[str, Any]) -> str:
         pid = quote(issue["project"], safe="")
         info = self.bridge.api(f"projects/{pid}/issues/{issue['iid']}")
@@ -651,7 +799,8 @@ class Secretary:
             return ""
         labels = [l for l in all_labels if l.startswith("状态:")]
         ref = self.ref(str(issue.get("project") or ""), int(issue["iid"]))
-        if issue.get("standby"):
+        is_standby, owner = self._resolve_standby_owner(url, issue)
+        if is_standby:
             parts = ["、".join(labels) or "待你发话启动"]
             if info.get("state") == "opened":
                 parts.append("暂未拉起 Agent（回复可先只读分析，或发 /go 开工）")
@@ -665,17 +814,25 @@ class Secretary:
                 alerts.append("等你处理")
         if SHIP_LABEL in labels and info.get("state") == "opened" and self.ship_not_requested(issue, info):
             alerts.append("已待上线，但调度者没 @你 请求授权合并")
-        owner = self.owner(issue.get("repo") or "", url)
+        if owner is None:
+            owner = self.owner(issue.get("repo") or "", url)
         if owner.get("task"):
             pane = owner.get("live_pane")
             if pane:
                 status = self.agent_status(pane)
                 parts.append(f"调度者{STATUS_TEXT.get(status, status)}")
-                busy = self.busy_members(pane)
+                busy_opt = self._query_busy_members(pane)
+                busy = busy_opt or []
                 if busy:
                     parts.append(f"{'、'.join(busy)}正在干活")
                 if status == "blocked":
                     alerts.append("调度者卡在确认界面，要到电脑上处理")
+                if info.get("state") == "opened" and WAITING_LABEL not in labels and SHIP_LABEL not in labels:
+                    stalled, last_activity = self._eval_idle_stall(issue, owner, status, busy_opt, self.bridge.now())
+                    if stalled:
+                        alerts.append(f"进行中但调度者空闲且无活跃成员，已超过 {STALL_ALERT_S // 60} 分钟没有动静")
+                        if isinstance(issue, dict):
+                            issue["stall_alerted_activity"] = last_activity
             elif not str(owner.get("status") or "").lower().startswith(find_scheduler().TERMINAL_STATUS):
                 alerts.append("调度者已退出，任务还没做完")
             last = max(float(issue.get("last_agent_at") or 0), self.state_mtime(issue.get("repo") or "", owner["task"]))
@@ -742,19 +899,29 @@ class Secretary:
         except Exception:
             return "unknown"
 
-    def busy_members(self, scheduler_pane: str) -> list[str]:
-        """调度者派出去、正在干活的成员（按 state/members.json 的领取登记）；查不到就不写，不影响总览。"""
+    def _query_busy_members(self, scheduler_pane: str) -> Optional[list[str]]:
+        """查询调度者名下正在干活的成员角色；herdr 不可用或登记簿损坏时返回 None，无登记簿视为空列表。"""
         try:
             agents = {a.get("pane_id"): a for a in json.loads(self.bridge.sh(["herdr", "agent", "list"]))["result"]["agents"]}
-            members = json.loads((self.home / "state" / "members.json").read_text())
         except Exception:
+            return None
+        members_file = self.home / "state" / "members.json"
+        if not members_file.exists():
             return []
+        try:
+            members = json.loads(members_file.read_text())
+        except Exception:
+            return None
         name = (agents.get(scheduler_pane) or {}).get("name")
         if not name:
             return []
         roles = {ROLE_TEXT.get(m.get("profile", ""), m.get("profile", "")) for p, m in members.items()
                  if m.get("scheduler") == name and (agents.get(p) or {}).get("agent_status") == "working"}
         return sorted(r for r in roles if r)
+
+    def busy_members(self, scheduler_pane: str) -> list[str]:
+        """调度者派出去、正在干活的成员（按 state/members.json 的领取登记）；查不到就不写，不影响总览。"""
+        return self._query_busy_members(scheduler_pane) or []
 
     @staticmethod
     def state_mtime(repo: str, task: str) -> float:

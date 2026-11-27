@@ -5,5 +5,9 @@ test:
     # 留证测试使用真实临时仓库，omp 扩展测试调用 node，均不用 mock 掩盖运行时行为。
     - apt-get update -qq && apt-get install -y --no-install-recommends git nodejs
   script:
-    - pip install -q pyyaml pillow
+    # 国内 runner 直连 files.pythonhosted.org 易读超时，优先走国内镜像源并按顺序兜底。
+    - |
+      pip install -q --retries 3 --default-timeout 60 -i https://mirrors.cloud.tencent.com/pypi/simple pyyaml pillow \
+        || pip install -q --retries 3 --default-timeout 60 -i https://mirrors.aliyun.com/pypi/simple pyyaml pillow \
+        || pip install -q --retries 3 --default-timeout 60 -i https://pypi.tuna.tsinghua.edu.cn/simple pyyaml pillow
     - python3 -m unittest discover -s tests -p 'test_*.py'

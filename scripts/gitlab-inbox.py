@@ -71,7 +71,8 @@ LOCAL_CONFIG_PATH = HWF_HOME / "gitlab-inbox.local.json"
 STATE_PATH = HWF_HOME / "state" / "gitlab-inbox.json"
 FIND_SCHEDULER = HWF_HOME / "scripts" / "find-scheduler.py"
 RESET_SESSION = HWF_HOME / "scripts" / "reset-session.py"
-CLEAN_TMP = HWF_HOME / "scripts" / "clean-tmp.py"
+# 相对当前脚本定位同目录 clean-tmp.py，确保在非 ~/.hwf 检出路径（如 GitLab CI 容器）下也能找到
+CLEAN_TMP = Path(__file__).resolve().with_name("clean-tmp.py")
 
 CMD_TIMEOUT_S = 30
 LAUNCH_TIMEOUT_S = 60

@@ -126,7 +126,7 @@ THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "a
 PROTOCOL_PATHS = ("PROTOCOL.md", "protocol/", "skills/", "roles.yaml", "herdr/")
 NOTIFY_REMINDER = (
     "\n[通知] issue 评论只用 task-record.py note，发前按 ~/.hwf/protocol/communication.md「通知模式」「发布入口」核对；"
-    "落实完用户中途提问或修改指令并再次停下等待前，须发 --kind answer 回报结果。"
+    "仅落实完用户新提问或修改指令时发一次 --kind answer，免打扰下严禁无新用户留言时用 --kind answer 播报中间进展。"
 )
 
 

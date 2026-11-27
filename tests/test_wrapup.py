@@ -617,6 +617,19 @@ class WrapupTest(Case):
         self.assertTrue(any("sort=desc&per_page=100" in q for q in queries))
         self.assertTrue(any("page=2" in q for q in queries))
 
+    def test_unanswered_user_note_ignores_inbox_status_reply_after_user_question(self) -> None:
+        # 用户提问后又查了一次 /status，收件箱自动回复的状态摘要不能遮盖那条未答复的真实提问。
+        self.glab.issue_notes = [
+            {"id": 92, "author": {"username": "pjhagent"}, "system": False,
+             "body": "@pengjh 目标 issue https://git.example.com/group/proj/-/issues/47：打开中；状态:方案中。\n会话状态：调度者空闲。"},
+            {"id": 91, "author": {"username": "pengjh"}, "system": False, "body": "/status"},
+            {"id": 90, "author": {"username": "pengjh"}, "system": False, "body": "这个改动会影响旧版桌面端吗？"},
+            {"id": 85, "author": {"username": "pjhagent"}, "system": False, "body": "上次回复\n<!-- hwf-kind:answer -->"},
+        ]
+        found = WR.unanswered_user_note(WR.parse_issue(ISSUE))
+        self.assertIsNotNone(found)
+        self.assertEqual(found["id"], 90)
+
 
 if __name__ == "__main__":
     unittest.main()

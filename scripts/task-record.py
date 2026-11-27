@@ -24,7 +24,7 @@ INDEX：index-add 追加本调度者的一行（接手别人的任务也是追�
 STATE 顶部：state-set 维护 STATE.md 开头 `<!-- hwf:top -->` 标记之间的固定字段（见 TOP_FIELDS），其余内容不动。
 
 评论：note 按 STATE 顶部的通知模式决定发不发，并在评论末尾附隐藏标记 `<!-- hwf-kind:<类别> -->` 供飞书秘书识别。
-免打扰下 stage（阶段进度）不发，退出码 3，内容只写 STATE；step-done（步骤汇总）与 record（登记或存档）只写 GitLab 留档备查，
+免打扰下 stage（阶段进度）不发，退出码 3，内容只写 STATE；answer（实质答复）会核对原 issue 水位，若上一条面向用户的回复之后无新用户留言同样按退出码 3 拦下（防止拿 answer 播报中间进度）；step-done（步骤汇总）与 record（登记或存档）只写 GitLab 留档备查，
 不推送飞书私聊、也不覆盖 STATE「最近用户通知」；只有 todo、risk、answer、delivery-done 会推送飞书私聊并更新「最近用户通知」（详尽模式全推）。
 step-done、delivery-done（及宣告最终验收通过的交卷评论）必须在 <details> 折叠区外附「验收标准逐条对账表」
 （| 验收项 | 结果 | 录屏与时间段（或免录说明） |），逐条带 ![说明](/uploads/...mp4)、起止时间段与
@@ -1234,6 +1234,29 @@ def note_content_guard_problems(
     return problems
 
 
+def check_quiet_answer_allowed(issue_url: str) -> Optional[str]:
+    """免打扰下发 --kind answer 前核对原 issue 水位：已回复过且无更新的用户留言时拦截，防伪装 stage 播报中间进度。"""
+    try:
+        issue = _WR.parse_issue(issue_url)
+        wm = _WR.latest_note_watermark(issue)
+    except _WR.WrapupError:
+        return None
+    if wm is None:
+        return None
+    latest_uf_id = int(wm["latest_user_facing_agent_id"] or 0)
+    if latest_uf_id <= 0:
+        return None
+    latest_user = wm["latest_user"]
+    if latest_user is not None and int(latest_user["id"]) > latest_uf_id:
+        return None
+    return (
+        f"没发：现在是免打扰模式，最近一条面向用户的回复（{issue.url}#note_{latest_uf_id}）之后"
+        "没有新的用户留言或提问，禁止用 --kind answer 播报中间进度。"
+        "请只更新 STATE.md 并继续推进下一步；确实需要用户拍板/操作请用 --kind todo，"
+        "发现新风险或流程违规请用 --kind risk，整步留档请用 --kind step-done（不推飞书），整项完成请用 --kind delivery-done。"
+    )
+
+
 def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequence[str],
          *, jev: Optional[Any] = None) -> tuple[int, str]:
     body = KIND_TAG.sub("", body).strip()
@@ -1242,6 +1265,10 @@ def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequ
     mode = notify_mode(repo, task)
     if kind == "stage" and mode == QUIET:
         return EXIT_HELD, "没发：现在是免打扰模式，阶段进度只写 STATE，等步骤完成时一起发。"
+    if kind == "answer" and mode == QUIET:
+        answer_hold = check_quiet_answer_allowed(issue_url)
+        if answer_hold:
+            return EXIT_HELD, answer_hold
     if kind == "todo" and not wills:
         raise RecordError("todo 必须带 --will：写明用户同意后你要做的动作，只需要用户自己做就写 --will none")
     results = preflight(wills)

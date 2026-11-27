@@ -132,6 +132,7 @@ def owner_row(repo: str, task: str) -> Any:
 
 
 _SUBSTANTIVE_AGENT_KIND_RE = re.compile(r"<!--\s*hwf-kind:(answer|todo|risk|delivery-done|step-done)\s*-->")
+_USER_FACING_AGENT_KIND_RE = re.compile(r"<!--\s*hwf-kind:(answer|todo|risk|delivery-done)\s*-->")
 _ANY_KIND_TAG_RE = re.compile(r"<!--\s*hwf-kind:([a-z-]+)\s*-->")
 _PURE_INBOX_COMMANDS = frozenset({
     "/status", "/new", "/clear", "/免打扰", "/quiet", "/详尽", "/verbose",
@@ -149,6 +150,7 @@ _INBOX_AUTO_RECEIPT_SNIPPETS = (
     "这个 issue 已经在交付流程中了",
     "现在没有对应的交付",
 )
+_LEADING_MENTION_RE = re.compile(r"^@\S+\s+")
 
 
 def _is_pure_inbox_command(body: str, me: str) -> bool:
@@ -159,24 +161,36 @@ def _is_pure_inbox_command(body: str, me: str) -> bool:
     return len(words) == 1 and words[0].lower() in _PURE_INBOX_COMMANDS
 
 
-def _is_substantive_agent_note(body: str) -> bool:
-    if _SUBSTANTIVE_AGENT_KIND_RE.search(body):
+def _is_inbox_status_reply(stripped: str) -> bool:
+    """识别收件箱对 /status 的自动状态回复，避免遮盖未答复的用户留言。"""
+    plain = _LEADING_MENTION_RE.sub("", stripped)
+    return plain.startswith("目标 issue ") and (
+        "会话状态：" in plain or "的状态查询失败，无法确认当前进度" in plain
+    )
+
+
+def _is_substantive_agent_note(body: str, *, include_step_done: bool = True) -> bool:
+    kind_re = _SUBSTANTIVE_AGENT_KIND_RE if include_step_done else _USER_FACING_AGENT_KIND_RE
+    if kind_re.search(body):
         return True
     if _ANY_KIND_TAG_RE.search(body):
-        # record / stage 只做存档备忘，不充当对用户提问或修改意见的实质答复。
+        # record / stage（以及未包含时的 step-done）不充当面向用户的实质答复。
         return False
     stripped = body.strip()
     if not stripped:
         return False
-    if any(stripped.startswith(p) for p in _INBOX_AUTO_RECEIPT_PREFIXES):
+    plain = _LEADING_MENTION_RE.sub("", stripped)
+    if any(plain.startswith(p) for p in _INBOX_AUTO_RECEIPT_PREFIXES):
         return False
     if any(s in stripped for s in _INBOX_AUTO_RECEIPT_SNIPPETS):
+        return False
+    if _is_inbox_status_reply(stripped):
         return False
     return True
 
 
-def unanswered_user_note(issue: Issue, *, exclude_note_ids: Sequence[int] = ()) -> Optional[dict[str, Any]]:
-    """对比本单最新一条用户非系统留言与最近一条 Agent 实质回复（answer/todo/risk/delivery-done 等），返回漏回留言。"""
+def latest_note_watermark(issue: Issue, *, exclude_note_ids: Sequence[int] = ()) -> Optional[dict[str, Any]]:
+    """返回本单最新用户非系统留言与 Agent 实质回复水位；无法识别本账号时返回 None。"""
     user_info = glab_api(issue.host, "GET", "user")
     me = str((user_info or {}).get("username") or "") if isinstance(user_info, dict) else ""
     if not me:
@@ -184,10 +198,11 @@ def unanswered_user_note(issue: Issue, *, exclude_note_ids: Sequence[int] = ()) 
     excluded = {int(nid) for nid in exclude_note_ids}
     pid = quote(issue.project, safe="")
     # 倒序按每页 100 条拉取，避免超百条系统动态把最新用户留言或实质回复挤出窗口；
-    # 仅在整页全为系统动态/收件回执时继续向旧翻页（最多 5 页）。
+    # 仅在整页全为系统动态/收件回执/纯存档时继续向旧翻页（最多 5 页）。
     seen_ids: set[int] = set()
     latest_user: Optional[dict[str, Any]] = None
     latest_agent_id = 0
+    latest_user_facing_agent_id = 0
     for page in range(1, 6):
         query = f"projects/{pid}/issues/{issue.iid}/notes?sort=desc&per_page=100"
         if page > 1:
@@ -209,18 +224,33 @@ def unanswered_user_note(issue: Issue, *, exclude_note_ids: Sequence[int] = ()) 
             if not author:
                 continue
             if author == me:
-                if nid > latest_agent_id and _is_substantive_agent_note(body):
+                if nid > latest_agent_id and _is_substantive_agent_note(body, include_step_done=True):
                     latest_agent_id = nid
+                if nid > latest_user_facing_agent_id and _is_substantive_agent_note(body, include_step_done=False):
+                    latest_user_facing_agent_id = nid
                 continue
             if nid in excluded or _is_pure_inbox_command(body, me):
                 continue
             if latest_user is None or nid > int(latest_user.get("id") or 0):
                 latest_user = item
-        if latest_user is not None or latest_agent_id > 0:
+        if latest_user is not None or latest_user_facing_agent_id > 0:
             break
         if len(notes) < 100 or added == 0:
             break
-    if latest_user is not None and int(latest_user["id"]) > latest_agent_id:
+    return {
+        "latest_user": latest_user,
+        "latest_agent_id": latest_agent_id,
+        "latest_user_facing_agent_id": latest_user_facing_agent_id,
+    }
+
+
+def unanswered_user_note(issue: Issue, *, exclude_note_ids: Sequence[int] = ()) -> Optional[dict[str, Any]]:
+    """对比本单最新一条用户非系统留言与最近一条 Agent 实质回复（answer/todo/risk/delivery-done 等），返回漏回留言。"""
+    wm = latest_note_watermark(issue, exclude_note_ids=exclude_note_ids)
+    if wm is None:
+        return None
+    latest_user = wm["latest_user"]
+    if latest_user is not None and int(latest_user["id"]) > int(wm["latest_agent_id"]):
         return latest_user
     return None
 

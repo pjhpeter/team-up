@@ -220,6 +220,54 @@ class NoteTests(Case):
         TR.state_set(self.repo, TASK, "通知模式", "详尽（用户 note_3）")
         self.assertEqual(self.note("stage", "本轮评审通过")[0], TR.EXIT_OK)
 
+    def test_quiet_mode_blocks_unsolicited_answer_without_new_user_note(self) -> None:
+        # 1) 全新工单尚无面向用户的 Agent 回复（即使已有收件箱回执和 record 备案）：首次 answer（如对话模式首轮分析）放行。
+        self.glab.issue_notes = [
+            {"id": 102, "author": {"username": "pjhagent"}, "system": False, "body": "备案\n<!-- hwf-kind:record -->"},
+            {"id": 101, "author": {"username": "pjhagent"}, "system": False,
+             "body": "已收到目标 issue https://git.example.com/group/proj/-/issues/47 的消息。目前没有在线负责人，已转交调度入口，等待接手后回复。"},
+        ]
+        code0, _ = self.note("answer", "首次只读分析结论")
+        self.assertEqual(code0, TR.EXIT_OK)
+
+        # 2) 已发过 answer 回复用户后，即使用户中间发了 /status 且收件箱回了状态文本，也没有新的用户提问：再发 answer 须拦下。
+        self.glab.issue_notes = [
+            {"id": 115, "author": {"username": "pjhagent"}, "system": False,
+             "body": "@pengjh 目标 issue https://git.example.com/group/proj/-/issues/47：打开中；状态:方案中。\n会话状态：调度者空闲。"},
+            {"id": 114, "author": {"username": "pengjh"}, "system": False, "body": "/status"},
+            {"id": 113, "author": {"username": "pjhagent"}, "system": False, "body": "阶段存档\n<!-- hwf-kind:record -->"},
+            {"id": 112, "author": {"username": "pjhagent"}, "system": False, "body": "已答复\n<!-- hwf-kind:answer -->"},
+            {"id": 110, "author": {"username": "pengjh"}, "system": False, "body": "现在进展如何？"},
+        ]
+        code1, msg1 = self.note("answer", "Windows CI 第一轮失败，正在继续排查")
+        self.assertEqual(code1, TR.EXIT_HELD)
+        self.assertIn("没有新的用户留言或提问", msg1)
+        self.assertIn("#note_112", msg1)
+
+        # 同期真正的 todo / risk / record 仍照常放行。
+        self.assertEqual(self.note("todo", "需要你决定：是否切方案 B", "none")[0], TR.EXIT_OK)
+        self.assertEqual(self.note("risk", "发现安全风险：隔离容器退出")[0], TR.EXIT_OK)
+        self.assertEqual(self.note("record", "补充备案")[0], TR.EXIT_OK)
+
+        # 3) 用户发出新的非纯指令留言后（即使中间已有收件箱回执和 step-done 归档，也未推飞书）：answer 恢复放行。
+        self.glab.issue_notes = [
+            {"id": 122, "author": {"username": "pjhagent"}, "system": False, "body": "步骤 1 完成\n<!-- hwf-kind:step-done -->"},
+            {"id": 121, "author": {"username": "pjhagent"}, "system": False,
+             "body": "已收到，已转交目标 issue https://git.example.com/group/proj/-/issues/47 的消息，等待调度者回复。"},
+            {"id": 120, "author": {"username": "pengjh"}, "system": False, "body": "那图片缓存这一项结论如何？"},
+            {"id": 112, "author": {"username": "pjhagent"}, "system": False, "body": "已答复\n<!-- hwf-kind:answer -->"},
+        ]
+        code2, _ = self.note("answer", "图片缓存热态命中已验证通过。")
+        self.assertEqual(code2, TR.EXIT_OK)
+
+        # 4) 详尽模式下不拦截 answer。
+        TR.state_set(self.repo, TASK, "通知模式", "详尽（用户 note_125）")
+        self.glab.issue_notes = [
+            {"id": 130, "author": {"username": "pjhagent"}, "system": False, "body": "已答复\n<!-- hwf-kind:answer -->"},
+            {"id": 120, "author": {"username": "pengjh"}, "system": False, "body": "那图片缓存这一项结论如何？"},
+        ]
+        self.assertEqual(self.note("answer", "详尽模式补充进展")[0], TR.EXIT_OK)
+
     def test_same_body_is_sent_once(self) -> None:
         self.note("answer", "结论")
         self.assertEqual(self.note("answer", "结论")[0], TR.EXIT_HELD)

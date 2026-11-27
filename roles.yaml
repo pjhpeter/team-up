@@ -40,31 +40,27 @@ team:
 
   # 方案作者：技术方案初稿、逐文件改动、回滚与验证表、评审回改；不签发不自审。
   arch-lite:
-    tool: codex
-    model: gpt-6.2-astra
+    tool: agy
+    model: claude-opus-5-5-medium
     thinking: medium
-    auto_compact_tokens: 200000
 
   # 开发者（不分前后端的仓库）
   dev:
-    tool: codex
-    model: gpt-6.2-sol
+    tool: agy
+    model: gemini-4-hydrogen-medium
     thinking: medium
-    auto_compact_tokens: 200000
 
   # 前端开发者
   dev-fe:
-    tool: codex
-    model: gpt-6.2-sol
+    tool: agy
+    model: gemini-4-hydrogen-medium
     thinking: medium
-    auto_compact_tokens: 200000
 
   # 后端开发者
   dev-be:
-    tool: codex
-    model: gpt-6.2-sol
+    tool: agy
+    model: gemini-4-hydrogen-medium
     thinking: medium
-    auto_compact_tokens: 200000
 
   # 测试用例作者
   test-writer:

@@ -23,8 +23,8 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `protocol/` | 七个主题：调度、沟通、规划、实现、评审测试、交付、工作树；进入对应阶段时再读 |
 | `skills/` | 成员干活的具体做法（install.sh 链接到 `~/.agents/skills/` 和 `~/.claude/skills/`，不走团队流程时也能用）：`acceptance-test-cases` 写和评测试用例，`test-first-evidence` 测试先行留证与实现前核验，`scoped-code-review` 限定范围的代码评审与回改核验，`real-browser-acceptance` 真实浏览器或桌面验收、过程录屏与附件上传、服务清理。协议管何时做、谁做、出口，skill 管怎么做 |
 | `workflows/team-up.yaml` | Herdr 启动团队的入口 |
-| `roles.yaml` | **全部角色的唯一配置源**：统一配置 11 个交付团队成员（`team`）和 4 个后台服务（`services`：`secretary`、`proactive`、`retrospect`、`typesafe`）的 CLI 工具、模型与思考强度；外围服务修改后免重启热生效，交付团队改完运行 `python3 ~/.hwf/scripts/role_config.py sync` 同步到 `herdr/config.yaml`（可用 `role_config.py show` 一键总览、`check` 校验同步） |
-| `herdr/config.yaml` | 由 `roles.yaml` 自动生成的 Herdr 插件配置（请勿手工编辑；`install.sh` 自动先同步再把 Herdr 插件配置链接到这里） |
+| `roles.yaml` | **全部角色的团队默认配置源（入库）**：统一配置 11 个交付团队成员（`team`）和 4 个后台服务（`services`：`secretary`、`proactive`、`retrospect`、`typesafe`）的 CLI 工具、模型与思考强度；**本机个人调整写在不入库的 `roles.local.yaml`**（只写要覆盖的角色，换 `tool` 整条替换，同 `tool` 逐字段覆盖；10 个成员和 4 个后台服务改完免重启自动生效，改 `scheduler` 跑一次 `python3 ~/.hwf/scripts/role_config.py sync` 同步不入库的 `herdr/config.local.yaml`；可用 `role_config.py show` 一键看来源与生效参数、`check` 校验） |
+| `herdr/config.yaml` | 仅由入库 `roles.yaml` 自动生成的团队默认 Herdr 配置（请勿手工编辑；本机合并 `roles.local.yaml` 后生成不入库的 `herdr/config.local.yaml`，`install.sh` 与 `role_config.py sync` 将 Herdr 插件配置软链指向后者，不污染 git） |
 | `herdr/droid-arch.json` | 备用 droid 会话配置（架构师现已改用 `agy` + `gemini-4-neon-xhigh`；若在 `roles.yaml` 把任意角色切为 `droid`，`role_config.py sync` 会自动托管生成对应 `herdr/droid-<role>.json`） |
 | `member-omp.yml` | 成员的 omp 上下文压缩设置（约 20 万词元压缩；目前没有角色使用） |
 | `scheduler-omp.yml` | 调度者的上下文压缩设置 |
@@ -36,7 +36,7 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 | `jev-gates.json` | Jev 五道决策关卡的阈值与关卡 4/5 检查清单（按文件 mtime 自动热加载，免重启生效；安全与授权红线标 `protected: true` 锁死，其余常规项由周期复盘在数据达标并通过单测后自动新增、调优或淘汰） |
 | `proactive-rules.md` | 主动接活的规则：什么情况 → 做什么，每条规则单独一档 |
 
-不入库（每台电脑自己的）：`state/`（运行状态）、`gitlab-inbox.local.json`（每个项目在本机的仓库路径，也可覆盖共用配置里的其他值，比如换成你自己的白名单账号）。
+不入库（每台电脑自己的）：`state/`（运行状态与本机托管 droid 配置）、`roles.local.yaml`（本机个人角色模型/工具覆盖，只需写要改的角色）、`herdr/config.local.yaml`（合并 `roles.yaml` 与 `roles.local.yaml` 生成的本机 Herdr 配置）、`gitlab-inbox.local.json`（每个项目在本机的仓库路径，也可覆盖共用配置里的其他值，比如换成你自己的白名单账号）、`feishu-bridge.local.json`（飞书应用与用户映射）。
 
 收件箱要常驻在一个 Herdr 窗格里：`python3 ~/.hwf/scripts/gitlab-inbox.py`；相关脚本更新后空闲时会自动热重载，改了配置则在那个窗格按 Ctrl+C 再重新运行。
 
@@ -119,6 +119,6 @@ python3 ~/.hwf/scripts/init-project.py ~/code/<仓库> --apply --smoke "国内=h
 
 1. 在 `~/.hwf` 里建分支：`git switch -c <改什么>`。
 2. 按 `PROTOCOL.md`「规则维护方式」修改对应条款，不追加事故流水账；workflow 用 loader 校验，脚本只跑直接相关的测试文件或用例。
-3. 调整任意角色的工具、模型或思考强度时，直接编辑 `~/.hwf/roles.yaml`；若改动了 `team` 段，运行 `python3 ~/.hwf/scripts/role_config.py sync` 同步 `herdr/config.yaml` 并一同提交（其他电脑首次安装或更换环境跑一次 `install.sh` 即可自动同步并建软链）。
+3. 只改自己本机用的模型或工具时，编辑不入库的 `~/.hwf/roles.local.yaml`（只写要覆盖的角色，10 个交付成员与 4 个后台服务改完免重启生效；改动 `scheduler` 跑一次 `python3 ~/.hwf/scripts/role_config.py sync` 刷新不入库的 `herdr/config.local.yaml`，不影响仓库）；只有要调整所有人共用的默认配置时，才改 `~/.hwf/roles.yaml` 并跑 `role_config.py sync` 把 `herdr/config.yaml` 一同提交（其他电脑首次安装或更换环境跑一次 `install.sh` 即可自动同步并建软链）。
 
-协议入口、主题、skill 与角色配置在本机更新后，下次读取时生效；收件箱监听 `PROTOCOL.md`、`protocol/`、`skills/`、`roles.yaml` 与 `herdr/` 的提交变化并提醒在途调度者。新增 skill 后要再跑一次 `install.sh` 才会链接到各 Agent。常驻的 `gitlab-inbox.py` 与 `feishu-bridge.py` 检测到自身及依赖模块（含 `role_config.py`）变化且语法检查通过后，会在空闲时自动重新加载（窗格打印 `hot-reloading ...`）；`roles.yaml` 与 `jev-gates.json` 按 mtime 热读，修改后免重启生效；修改本机 JSON 配置仍需在原窗格重启相应进程。
+协议入口、主题、skill 与角色配置在本机更新后，下次读取时生效；收件箱监听 `PROTOCOL.md`、`protocol/`、`skills/`、`roles.yaml` 与 `herdr/` 的提交变化并提醒在途调度者。新增 skill 后要再跑一次 `install.sh` 才会链接到各 Agent。常驻的 `gitlab-inbox.py` 与 `feishu-bridge.py` 检测到自身及依赖模块（含 `role_config.py`）变化且语法检查通过后，会在空闲时自动重新加载（窗格打印 `hot-reloading ...`）；`roles.yaml`、`roles.local.yaml` 与 `jev-gates.json` 按 mtime 热读，修改后免重启生效；修改本机 JSON 配置仍需在原窗格重启相应进程。

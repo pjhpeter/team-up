@@ -17,7 +17,7 @@
 | test | 正常流程评审放行后、debug 在 develop 部署后的真实自动化、UI 走查、报告与录屏/截图证据 |
 | dev-fe / dev-be / dev | 分别只写前端、后端或不分端的仓库，按已批准验收与用例实现、修复 |
 
-- 成员执行体、模型、thinking、YOLO 启动参数统一维护在全局配置 `roles.yaml`（`team` 段；改动后由 `scripts/role_config.py sync` 同步生成 `herdr/config.yaml` 供 Herdr 插件入口读取），读取顺序为全局配置（优先 `roles.yaml`，回退 `herdr plugin config-dir herdr-workflows`）→ 仓库 `.hwf/config.yaml` → `.hwf/config.local.yaml`，后者按整条命名 entry 覆盖。同机同角色仅维护全局配置，不在仓库重复定义。
+- 成员执行体、模型、thinking、YOLO 启动参数统一维护在全局配置 `roles.yaml`（入库团队默认）与本机覆盖 `roles.local.yaml`（不入库，只需写要覆盖的角色；换 `tool` 整条替换，同 `tool` 或省略 `tool` 逐字段覆盖；`scripts/role_config.py sync` 分别同步入库 `herdr/config.yaml` 与不入库 `herdr/config.local.yaml` 供 Herdr 插件入口读取），读取顺序为全局配置（优先 `roles.yaml` + `roles.local.yaml`，回退 `herdr plugin config-dir herdr-workflows`）→ 仓库 `.hwf/config.yaml` → `.hwf/config.local.yaml`，后者按整条命名 entry 覆盖。同机同角色仅维护全局配置，不在各业务仓库重复定义。
 - scheduler 跟随发起会话的模型与 thinking，配置不写死；其余成员必须显式使用配置的模型参数，不能依赖执行体默认值。访问 herdr socket 的验证用 `test-herdr` profile。debug 的开发角色见 [implementation.md](implementation.md)「debug 模式」。
 - 用户指定其他模型才可覆盖，记录来源和适用范围；模型不可用/额度耗尽须报告阻塞，取得本次替换授权后用 `--model-override` 与 `--authorized-by` 领取。授权结束恢复默认，因额度临时替换的按授权在额度恢复后切回。替换不取消独立终审。
 - 成员统一以 YOLO 权限启动，但不豁免全局禁令与授权边界。模型、执行体或 herdr 版本变化后，首次使用 profile 前实测 `working`/`blocked` 识别及结论格式；换调度者执行体时同样核验审批界面，不能仅凭 working 可识别就启用。
@@ -43,7 +43,7 @@
 - 有合格空闲成员就复用，包括本团队其他 tab 中的成员；均忙才新建。成员不跨调度者占用、不抢别的 issue 未释放的成员；创建前记录角色、pane、session 与 `created_by`，各团队无跨调度者角色锁。
 - 每个调度者独占 tab；成员只在自己的 tab 内创建/复用，布局、保持焦点、最小窗格由 member-start 管理，太挤另开 tab。记录实际返回的 pane/tab，不拼 ID，不搬动其他团队。
 - 派活前保证持久标题为 `角色-实际模型-任务`，未定任务先写“待派任务”，领取、复用或改任务时更新；不只依赖进程动态标题。
-- 复用 pane 不等于沿用会话：新 issue（含父转子、子转子）必须新会话。先保存旧产出与 session，确认交接后用 member-start 默认重启，不带 resume/continue；只有能验证 session 已变化时才用 `/new`。同 issue 回改可沿用，但每次阶段切换、收到 `roles.yaml` / `herdr/` 角色配置更新，或发现已建成员的实际执行体/模型与当前 `roles.yaml` 不一致（且无有效 `--model-override` 用户授权）时，派活前必须先运行 `member-start.py --keep-session` 让脚本自动将旧执行体/模型窗格重启到新配置，禁止绕过脚本直接向旧配置会话 `herdr agent prompt`；同一开发会话连续 2 轮真机或集成回改仍未收敛时，去掉 `--keep-session` 换干净新会话。test 每轮新会话按 [review-testing.md](review-testing.md) §8。
+- 复用 pane 不等于沿用会话：新 issue（含父转子、子转子）必须新会话。先保存旧产出与 session，确认交接后用 member-start 默认重启，不带 resume/continue；只有能验证 session 已变化时才用 `/new`。同 issue 回改可沿用，但每次阶段切换、收到 `roles.yaml` / `herdr/` 角色配置更新，或发现已建成员的实际执行体/模型与当前生效角色配置（`roles.yaml` 叠加 `roles.local.yaml`）不一致（且无有效 `--model-override` 用户授权）时，派活前必须先运行 `member-start.py --keep-session` 让脚本自动将旧执行体/模型窗格重启到新配置，禁止绕过脚本直接向旧配置会话 `herdr agent prompt`；同一开发会话连续 2 轮真机或集成回改仍未收敛时，去掉 `--keep-session` 换干净新会话。test 每轮新会话按 [review-testing.md](review-testing.md) §8。
 - `--keep-session` 只在同一 issue 可沿用且实际执行体与启动命令符合配置时保留原会话（不一致时脚本自动重启切换）。尚无 spec 时按临时需求标识归档，发布后关联 URL，再给正式 issue 建新会话，不恢复临时分析会话冒充。
 
 ## 派活与结果收取

@@ -7,3 +7,6 @@ __pycache__/
 # 收件箱的本机部分（GitLab 项目 → 本机仓库路径）；共用部分 gitlab-inbox.config.json 入库
 gitlab-inbox.local.json
 feishu-bridge.local.json
+# 本机角色个人覆盖与合并生成的 Herdr 配置，不入库；团队默认在 roles.yaml / herdr/config.yaml
+roles.local.yaml
+herdr/config.local.yaml

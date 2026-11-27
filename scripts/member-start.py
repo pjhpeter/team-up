@@ -102,11 +102,27 @@ def main_repo(cwd: str) -> Optional[Path]:
 
 
 def _profiles_from_layer(path: Path) -> dict[str, Any]:
-    """同时兼容统一格式 roles.yaml（team 段）与传统 Herdr 格式（profiles 段）。"""
+    """同时兼容统一格式 roles.yaml（自动合并同目录 roles.local.yaml）与传统 Herdr 格式（profiles 段）。"""
+    if path.name == _RC.ROLES_FILENAME:
+        try:
+            data = _RC.load_roles(hwf_home=path.parent, include_local=True)
+        except _RC.RoleConfigError as exc:
+            raise ClaimError(str(exc)) from exc
+        out: dict[str, Any] = {}
+        for role_name, spec in data.get("team", {}).items():
+            try:
+                # 成员运行时托管 droid 配置落到不入库的 state/，避免污染受 Git 跟踪的 herdr/。
+                out[str(role_name)] = _RC.compile_team_profile(
+                    str(role_name), spec, hwf_home=path.parent, write_settings=True, settings_subdir="state"
+                )
+            except _RC.RoleConfigError as exc:
+                raise ClaimError(str(exc)) from exc
+        return out
+
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     if not isinstance(data, dict):
         return {}
-    out: dict[str, Any] = {}
+    out = {}
     raw_team = data.get("team")
     if isinstance(raw_team, dict):
         for role_name, spec in raw_team.items():
@@ -114,7 +130,7 @@ def _profiles_from_layer(path: Path) -> dict[str, Any]:
                 continue
             try:
                 out[str(role_name)] = _RC.compile_team_profile(
-                    str(role_name), spec, hwf_home=path.parent, write_settings=True
+                    str(role_name), spec, hwf_home=path.parent, write_settings=True, settings_subdir="state"
                 )
             except _RC.RoleConfigError as exc:
                 raise ClaimError(str(exc)) from exc

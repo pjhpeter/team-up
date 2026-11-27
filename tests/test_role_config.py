@@ -49,7 +49,8 @@ def _write_roles(home: Path, content: str) -> Path:
 class RepoConsistencyTests(unittest.TestCase):
     def test_real_roles_yaml_valid_and_synced_with_herdr_config(self) -> None:
         RC.clear_cache()
-        data = RC.load_roles(HWF_ROOT)
+        # 仓库一致性单测只校验入库默认配置，不受开发者本机 roles.local.yaml 覆盖影响
+        data = RC.load_roles(HWF_ROOT, include_local=False)
         self.assertEqual(data["default_profile"], "scheduler")
         for role in (
             "scheduler", "arch", "arch-lite", "dev", "dev-fe", "dev-be",
@@ -671,6 +672,362 @@ services: {}
     def test_watched_scripts_include_role_config(self) -> None:
         self.assertIn(SCRIPTS_DIR / "role_config.py", GITLAB_INBOX.watched_scripts())
         self.assertIn(SCRIPTS_DIR / "role_config.py", FEISHU_BRIDGE.watched_scripts())
+
+
+class LocalRolesOverrideTests(unittest.TestCase):
+    def _write_local(self, home: Path, content: str) -> Path:
+        path = home / "roles.local.yaml"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_sparse_field_merge_and_tool_switch_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hwf-roles-local-") as tmp:
+            home = Path(tmp)
+            _write_roles(
+                home,
+                """
+default_profile: scheduler
+team:
+  scheduler:
+    tool: omp
+    model: null
+    thinking: null
+    omp_config: ~/.hwf/scheduler-omp.yml
+  arch:
+    tool: agy
+    model: gemini-4-neon-xhigh
+    thinking: xhigh
+  dev:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: medium
+    auto_compact_tokens: 200000
+    extra_args: ["--codex-flag"]
+  code-review:
+    tool: codex
+    model: gpt-6.2-astra
+    thinking: medium
+    auto_compact_tokens: 200000
+services:
+  secretary:
+    tool: omp
+    model: jc-gpt/gpt-6-luna
+    thinking: medium
+    timeout_s: 120
+""".strip() + "\n",
+            )
+            self._write_local(
+                home,
+                """
+team:
+  # 省略 tool：保留 codex / gpt-6.2-sol，仅改 thinking 并清空 auto_compact_tokens
+  code-review:
+    thinking: high
+    auto_compact_tokens: null
+  # 切换 tool：整条替换，不继承 codex 的 auto_compact_tokens 与 extra_args
+  dev:
+    tool: droid
+    model: gemini-4-carbon
+    thinking: high
+  # 新增本机专属角色
+  custom-fast:
+    tool: claude
+    model: claude-haiku-4-5
+    thinking: low
+services:
+  secretary:
+    thinking: low
+""".strip() + "\n",
+            )
+            RC.clear_cache()
+            loaded = RC.load_roles_with_sources(home, include_local=True)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            data, sources = loaded
+
+            self.assertEqual(sources["team"], {"code-review", "dev", "custom-fast"})
+            self.assertEqual(sources["services"], {"secretary"})
+
+            # 未覆盖角色原样继承
+            self.assertEqual(data["team"]["arch"]["tool"], "agy")
+            self.assertEqual(data["team"]["arch"]["model"], "gemini-4-neon-xhigh")
+
+            # 同工具字段级合并（且支持 null 清空）
+            cr = data["team"]["code-review"]
+            self.assertEqual(cr["tool"], "codex")
+            self.assertEqual(cr["model"], "gpt-6.2-astra")
+            self.assertEqual(cr["thinking"], "high")
+            self.assertIsNone(cr["auto_compact_tokens"])
+
+            # 换工具整条替换（不带入 codex 参数）
+            dev = data["team"]["dev"]
+            self.assertEqual(dev["tool"], "droid")
+            self.assertEqual(dev["model"], "gemini-4-carbon")
+            self.assertEqual(dev["thinking"], "high")
+            self.assertNotIn("auto_compact_tokens", dev)
+            self.assertNotIn("extra_args", dev)
+
+            # 本机新增角色
+            self.assertEqual(data["team"]["custom-fast"]["model"], "claude-haiku-4-5")
+
+            # 后台服务字段级合并
+            sec = data["services"]["secretary"]
+            self.assertEqual(sec["tool"], "omp")
+            self.assertEqual(sec["model"], "jc-gpt/gpt-6-luna")
+            self.assertEqual(sec["thinking"], "low")
+            self.assertEqual(sec["timeout_s"], 120)
+
+            # include_local=False 仅返回默认 roles.yaml
+            base_only = RC.load_roles(home, include_local=False)
+            self.assertEqual(base_only["team"]["dev"]["tool"], "codex")
+            self.assertNotIn("custom-fast", base_only["team"])
+
+    def test_local_validation_errors_and_empty_comment_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hwf-roles-local-err-") as tmp:
+            home = Path(tmp)
+            _write_roles(
+                home,
+                """
+default_profile: scheduler
+team:
+  scheduler:
+    tool: omp
+  dev:
+    tool: codex
+    model: gpt-6.2-sol
+services: {}
+""".strip() + "\n",
+            )
+            # 仅注释/空文件不报错，等价于无覆盖
+            self._write_local(home, "# 留空表示全用默认\n")
+            RC.clear_cache()
+            data = RC.load_roles(home, include_local=True)
+            self.assertEqual(data["team"]["dev"]["model"], "gpt-6.2-sol")
+
+            # 换 tool 但漏写 model 必须报错，绝不把 codex 模型错配给 droid
+            self._write_local(home, "team:\n  dev:\n    tool: droid\n")
+            RC.clear_cache()
+            with self.assertRaisesRegex(RC.RoleConfigError, "缺少必填字段 model"):
+                RC.load_roles(home, include_local=True)
+
+            # 顶层拼写错误（如 teams）必须报错，防止静默失效
+            self._write_local(home, "teams:\n  dev:\n    thinking: high\n")
+            RC.clear_cache()
+            with self.assertRaisesRegex(RC.RoleConfigError, "未知顶层字段"):
+                RC.load_roles(home, include_local=True)
+
+            # 非对象顶层报错
+            self._write_local(home, "- invalid\n")
+            RC.clear_cache()
+            with self.assertRaisesRegex(RC.RoleConfigError, "顶层必须是 YAML 映射对象"):
+                RC.load_roles(home, include_local=True)
+
+    def test_hot_reload_on_local_create_modify_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hwf-roles-local-hot-") as tmp:
+            home = Path(tmp)
+            _write_roles(
+                home,
+                """
+team: {}
+services:
+  secretary:
+    tool: omp
+    model: base-model
+    thinking: medium
+""".strip() + "\n",
+            )
+            RC.clear_cache()
+            self.assertEqual(RC.resolve_service_role("secretary", hwf_home=home)["model"], "base-model")
+
+            # 新建 roles.local.yaml：不手工清缓存也能立即热生效
+            local_path = self._write_local(home, "services:\n  secretary:\n    model: local-model-v1\n")
+            self.assertEqual(RC.resolve_service_role("secretary", hwf_home=home)["model"], "local-model-v1")
+
+            # 修改 roles.local.yaml（不同文件大小确保 mtime/size 签名变化）
+            self._write_local(home, "services:\n  secretary:\n    model: local-model-version-two\n")
+            self.assertEqual(
+                RC.resolve_service_role("secretary", hwf_home=home)["model"],
+                "local-model-version-two",
+            )
+
+            # 删除 roles.local.yaml：立即回退默认配置
+            local_path.unlink()
+            self.assertEqual(RC.resolve_service_role("secretary", hwf_home=home)["model"], "base-model")
+
+    def test_sync_isolates_tracked_herdr_config_from_local_overrides(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hwf-roles-sync-iso-") as tmp:
+            home = Path(tmp)
+            _write_roles(
+                home,
+                """
+default_profile: scheduler
+team:
+  scheduler:
+    tool: omp
+    omp_config: ~/.hwf/scheduler-omp.yml
+  arch:
+    tool: agy
+    model: gemini-4-neon-xhigh
+    thinking: xhigh
+  dev:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: medium
+services:
+  secretary:
+    tool: omp
+    model: jc-gpt/gpt-6-luna
+    thinking: medium
+""".strip() + "\n",
+            )
+            # 先同步一次默认配置，记录入库 herdr/config.yaml 内容
+            RC.sync_herdr_config(home, check_only=False)
+            tracked_path = home / "herdr" / "config.yaml"
+            tracked_before = tracked_path.read_text(encoding="utf-8")
+
+            # 写入本机覆盖：把 arch 切到 droid，把 scheduler 切到 claude
+            self._write_local(
+                home,
+                """
+team:
+  scheduler:
+    tool: claude
+    model: claude-opus-4-7
+    thinking: high
+  arch:
+    tool: droid
+    model: gemini-4-carbon
+    thinking: high
+""".strip() + "\n",
+            )
+            RC.clear_cache()
+
+            # 跑 CLI sync：入库 herdr/config.yaml 必须一字不动，且不得在 herdr/ 下生成 droid-arch.json
+            res_sync = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "role_config.py"), "--home", str(home), "sync"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(res_sync.returncode, 0, res_sync.stderr)
+            self.assertEqual(tracked_path.read_text(encoding="utf-8"), tracked_before)
+            self.assertFalse((home / "herdr" / "droid-arch.json").exists())
+
+            # 本机不入库 herdr/config.local.yaml 与 state/droid-arch.json 正确生成
+            local_herdr = home / "herdr" / "config.local.yaml"
+            self.assertTrue(local_herdr.is_file())
+            local_text = local_herdr.read_text(encoding="utf-8")
+            self.assertIn("claude-opus-4-7", local_text)
+            state_droid = home / "state" / "droid-arch.json"
+            self.assertTrue(state_droid.is_file())
+            self.assertIn(str(state_droid), local_text)
+            self.assertEqual(
+                json.loads(state_droid.read_text(encoding="utf-8")),
+                {"sessionDefaultSettings": {"model": "gemini-4-carbon", "reasoningEffort": "high"}},
+            )
+
+            # CLI show 明确标注 [local] 与 [default]
+            res_show = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "role_config.py"), "--home", str(home), "show"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(res_show.returncode, 0, res_show.stderr)
+            self.assertIn("已生效", res_show.stdout)
+            self.assertIn("[local  ]", res_show.stdout)
+            self.assertIn("[default]", res_show.stdout)
+
+            # 再改 roles.local.yaml 但暂不 sync：CLI check 仍通过并给提示（改非 scheduler 无需 sync）
+            self._write_local(
+                home,
+                """
+team:
+  dev:
+    thinking: high
+""".strip() + "\n",
+            )
+            res_check = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "role_config.py"), "--home", str(home), "check"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertEqual(res_check.returncode, 0, res_check.stderr)
+            self.assertIn("[提示]", res_check.stdout)
+
+            # roles.local.yaml 写错时 CLI check 必须返回非 0
+            self._write_local(home, "team:\n  dev:\n    tool: invalid_tool\n    model: x\n")
+            res_bad = subprocess.run(
+                [sys.executable, str(SCRIPTS_DIR / "role_config.py"), "--home", str(home), "check"],
+                capture_output=True, text=True, check=False,
+            )
+            self.assertNotEqual(res_bad.returncode, 0)
+
+    def test_member_start_and_start_scheduler_use_roles_local_without_dirtying_herdr(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hwf-local-launch-") as tmp:
+            home = Path(tmp)
+            _write_roles(
+                home,
+                """
+default_profile: scheduler
+team:
+  scheduler:
+    tool: omp
+    omp_config: ~/.hwf/scheduler-omp.yml
+  dev:
+    tool: codex
+    model: gpt-6.2-sol
+    thinking: medium
+    auto_compact_tokens: 200000
+  arch:
+    tool: agy
+    model: gemini-4-neon-xhigh
+    thinking: xhigh
+services: {}
+""".strip() + "\n",
+            )
+            self._write_local(
+                home,
+                """
+team:
+  scheduler:
+    tool: claude
+    model: claude-opus-4-7
+    thinking: high
+  dev:
+    thinking: high
+  arch:
+    tool: droid
+    model: gemini-4-carbon
+    thinking: high
+""".strip() + "\n",
+            )
+            RC.clear_cache()
+
+            # member-start 自动合并 roles.local.yaml，并把托管 droid 设置写到 state/ 而不是 herdr/
+            with patch.object(MEMBER_START._RC, "HWF_HOME", home):
+                dev_profile = MEMBER_START.load_profile("dev", [MEMBER_START.global_config_path()])
+                self.assertEqual(dev_profile["kind"], "codex")
+                self.assertIn("gpt-6.2-sol", dev_profile["args"])
+                self.assertIn("model_reasoning_effort=high", dev_profile["args"])
+
+                arch_profile = MEMBER_START.load_profile("arch", [MEMBER_START.global_config_path()])
+                self.assertEqual(arch_profile["kind"], "droid")
+                self.assertEqual(MEMBER_START.model_of(arch_profile["args"]), "gemini-4-carbon")
+                self.assertTrue((home / "state" / "droid-arch.json").is_file())
+                self.assertFalse((home / "herdr" / "droid-arch.json").exists())
+
+            # start-scheduler 自动读取 roles.local.yaml 的 scheduler 覆盖
+            tool, args = START_SCHEDULER.resolve_scheduler_launch("", "", hwf_home=home)
+            self.assertEqual(tool, "claude")
+            self.assertIn("claude-opus-4-7", args)
+            self.assertIn("high", args)
+
+            # 环境变量 HWF_ROLES_CONFIG 指定独立整文件时，不混入 HWF_HOME 下的 roles.local.yaml
+            standalone = home / "standalone.yaml"
+            standalone.write_text(
+                "default_profile: dev\nteam:\n  dev:\n    tool: codex\n    model: only-standalone\nservices: {}\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"HWF_ROLES_CONFIG": str(standalone)}):
+                RC.clear_cache()
+                self.assertIsNone(RC.local_roles_path())
+                self.assertEqual(RC.resolve_team_role("dev")["model"], "only-standalone")
 
 
 if __name__ == "__main__":

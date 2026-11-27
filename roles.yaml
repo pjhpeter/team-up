@@ -1,11 +1,17 @@
-# 团队全部角色的统一配置文件（唯一真相源）。
+# 团队全部角色的默认配置文件（入库，所有人共用）。
 #
-# 使用方式：
-#   - 交付团队（team 段）：改完后运行 `python3 ~/.hwf/scripts/role_config.py sync` 同步到 `herdr/config.yaml`
-#     （`member-start.py` 会直接读取本文件；同步 `herdr/config.yaml` 供 Herdr 工作流入口与兼容工具读取）。
-#   - 外围服务（services 段）：飞书秘书、GitLab 主动接活、周期复盘、Jev 概率关卡均按文件修改时间热读，
-#     修改后免重启即时生效。
-#   - 查看全部角色生效参数：`python3 ~/.hwf/scripts/role_config.py show`
+# 个人本机覆盖（推荐日常试模型/换工具使用）：
+#   - 编辑不入库的 `~/.hwf/roles.local.yaml`，只需写你想覆盖的那几个角色，不会脏 git 或推到远端：
+#       * 换 tool（如 codex -> droid）时整条角色替换，不继承旧工具专属参数；
+#       * 同 tool 或省略 tool 时逐字段覆盖（例如单改 thinking 或 model）。
+#   - 10 个交付成员与 4 个外围服务改完免重启自动热生效；改动 scheduler 后运行一次 `role_config.py sync`
+#     刷新不入库的 `herdr/config.local.yaml`（不会改动入库的 `herdr/config.yaml`）。
+#
+# 调整团队默认配置（需同步推送给所有人）：
+#   - 直接编辑本文件 `roles.yaml`；若改动了 `team` 段，运行 `python3 ~/.hwf/scripts/role_config.py sync`
+#     同步生成入库的 `herdr/config.yaml` 并一同提交。
+#   - 查看全部角色当前生效参数与来源（default / local）：`python3 ~/.hwf/scripts/role_config.py show`
+#   - 校验合法性与同步状态：`python3 ~/.hwf/scripts/role_config.py check`
 #
 # 字段说明：
 #   tool: 执行工具

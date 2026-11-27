@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""统一角色配置加载、参数翻译、无头调用适配与 herdr/config.yaml 同步工具。
+"""统一角色配置加载、参数翻译、无头调用适配与 herdr 配置同步工具。
 
-唯一真相源：~/.hwf/roles.yaml（支持环境变量 HWF_ROLES_CONFIG 覆盖）。
+配置层级：
+    - 团队默认（入库）：~/.hwf/roles.yaml（支持环境变量 HWF_ROLES_CONFIG 整文件替换）
+    - 本机个人覆盖（不入库）：~/.hwf/roles.local.yaml（只需写要改的角色；换 tool 整条替换，同 tool 逐字段覆盖）
+
 用法：
-    python3 ~/.hwf/scripts/role_config.py show    # 展示全部角色的工具、模型、思考强度与展开参数
-    python3 ~/.hwf/scripts/role_config.py sync    # 按 roles.yaml 重新生成 herdr/config.yaml（及托管 droid 配置）
-    python3 ~/.hwf/scripts/role_config.py check   # 校验 roles.yaml 合法性以及与 herdr/config.yaml 是否同步一致
+    python3 ~/.hwf/scripts/role_config.py show    # 展示全部角色最终生效配置与来源（default / local）
+    python3 ~/.hwf/scripts/role_config.py sync    # 同步入库 herdr/config.yaml 与本机不入库 herdr/config.local.yaml
+    python3 ~/.hwf/scripts/role_config.py check   # 校验 roles.yaml / roles.local.yaml 合法性与入库同步状态
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -22,14 +26,20 @@ import yaml
 
 HWF_HOME = Path(os.environ.get("HWF_HOME", Path.home() / ".hwf"))
 ROLES_FILENAME = "roles.yaml"
+LOCAL_ROLES_FILENAME = "roles.local.yaml"
+_LOCAL_TOP_KEYS = frozenset({"default_profile", "team", "services"})
 TEAM_TOOLS = frozenset({"codex", "agy", "omp", "claude", "droid", "pi"})
 HEADLESS_TOOLS = frozenset({"omp", "droid", "codex", "agy", "claude"})
 SERVICE_TOOLS = HEADLESS_TOOLS | frozenset({"typesafe"})
 THINKING_LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max", "auto")
 DROID_FALLBACK_PATHS = (Path.home() / ".local" / "bin" / "droid",)
 
-# 按 (绝对路径) -> (mtime_ns, size, parsed_data) 做进程内缓存，修改 roles.yaml 后免重启自动刷新。
-_ROLES_CACHE: dict[Path, tuple[int, int, dict[str, Any]]] = {}
+# 按 (base_path, local_path) -> (base_sig, local_sig, parsed_data, local_sources) 做进程内缓存，
+# 修改 roles.yaml 或增删改 roles.local.yaml 后均免重启自动刷新。
+_ROLES_CACHE: dict[
+    tuple[Path, Optional[Path]],
+    tuple[tuple[int, int], Optional[tuple[int, int]], dict[str, Any], dict[str, set[str]]],
+] = {}
 
 
 class RoleConfigError(RuntimeError):
@@ -85,6 +95,24 @@ def roles_path(hwf_home: Optional[Path] = None, *, path: Optional[Path] = None) 
     if env_override:
         return Path(env_override).expanduser()
     return HWF_HOME / ROLES_FILENAME
+
+
+def local_roles_path(
+    hwf_home: Optional[Path] = None,
+    *,
+    path: Optional[Path] = None,
+    local_path: Optional[Path] = None,
+) -> Optional[Path]:
+    """返回本机个人覆盖文件路径（~/.hwf/roles.local.yaml）；显式指定单文件路径或环境变量整文件替换时返回 None。"""
+    if local_path is not None:
+        return Path(local_path)
+    if path is not None:
+        return None
+    if hwf_home is not None:
+        return Path(hwf_home) / LOCAL_ROLES_FILENAME
+    if os.environ.get("HWF_ROLES_CONFIG", "").strip():
+        return None
+    return HWF_HOME / LOCAL_ROLES_FILENAME
 
 
 def find_executable(name: str, fallbacks: Sequence[Path] = ()) -> str:
@@ -146,28 +174,158 @@ def validate_roles_data(data: Any) -> dict[str, Any]:
     }
 
 
-def load_roles_optional(hwf_home: Optional[Path] = None, *, path: Optional[Path] = None) -> Optional[dict[str, Any]]:
-    """按文件 mtime 热读 roles.yaml；文件不存在时返回 None（供隔离单测与兜底回退）。"""
-    cfg_path = roles_path(hwf_home, path=path)
+def _merge_role_entry(base_spec: Optional[Mapping[str, Any]], local_spec: Mapping[str, Any]) -> dict[str, Any]:
+    """合并单条角色配置：换了 tool（或新增角色）整条替换，防止旧工具专属参数串入；同 tool 或省略 tool 时逐字段覆盖。"""
+    base_tool = _clean_str(base_spec.get("tool")).lower() if isinstance(base_spec, Mapping) else ""
+    local_tool = _clean_str(local_spec.get("tool")).lower()
+    if not isinstance(base_spec, Mapping) or (local_tool and local_tool != base_tool):
+        return dict(local_spec)
+
+    merged = dict(base_spec)
+    # 清理成对别名字段，防止本地只改 thinking/timeout_s 时被默认里的旧别名盖回。
+    if "thinking" in local_spec and "reasoning_effort" not in local_spec:
+        merged.pop("reasoning_effort", None)
+    elif "reasoning_effort" in local_spec and "thinking" not in local_spec:
+        merged.pop("thinking", None)
+    if "timeout_s" in local_spec and "model_timeout_s" not in local_spec:
+        merged.pop("model_timeout_s", None)
+    elif "model_timeout_s" in local_spec and "timeout_s" not in local_spec:
+        merged.pop("timeout_s", None)
+    merged.update(local_spec)
+    return merged
+
+
+def merge_roles_data(base_raw: Any, local_raw: Any) -> tuple[dict[str, Any], dict[str, set[str]]]:
+    """将 roles.local.yaml 合并到 roles.yaml 上并做完整校验，同时返回被本地覆盖的角色集合。"""
+    if not isinstance(base_raw, Mapping):
+        validate_roles_data(base_raw)
+        raise RoleConfigError("roles.yaml 顶层必须是 YAML 映射对象")
+    if local_raw is None:
+        return validate_roles_data(base_raw), {"team": set(), "services": set()}
+    if not isinstance(local_raw, Mapping):
+        raise RoleConfigError("roles.local.yaml 顶层必须是 YAML 映射对象")
+
+    unknown = sorted(str(k) for k in local_raw.keys() if str(k) not in _LOCAL_TOP_KEYS)
+    if unknown:
+        raise RoleConfigError(
+            f"roles.local.yaml 包含未知顶层字段：{', '.join(unknown)}（仅支持 default_profile / team / services）"
+        )
+
+    base_team = base_raw.get("team")
+    base_services = base_raw.get("services")
+    if base_team is not None and not isinstance(base_team, Mapping):
+        raise RoleConfigError("roles.yaml 的 team 必须是对象")
+    if base_services is not None and not isinstance(base_services, Mapping):
+        raise RoleConfigError("roles.yaml 的 services 必须是对象")
+
+    local_team = local_raw.get("team")
+    local_services = local_raw.get("services")
+    if local_team is not None and not isinstance(local_team, Mapping):
+        raise RoleConfigError("roles.local.yaml 的 team 必须是对象")
+    if local_services is not None and not isinstance(local_services, Mapping):
+        raise RoleConfigError("roles.local.yaml 的 services 必须是对象")
+
+    merged_team: dict[str, Any] = {str(k): v for k, v in (base_team or {}).items()}
+    merged_services: dict[str, Any] = {str(k): v for k, v in (base_services or {}).items()}
+    local_sources: dict[str, set[str]] = {"team": set(), "services": set()}
+
+    for role_name, raw_spec in (local_team or {}).items():
+        if not isinstance(raw_spec, Mapping):
+            raise RoleConfigError(f"roles.local.yaml 的 team.{role_name} 必须是对象")
+        key = str(role_name)
+        merged_team[key] = _merge_role_entry(
+            merged_team.get(key) if isinstance(merged_team.get(key), Mapping) else None,
+            raw_spec,
+        )
+        local_sources["team"].add(key)
+
+    for svc_name, raw_spec in (local_services or {}).items():
+        if not isinstance(raw_spec, Mapping):
+            raise RoleConfigError(f"roles.local.yaml 的 services.{svc_name} 必须是对象")
+        key = str(svc_name)
+        merged_services[key] = _merge_role_entry(
+            merged_services.get(key) if isinstance(merged_services.get(key), Mapping) else None,
+            raw_spec,
+        )
+        local_sources["services"].add(key)
+
+    default_profile = _clean_str(local_raw.get("default_profile")) or base_raw.get("default_profile")
+    validated = validate_roles_data(
+        {
+            "default_profile": default_profile,
+            "team": merged_team,
+            "services": merged_services,
+        }
+    )
+    return validated, local_sources
+
+
+def _file_sig(file_path: Optional[Path]) -> Optional[tuple[int, int]]:
+    if file_path is None:
+        return None
     try:
-        st = cfg_path.stat()
+        st = file_path.stat()
     except OSError:
         return None
-    cached = _ROLES_CACHE.get(cfg_path)
-    if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
-        return cached[2]
+    return (st.st_mtime_ns, st.st_size)
+
+
+def load_roles_with_sources(
+    hwf_home: Optional[Path] = None,
+    *,
+    path: Optional[Path] = None,
+    include_local: bool = True,
+    local_path: Optional[Path] = None,
+) -> Optional[tuple[dict[str, Any], dict[str, set[str]]]]:
+    """按文件 mtime 热读 roles.yaml（及可选本机 roles.local.yaml），同时返回本地覆盖来源集合。"""
+    cfg_path = roles_path(hwf_home, path=path)
+    base_sig = _file_sig(cfg_path)
+    if base_sig is None:
+        return None
+
+    eff_local_path = local_roles_path(hwf_home, path=path, local_path=local_path) if include_local else None
+    local_sig = _file_sig(eff_local_path)
+    cache_key = (cfg_path, eff_local_path)
+    cached = _ROLES_CACHE.get(cache_key)
+    if cached is not None and cached[0] == base_sig and cached[1] == local_sig:
+        return cached[2], cached[3]
+
     try:
-        raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+        base_raw = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     except (OSError, yaml.YAMLError) as exc:
         raise RoleConfigError(f"读取 {cfg_path} 失败：{exc}") from exc
-    parsed = validate_roles_data(raw)
-    _ROLES_CACHE[cfg_path] = (st.st_mtime_ns, st.st_size, parsed)
-    return parsed
+
+    local_raw: Any = None
+    if eff_local_path is not None and local_sig is not None:
+        try:
+            local_raw = yaml.safe_load(eff_local_path.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            raise RoleConfigError(f"读取 {eff_local_path} 失败：{exc}") from exc
+
+    parsed, sources = merge_roles_data(base_raw, local_raw)
+    _ROLES_CACHE[cache_key] = (base_sig, local_sig, parsed, sources)
+    return parsed, sources
 
 
-def load_roles(hwf_home: Optional[Path] = None, *, path: Optional[Path] = None) -> dict[str, Any]:
+def load_roles_optional(
+    hwf_home: Optional[Path] = None,
+    *,
+    path: Optional[Path] = None,
+    include_local: bool = True,
+) -> Optional[dict[str, Any]]:
+    """按文件 mtime 热读 roles.yaml（默认合并本机 roles.local.yaml）；主文件不存在时返回 None。"""
+    loaded = load_roles_with_sources(hwf_home, path=path, include_local=include_local)
+    return loaded[0] if loaded is not None else None
+
+
+def load_roles(
+    hwf_home: Optional[Path] = None,
+    *,
+    path: Optional[Path] = None,
+    include_local: bool = True,
+) -> dict[str, Any]:
     cfg_path = roles_path(hwf_home, path=path)
-    parsed = load_roles_optional(hwf_home, path=path)
+    parsed = load_roles_optional(hwf_home, path=path, include_local=include_local)
     if parsed is None:
         raise RoleConfigError(f"找不到角色配置文件：{cfg_path}")
     return parsed
@@ -185,8 +343,8 @@ def _droid_settings_payload(model: str, thinking: str) -> str:
     return json.dumps({"sessionDefaultSettings": session_cfg}, ensure_ascii=False, indent=2) + "\n"
 
 
-def _managed_droid_settings_path(role_name: str, hwf_home: Path) -> Path:
-    return hwf_home / "herdr" / f"droid-{role_name}.json"
+def _managed_droid_settings_path(role_name: str, hwf_home: Path, *, settings_subdir: str = "herdr") -> Path:
+    return hwf_home / settings_subdir / f"droid-{role_name}.json"
 
 
 def compile_team_profile(
@@ -196,6 +354,7 @@ def compile_team_profile(
     hwf_home: Optional[Path] = None,
     write_settings: bool = False,
     portable: bool = False,
+    settings_subdir: str = "herdr",
 ) -> dict[str, Any]:
     """把单条 team 角色定义翻译成 Herdr 可直接启动的 {kind, args}。"""
     home = Path(hwf_home) if hwf_home is not None else HWF_HOME
@@ -253,13 +412,13 @@ def compile_team_profile(
         if settings_file:
             settings_arg = _format_hwf_path(settings_file, home, portable=portable)
         elif model or thinking:
-            resolved_settings = _managed_droid_settings_path(name, home)
+            resolved_settings = _managed_droid_settings_path(name, home, settings_subdir=settings_subdir)
             if write_settings:
                 payload = _droid_settings_payload(model, thinking)
                 resolved_settings.parent.mkdir(parents=True, exist_ok=True)
                 if not resolved_settings.is_file() or resolved_settings.read_text(encoding="utf-8") != payload:
                     resolved_settings.write_text(payload, encoding="utf-8")
-            settings_arg = f"~/.hwf/herdr/droid-{name}.json" if portable else str(resolved_settings)
+            settings_arg = f"~/.hwf/{settings_subdir}/droid-{name}.json" if portable else str(resolved_settings)
         if settings_arg is not None:
             args.extend(["--settings", settings_arg])
         if yolo:
@@ -280,12 +439,18 @@ def compile_herdr_config(
     hwf_home: Optional[Path] = None,
     write_settings: bool = False,
     portable: bool = False,
+    settings_subdir: str = "herdr",
 ) -> dict[str, Any]:
     validated = validate_roles_data(roles_data)
     profiles: dict[str, dict[str, Any]] = {}
     for role_name, spec in validated["team"].items():
         profiles[role_name] = compile_team_profile(
-            role_name, spec, hwf_home=hwf_home, write_settings=write_settings, portable=portable
+            role_name,
+            spec,
+            hwf_home=hwf_home,
+            write_settings=write_settings,
+            portable=portable,
+            settings_subdir=settings_subdir,
         )
     return {
         "profiles": profiles,
@@ -299,14 +464,25 @@ def render_herdr_config_yaml(
     hwf_home: Optional[Path] = None,
     write_settings: bool = False,
     portable: bool = True,
+    settings_subdir: str = "herdr",
+    header_lines: Optional[Sequence[str]] = None,
 ) -> str:
-    compiled = compile_herdr_config(roles_data, hwf_home=hwf_home, write_settings=write_settings, portable=portable)
-    lines = [
-        "# 本文件由 ~/.hwf/roles.yaml 自动生成，请勿直接手工修改。",
-        "# 调整任何角色的工具、模型或思考强度，请编辑 ~/.hwf/roles.yaml 后运行：",
-        "#   python3 ~/.hwf/scripts/role_config.py sync",
-        "profiles:",
-    ]
+    compiled = compile_herdr_config(
+        roles_data,
+        hwf_home=hwf_home,
+        write_settings=write_settings,
+        portable=portable,
+        settings_subdir=settings_subdir,
+    )
+    lines = list(
+        header_lines
+        or (
+            "# 本文件由 ~/.hwf/roles.yaml 自动生成，请勿直接手工修改。",
+            "# 调整任何角色的工具、模型或思考强度，请编辑 ~/.hwf/roles.yaml 后运行：",
+            "#   python3 ~/.hwf/scripts/role_config.py sync",
+        )
+    )
+    lines.append("profiles:")
     for name, entry in compiled["profiles"].items():
         args_literal = json.dumps(entry["args"], ensure_ascii=False)
         lines.append(f"  {name}:")
@@ -316,16 +492,25 @@ def render_herdr_config_yaml(
     return "\n".join(lines) + "\n"
 
 
-def sync_herdr_config(hwf_home: Optional[Path] = None, *, check_only: bool = False) -> tuple[bool, Path]:
-    """同步 roles.yaml 到 herdr/config.yaml。
-
-    check_only=True 时返回 (是否完全同步, target_path)，不写文件；
-    check_only=False 时返回 (文件是否发生改动, target_path)。
-    """
-    home = Path(hwf_home) if hwf_home is not None else HWF_HOME
-    roles_data = load_roles(home)
-    target = home / "herdr" / "config.yaml"
-    expected = render_herdr_config_yaml(roles_data, hwf_home=home, write_settings=not check_only)
+def _sync_herdr_target(
+    home: Path,
+    *,
+    include_local: bool,
+    target: Path,
+    portable: bool,
+    settings_subdir: str,
+    header_lines: Optional[Sequence[str]] = None,
+    check_only: bool = False,
+) -> tuple[bool, Path]:
+    roles_data = load_roles(home, include_local=include_local)
+    expected = render_herdr_config_yaml(
+        roles_data,
+        hwf_home=home,
+        write_settings=not check_only,
+        portable=portable,
+        settings_subdir=settings_subdir,
+        header_lines=header_lines,
+    )
 
     if check_only:
         if not target.is_file() or target.read_text(encoding="utf-8") != expected:
@@ -336,7 +521,9 @@ def sync_herdr_config(hwf_home: Optional[Path] = None, *, check_only: bool = Fal
                 model = _clean_str(spec.get("model"))
                 thinking = _clean_str(spec.get("thinking")) or _clean_str(spec.get("reasoning_effort"))
                 if model or thinking:
-                    settings_path = _managed_droid_settings_path(role_name, home)
+                    settings_path = _managed_droid_settings_path(
+                        role_name, home, settings_subdir=settings_subdir
+                    )
                     expected_json = _droid_settings_payload(model, thinking)
                     if not settings_path.is_file() or settings_path.read_text(encoding="utf-8") != expected_json:
                         return False, settings_path
@@ -350,6 +537,44 @@ def sync_herdr_config(hwf_home: Optional[Path] = None, *, check_only: bool = Fal
     tmp.write_text(expected, encoding="utf-8")
     tmp.replace(target)
     return True, target
+
+
+def sync_herdr_config(hwf_home: Optional[Path] = None, *, check_only: bool = False) -> tuple[bool, Path]:
+    """同步入库默认配置 roles.yaml 到入库 herdr/config.yaml（不混入本机 roles.local.yaml）。
+
+    check_only=True 时返回 (是否完全同步, target_path)，不写文件；
+    check_only=False 时返回 (文件是否发生改动, target_path)。
+    """
+    home = Path(hwf_home) if hwf_home is not None else HWF_HOME
+    return _sync_herdr_target(
+        home,
+        include_local=False,
+        target=home / "herdr" / "config.yaml",
+        portable=True,
+        settings_subdir="herdr",
+        check_only=check_only,
+    )
+
+
+def sync_local_herdr_config(hwf_home: Optional[Path] = None, *, check_only: bool = False) -> tuple[bool, Path]:
+    """同步合并配置（roles.yaml + 本机 roles.local.yaml）到不入库的 herdr/config.local.yaml。
+
+    本机托管 droid-<role>.json 落到不入库的 state/ 目录，避免污染仓库中的 herdr/ 目录。
+    """
+    home = Path(hwf_home) if hwf_home is not None else HWF_HOME
+    return _sync_herdr_target(
+        home,
+        include_local=True,
+        target=home / "herdr" / "config.local.yaml",
+        portable=False,
+        settings_subdir="state",
+        header_lines=(
+            "# 本文件由 ~/.hwf/roles.yaml 与本机 ~/.hwf/roles.local.yaml 合并自动生成（不入库）。",
+            "# 调整个人模型或工具请编辑 ~/.hwf/roles.local.yaml；改动 scheduler 后运行：",
+            "#   python3 ~/.hwf/scripts/role_config.py sync",
+        ),
+        check_only=check_only,
+    )
 
 
 # ---------- 运行时角色查询（热读 roles.yaml + 覆盖优先级） ----------
@@ -787,24 +1012,75 @@ def parse_headless_output(
 # ---------- CLI ----------
 
 
+def _ensure_herdr_plugin_local_symlink(home: Path) -> Optional[Path]:
+    """若本机 Herdr 插件配置软链仍指向入库的 herdr/config.yaml，则原子迁到不入库的 herdr/config.local.yaml。"""
+    local_cfg = home / "herdr" / "config.local.yaml"
+    default_cfg = home / "herdr" / "config.yaml"
+    if not local_cfg.is_file() or not default_cfg.is_file():
+        return None
+    plugin_dir = Path.home() / ".config" / "herdr" / "plugins" / "config" / "herdr-workflows"
+    try:
+        res = subprocess.run(
+            [os.environ.get("HERDR_BIN_PATH") or "herdr", "plugin", "config-dir", "herdr-workflows"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            plugin_dir = Path(res.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    link = plugin_dir / "config.yaml"
+    if not link.is_symlink():
+        return None
+    try:
+        if link.resolve() != default_cfg.resolve():
+            return None
+        tmp = link.with_name(f".config.yaml.tmp-{os.getpid()}")
+        if tmp.exists() or tmp.is_symlink():
+            tmp.unlink()
+        tmp.symlink_to(local_cfg)
+        tmp.replace(link)
+        return link
+    except OSError:
+        return None
+
+
 def format_roles_table(hwf_home: Optional[Path] = None) -> str:
+    loaded = load_roles_with_sources(hwf_home, include_local=True)
+    if loaded is None:
+        raise RoleConfigError(f"找不到角色配置文件：{roles_path(hwf_home)}")
+    data, local_sources = loaded
     home = Path(hwf_home) if hwf_home is not None else HWF_HOME
-    data = load_roles(home)
-    lines = [f"角色配置文件：{roles_path(home)}", "", "[交付团队 team]"]
+    base_cfg = roles_path(hwf_home)
+    local_cfg = local_roles_path(hwf_home)
+    lines = [f"默认配置文件：{base_cfg}"]
+    if local_cfg is not None:
+        overridden_count = len(local_sources["team"]) + len(local_sources["services"])
+        if not local_cfg.is_file():
+            status = "未创建，全部使用默认"
+        elif overridden_count:
+            status = f"已生效，覆盖 {overridden_count} 个角色"
+        else:
+            status = "已创建，当前未覆盖任何角色"
+        lines.append(f"本机覆盖文件：{local_cfg}（{status}）")
+    lines.extend(["", "[交付团队 team]"])
     for name, spec in data["team"].items():
-        compiled = compile_team_profile(name, spec, hwf_home=home, write_settings=False)
+        compiled = compile_team_profile(name, spec, hwf_home=home, write_settings=False, settings_subdir="state")
         model = _clean_str(spec.get("model")) or "(跟随当前会话)"
         thinking = _clean_str(spec.get("thinking")) or "(默认)"
+        src_tag = "local  " if name in local_sources["team"] else "default"
         args_str = " ".join(compiled["args"])
-        lines.append(f"  {name:<12} tool={compiled['kind']:<6} model={model:<22} thinking={thinking:<8} args={args_str}")
+        lines.append(
+            f"  {name:<12} [{src_tag}] tool={compiled['kind']:<6} model={model:<22} thinking={thinking:<8} args={args_str}"
+        )
     lines.append("")
     lines.append("[外围服务 services]")
     for name, spec in data["services"].items():
         model = _clean_str(spec.get("model"))
         thinking = _clean_str(spec.get("thinking")) or "-"
+        src_tag = "local  " if name in local_sources["services"] else "default"
         timeout = spec.get("timeout_s")
         extra = f" timeout={timeout}s" if timeout else ""
-        lines.append(f"  {name:<12} tool={spec['tool']:<8} model={model:<22} thinking={thinking:<8}{extra}")
+        lines.append(f"  {name:<12} [{src_tag}] tool={spec['tool']:<8} model={model:<22} thinking={thinking:<8}{extra}")
     return "\n".join(lines)
 
 
@@ -812,19 +1088,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--home", type=Path, default=None, help="覆盖 ~/.hwf 根目录路径")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("show", help="打印全部角色生效的工具、模型、思考强度与展开参数")
-    sub.add_parser("sync", help="从 roles.yaml 重新生成 herdr/config.yaml")
-    sub.add_parser("check", help="校验 roles.yaml 合法性以及与 herdr/config.yaml 是否同步")
+    sub.add_parser("show", help="打印全部角色最终生效的工具、模型、思考强度与来源（default / local）")
+    sub.add_parser("sync", help="同步入库 herdr/config.yaml 与本机不入库 herdr/config.local.yaml")
+    sub.add_parser("check", help="校验 roles.yaml / roles.local.yaml 合法性以及与 herdr/config.yaml 是否同步")
     args = parser.parse_args(argv)
     home = args.home or HWF_HOME
     try:
         if args.cmd == "show":
-            print(format_roles_table(home))
+            print(format_roles_table(args.home))
             return 0
         if args.cmd == "sync":
             changed, target = sync_herdr_config(home, check_only=False)
             state = "已更新" if changed else "已是最新"
-            print(f"[{state}] {target}")
+            print(f"[{state}] {target}（团队默认）")
+
+            local_changed, local_target = sync_local_herdr_config(home, check_only=False)
+            local_state = "已更新" if local_changed else "已是最新"
+            print(f"[{local_state}] {local_target}（本机生效，不入库）")
+
+            if args.home is None:
+                migrated = _ensure_herdr_plugin_local_symlink(home)
+                if migrated is not None:
+                    print(f"[已迁链接] {migrated} -> {local_target}")
             return 0
         if args.cmd == "check":
             in_sync, target = sync_herdr_config(home, check_only=True)
@@ -835,6 +1120,19 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 )
                 return 1
             print(f"[已同步] {roles_path(home)} -> {target}")
+
+            local_cfg = local_roles_path(home)
+            if local_cfg is not None and local_cfg.is_file():
+                # 校验本机覆盖文件的语法与合并后 schema 合法性
+                load_roles(home, include_local=True)
+                local_in_sync, local_target = sync_local_herdr_config(home, check_only=True)
+                if local_in_sync:
+                    print(f"[已同步] {local_cfg} -> {local_target}")
+                else:
+                    print(
+                        f"[提示] 本机覆盖 {local_cfg} 合法，但 {local_target} 尚未同步"
+                        "（成员与后台服务已热生效；如改动了 scheduler 请运行：python3 ~/.hwf/scripts/role_config.py sync）"
+                    )
             return 0
     except (RoleConfigError, OSError, ValueError) as exc:
         print(f"role_config failed: {exc}", file=sys.stderr)

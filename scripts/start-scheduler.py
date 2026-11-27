@@ -57,7 +57,9 @@ def resolve_scheduler_launch(model: str, thinking: str, *, hwf_home: Path = HWF_
         merged["model"] = model
     if thinking:
         merged["thinking"] = thinking
-    compiled = _RC.compile_team_profile("scheduler", merged, hwf_home=hwf_home, write_settings=True)
+    compiled = _RC.compile_team_profile(
+        "scheduler", merged, hwf_home=hwf_home, write_settings=True, settings_subdir="state"
+    )
     return str(compiled["kind"]), list(compiled["args"])
 
 

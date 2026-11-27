@@ -17,14 +17,46 @@ else
   echo "[已有]   gitlab-inbox.local.json"
 fi
 
-# 2. Herdr 插件的角色配置：先按统一总表 roles.yaml 同步生成 herdr/config.yaml，再链接给 Herdr
+# 2. 角色本机覆盖模板与 Herdr 插件配置：roles.local.yaml 不入库，只写你想改的角色
+if [ ! -f "$HWF/roles.local.yaml" ]; then
+  cat <<'EOF' > "$HWF/roles.local.yaml"
+# 本机个人角色覆盖配置（不入库，不会随 git 推送到远端）。
+# 只需写你想覆盖的角色，未写的角色自动继承 ~/.hwf/roles.yaml：
+#   - 换 tool（例如 codex -> droid）时整条角色替换，避免旧工具专属参数串入；
+#   - 没换 tool 或省略 tool 时仅覆盖你写的字段（例如单改 thinking 或 model）。
+# 10 个交付成员与 4 个后台服务改完免重启自动生效；改动 scheduler 后运行一次：
+#   python3 ~/.hwf/scripts/role_config.py sync
+# 查看当前生效配置与来源：
+#   python3 ~/.hwf/scripts/role_config.py show
+#
+# team:
+#   arch:
+#     tool: droid
+#     model: gemini-4-carbon
+#     thinking: high
+#   dev:
+#     thinking: high
+#
+# services:
+#   secretary:
+#     thinking: low
+EOF
+  echo "[已新建] roles.local.yaml（本机个人覆盖模板，不入库）"
+else
+  echo "[已有]   roles.local.yaml"
+fi
+
 if [ -f "$HWF/roles.yaml" ] && python3 -c 'import yaml' 2>/dev/null; then
   python3 "$HWF/scripts/role_config.py" sync
 fi
 dir=$(herdr plugin config-dir herdr-workflows 2>/dev/null || echo "$HOME/.config/herdr/plugins/config/herdr-workflows")
 mkdir -p "$dir"
 target="$dir/config.yaml"
-src="$HWF/herdr/config.yaml"
+if [ -f "$HWF/herdr/config.local.yaml" ]; then
+  src="$HWF/herdr/config.local.yaml"
+else
+  src="$HWF/herdr/config.yaml"
+fi
 if grep -q "/Users/pengjiahui/.hwf" "$src" && [ "$HOME" != "/Users/pengjiahui" ]; then
   # 别人的机器且未装 PyYAML 无法 sync：复制一份并替换路径
   [ -e "$target" ] && [ ! -L "$target" ] && cp -p "$target" "$target.bak-$(date +%Y%m%d%H%M%S)"

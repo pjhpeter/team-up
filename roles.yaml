@@ -46,21 +46,24 @@ team:
 
   # 开发者（不分前后端的仓库）
   dev:
-    tool: agy
-    model: gemini-4-hydrogen-medium
+    tool: codex
+    model: gpt-6.2-sol
     thinking: medium
+    auto_compact_tokens: 200000
 
   # 前端开发者
   dev-fe:
-    tool: agy
-    model: gemini-4-hydrogen-medium
+    tool: codex
+    model: gpt-6.2-sol
     thinking: medium
+    auto_compact_tokens: 200000
 
   # 后端开发者
   dev-be:
-    tool: agy
-    model: gemini-4-hydrogen-medium
+    tool: codex
+    model: gpt-6.2-sol
     thinking: medium
+    auto_compact_tokens: 200000
 
   # 测试用例作者
   test-writer:

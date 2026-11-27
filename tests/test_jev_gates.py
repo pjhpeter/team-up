@@ -313,6 +313,25 @@ class JevGatesTests(unittest.TestCase):
         cfg = JG.load_gates_config(repo_home)
         self.assertTrue(cfg["thresholds"]["secretary_auth_now_min"]["protected"])
         self.assertFalse(cfg["thresholds"]["secretary_fast_relay_min"]["protected"])
+        g4_by_id = {r["rule_id"]: r for r in cfg["gate4_semantic_lint"]}
+        remote = g4_by_id["remote_exec"]
+        self.assertEqual(remote["severity"], "critical")
+        self.assertTrue(remote["protected"])
+        self.assertAlmostEqual(remote["threshold"], 0.8)
+        self.assertEqual(remote["scope"], "prod_code")
+        self.assertTrue(remote["added_only"])
+
+    def test_validate_gates_schema_checks_optional_scope_and_added_only(self) -> None:
+        cfg = JG.load_gates_config(self.home)
+        bad_scope = json.loads(json.dumps(cfg))
+        bad_scope["gate4_semantic_lint"][0]["scope"] = "bogus"
+        with self.assertRaises(JG.JevGatesError):
+            JG.validate_gates_schema(bad_scope)
+
+        bad_added = json.loads(json.dumps(cfg))
+        bad_added["gate4_semantic_lint"][0]["added_only"] = "yes"
+        with self.assertRaises(JG.JevGatesError):
+            JG.validate_gates_schema(bad_added)
 
 
 if __name__ == "__main__":

@@ -115,6 +115,10 @@ def validate_gates_schema(data: Mapping[str, Any]) -> None:
                     raise JevGatesError(f"{table}.{rid} invalid severity {rule.get('severity')!r}")
                 if not str(rule.get("fix_hint_zh") or "").strip():
                     raise JevGatesError(f"{table}.{rid} missing fix_hint_zh")
+                if "scope" in rule and rule.get("scope") not in ("all", "non_test", "prod_code", "tests"):
+                    raise JevGatesError(f"{table}.{rid} invalid scope {rule.get('scope')!r}")
+                if "added_only" in rule and not isinstance(rule.get("added_only"), bool):
+                    raise JevGatesError(f"{table}.{rid} invalid added_only {rule.get('added_only')!r}")
             else:
                 if not str(rule.get("error_zh") or "").strip():
                     raise JevGatesError(f"{table}.{rid} missing error_zh")

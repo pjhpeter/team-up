@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import redirect_stdout
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import sys
@@ -463,6 +464,82 @@ class NoteTests(Case):
 
         # 已发过 delivery-done 后，后续补充 todo 不再重复要求对账表
         self.assertEqual(self.note("todo", "补充提醒：最终验收通过的前置后端已部署，请合并", "none")[0], TR.EXIT_OK)
+
+    def test_delivery_done_independence_gate(self) -> None:
+        sec1 = "cccccccccccccccccccccccccccccccc"
+        video_delivery = "\n".join([
+            "整项交付完成，上线 MR 待你合并。",
+            "",
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |",
+            "| --- | --- | --- |",
+            f"| 1. 核心流程 | 通过 | ![AC1](/uploads/{sec1}/ac1.mp4) 00:01–00:08 "
+            f"https://git.example.com/-/project/10/uploads/{sec1}/ac1.mp4 |",
+        ])
+        unit_only_delivery = "\n".join([
+            "整项交付完成，上线 MR 待你合并。",
+            "",
+            "| 验收项 | 结果 | 录屏与时间段（或免录说明） |",
+            "| --- | --- | --- |",
+            "| 1. 后端接口校验 | 通过 | 纯单测：`pytest tests/test_api.py` 12 条通过 |",
+        ])
+        with tempfile.TemporaryDirectory() as state_dir:
+            ledger = Path(state_dir) / "role-ledger.jsonl"
+
+            def write_ledger(rows: list[dict[str, str]]) -> None:
+                ledger.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"HWF_STATE_DIR": state_dir}):
+                # 1) 正文显式写 dev 自审 -> 即使无台账也直接拦下
+                code, msg = self.note("delivery-done", f"由 dev 自审通过。\n\n{unit_only_delivery}")
+                self.assertEqual(code, TR.EXIT_HELD)
+                self.assertIn("独立性硬门禁", msg)
+
+                # 2) 常规交付仅有 dev，无 code-review、无 test -> 拦下并指出两者缺失
+                write_ledger([
+                    {"issue": "#47", "profile": "dev", "name": "p-47-dev", "pane_id": "p1", "session": "s1"},
+                ])
+                code, msg = self.note("delivery-done", video_delivery)
+                self.assertEqual(code, TR.EXIT_HELD)
+                self.assertIn("缺少独立代码评审记录", msg)
+                self.assertIn("缺少独立测试角色记录", msg)
+
+                # 3) dev 与 code-review 撞同一个 pane/session -> 拦下
+                write_ledger([
+                    {"issue": "#47", "profile": "dev", "name": "p-47-dev", "pane_id": "p1", "session": "s1"},
+                    {"issue": "#47", "profile": "code-review", "name": "p-47-cr", "pane_id": "p1", "session": "s2"},
+                    {"issue": "#47", "profile": "test", "name": "p-47-test", "pane_id": "p3", "session": "s3"},
+                ])
+                code, msg = self.note("delivery-done", video_delivery)
+                self.assertEqual(code, TR.EXIT_HELD)
+                self.assertIn("成员独立性冲突", msg)
+                self.assertIn("同窗格 p1", msg)
+
+                # 4) 纯单测交付：dev + 独立 code-review（无 test） -> 放行
+                write_ledger([
+                    {"issue": "#47", "profile": "dev", "name": "p-47-dev", "pane_id": "p1", "session": "s1"},
+                    {"issue": "#47", "profile": "code-review", "name": "p-47-cr", "pane_id": "p2", "session": "s2"},
+                ])
+                code, _ = self.note("delivery-done", unit_only_delivery)
+                self.assertEqual(code, TR.EXIT_OK)
+
+                # 5) debug 模式免 code-review，但必须有独立 test（不与 dev 重合）
+                TR.state_set(self.repo, TASK, "当前阶段", "debug 模式验证完成")
+                write_ledger([
+                    {"issue": "#47", "profile": "dev", "name": "p-47-dev", "pane_id": "p1", "session": "s1"},
+                    {"issue": "#47", "profile": "test", "name": "p-47-test", "pane_id": "p3", "session": "s3"},
+                ])
+                code, _ = self.note("delivery-done", video_delivery + "\n\n（debug 模式交付）")
+                self.assertEqual(code, TR.EXIT_OK)
+
+                # 6) 常规交付三角色完全独立 -> 放行
+                TR.state_set(self.repo, TASK, "当前阶段", "常规交付验收完成")
+                write_ledger([
+                    {"issue": "#47", "profile": "dev", "name": "p-47-dev", "pane_id": "p1", "session": "s1"},
+                    {"issue": "#47", "profile": "code-review", "name": "p-47-cr", "pane_id": "p2", "session": "s2"},
+                    {"issue": "#47", "profile": "test", "name": "p-47-test", "pane_id": "p3", "session": "s3"},
+                ])
+                code, _ = self.note("delivery-done", video_delivery + "\n\n（常规全独立交付）")
+                self.assertEqual(code, TR.EXIT_OK)
 
     def test_protected_tag_blocks_and_unreadable_rule_is_disclosed(self) -> None:
         will = "tag=https://git.example.com/group/proj@2.7.20"

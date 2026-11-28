@@ -88,7 +88,7 @@ QUIET, VERBOSE = "quiet", "verbose"
 NOTIFY_COMMANDS = {"/免打扰": QUIET, "/quiet": QUIET, "/详尽": VERBOSE, "/verbose": VERBOSE}
 NOTIFY_LABELS = {QUIET: ("免打扰", "之后私聊只在需要你决定、答复你问题和整项交付完成时发消息（步骤与过程记录留 GitLab）"),
                  VERBOSE: ("详尽", "之后每个小阶段都会发消息")}
-# `/go` 后的模式词或整条独立模式指令进入 debug 流程，见 protocol/implementation.md「debug 模式」。
+# `/go` 后的模式词或整条独立模式指令进入 debug 流程，见 ~/.hwf/PROTOCOL.md 门槛 2。
 # 兼容两个词之间的空格，例如「debug 模式」「改 bug」「修 bug」「极简 模式」；普通正文交调度者判断。
 DEBUG_WORDS = frozenset({"debug", "debug模式", "改bug", "修bug", "极简", "极简模式", "minimal"})
 # 发起 issue 的两种模式：对话 = 只读 + 评论答疑；交付 = 跑完整交付流程。指派后默认对话，/go 切到交付。
@@ -472,9 +472,9 @@ class Inbox:
             log(f"reset {task}: {result.stderr.strip()}; retry next round")
             return None
         self.prompt(pane, (
-            f"[GitLab 收件箱] 用户要求清空上下文，你已在新会话中。你是任务 {task} 的调度者：按 "
-            "~/.hwf/PROTOCOL.md 的阅读入口读取 ~/.hwf/protocol/scheduling.md，用 herdr agent get 核对登记身份（不要改名），再按 .hwf/tmp/INDEX.md 与该任务 "
-            "STATE.md 接续；在 STATE 记录新会话。结束回合或收到关闭通知前，按 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」核验剩余工作。"))
+            f"[GitLab 收件箱] 用户要求清空上下文，你已在新会话中。你是任务 {task} 的调度者：先读 "
+            "~/.hwf/PROTOCOL.md，用 herdr agent get 核对登记身份（不要改名），再按 .hwf/tmp/INDEX.md 与该任务 "
+            "STATE.md 接续；在 STATE 记录新会话。结束回合或收到关闭通知前，按 ~/.hwf/PROTOCOL.md 门槛 3–4 核验交付证据与剩余工作。"))
         return result.stdout
 
     def comment(self, where: Mapping[str, Any], body: str) -> None:
@@ -590,10 +590,10 @@ class Inbox:
             forwarded = bool(rest) and self.deliver(repo, url, self.message(url, note, True), DELIVER) is not None
             self.comment(where, f"@{user} 这个 issue 已经在交付流程中了。" + ("补充说明已转给调度者。" if forwarded else ""))
             return True
-        flow = ("用户明确要求 debug 模式：按 ~/.hwf/protocol/implementation.md「debug 模式」领取普通开发角色 dev/dev-fe/dev-be，"
-                "保留本地单元测试先行和实现前核验；不跑本地浏览器/Electron 验收，develop 部署后做真实自动化验收，通过后提交 MR 到 release-<根编号>。"
-                "不做复杂度判定、方案评审、整项代码评审、arch 终审或 main 合并；按此流程"
-                if debug else "按 ~/.hwf/protocol/planning.md 从 §0 复杂度判定开始")
+        flow = ("用户明确要求 debug 模式：按 ~/.hwf/PROTOCOL.md debug 短路径领取普通开发角色 dev/dev-fe/dev-be，"
+                "保留本地单元测试先红后绿留证；develop 部署后由独立 test 做真实自动化验收，通过后提交 MR 到 release-<根编号>。"
+                "免整项代码评审与 main 合并，按此流程"
+                if debug else "按 ~/.hwf/PROTOCOL.md 进入自由交付：先起草验收卡交用户本人确认，通过后自主编排")
         go = (f"[GitLab 收件箱] 用户在 {url}#note_{note['id']} 发出 {trigger_label}：从对话模式切换到交付流程，"
               f"{flow}交付这个 issue（发起人 @{user}）。"
               + (f"\n用户补充：{extra}" if extra else ""))
@@ -1351,11 +1351,11 @@ class Inbox:
                         "若尚未收到开工授权、未进入交付流程且无代码改动或未合并分支，用户关闭发起 issue 即视为取消本次只读咨询，"
                         f"直接运行 wrapup.py --status \"cancelled（对话模式未开工，用户已关闭 issue）\" --no-issue-note 静默释放成员并更新 INDEX，"
                         "禁止在 issue 发追问评论、禁止发待办 ntfy；"
-                        "仅当 STATE.md 已切入交付流程且确有未完成交付工作时，才按 ~/.hwf/protocol/delivery.md §9 核验缺项并处理。",
+                        "仅当 STATE.md 已切入交付流程且确有未完成交付工作时，才按 ~/.hwf/PROTOCOL.md 门槛 3–4 核验缺项并处理。",
                     )
                 else:
-                    self.prompt(pane, f"[GitLab 收件箱] 检测到发起 issue 已关闭 {url}。先按 ~/.hwf/protocol/delivery.md "
-                                      "§9「完成评论与关闭前核对」「发起 issue 的关闭授权」核验交付证据和剩余工作；关闭事件本身不代表验收或交付完成。"
+                    self.prompt(pane, f"[GitLab 收件箱] 检测到发起 issue 已关闭 {url}。先按 ~/.hwf/PROTOCOL.md "
+                                      "红线 1 与门槛 3–4 核验交付证据和剩余工作；关闭事件本身不代表验收或交付完成。"
                                       "仍有未完成项且用户未明确取消时，在原 issue 说明缺项，请用户重开继续或明确取消，"
                                       "INDEX 保持 blocked，保留成员与 worktree；测试服务仍按每轮规则清理。"
                                       "只有确认交付完成或用户明确取消后，才执行 §9「成员收尾与收尾回执」。")

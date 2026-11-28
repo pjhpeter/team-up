@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""交付收尾一条命令版：按 ~/.hwf/protocol/delivery.md §9「成员收尾与收尾回执」的顺序做完收尾，全部通过才把 INDEX 改成收尾状态。
+"""交付收尾一条命令版：按 ~/.hwf/PROTOCOL.md 门槛 4 的顺序做完收尾，全部通过才把 INDEX 改成收尾状态。
 
     python3 ~/.hwf/scripts/wrapup.py --repo <主仓库> --task <任务标识> --issue <发起 issue URL（没有则根 issue）> \\
         --release <release-<根编号>> --status "done（…）" [--port N]... [--dry-run]

@@ -3,14 +3,14 @@
 #   python3 ~/.hwf/scripts/role_config.py sync
 profiles:
   scheduler:
-    kind: omp
-    args: ["--config", "~/.hwf/scheduler-omp.yml", "--approval-mode", "yolo"]
+    kind: agy
+    args: ["--model", "gemini-4-neon-medium", "--effort", "medium", "--dangerously-skip-permissions"]
   arch:
     kind: agy
-    args: ["--model", "gemini-4-neon-xhigh", "--effort", "xhigh", "--mode", "auto", "--dangerously-skip-permissions"]
+    args: ["--model", "gemini-4-neon-xhigh", "--effort", "xhigh", "--dangerously-skip-permissions"]
   arch-lite:
     kind: agy
-    args: ["--model", "claude-opus-5-5-medium", "--effort", "medium", "--mode", "auto", "--dangerously-skip-permissions"]
+    args: ["--model", "claude-opus-5-5-medium", "--effort", "medium", "--dangerously-skip-permissions"]
   dev:
     kind: codex
     args: ["-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=medium", "-c", "model_auto_compact_token_limit=200000", "--dangerously-bypass-approvals-and-sandbox"]

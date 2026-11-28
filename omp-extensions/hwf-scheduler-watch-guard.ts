@@ -159,7 +159,7 @@ export function buildReason(unwatched) {
   return [
     "[hwf 监听守卫] 你准备结束回合，但下面这些成员还在干活或卡住，却没有任何后台 member-wait.py 在盯：",
     ...lines,
-    "按 ~/.hwf/protocol/scheduling.md「等待与完成判定」：用 bash `async: true` 挂上述等待（不要写 for 循环或 sleep），确认返回「Backgrounded as job」后再结束回合。",
+    "按 ~/.hwf/PROTOCOL.md 第四节：用 bash `async: true` 挂上述等待（不要写 for 循环或 sleep），确认返回「Backgrounded as job」后再结束回合。",
     "若某成员已不属于本任务（已交接或改由其他调度者使用），在 STATE 记一句并直接结束回合即可。",
   ].join("\n");
 }

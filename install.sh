@@ -71,7 +71,7 @@ else
   echo "[已链接] Herdr 角色配置 → $src"
 fi
 
-# 3. omp 扩展：调度者改 INDEX、发 issue 评论时拦下手写，改走 task-record.py
+# 3. omp 扩展 + agy Hooks：调度者改 INDEX、发 issue 评论、停回合忘挂等待或弹框/私开子代理时硬拦截
 ext="$HOME/.omp/agent/extensions"
 if [ -d "$HOME/.omp/agent" ]; then
   mkdir -p "$ext"
@@ -81,6 +81,13 @@ if [ -d "$HOME/.omp/agent" ]; then
   echo "[已链接] omp 扩展 → $HWF/omp-extensions（新开的 omp 会话生效）"
 else
   echo "[注意]   没找到 ~/.omp/agent，omp 扩展未安装（调度者用 omp 时需要）"
+fi
+
+if [ -d "$HOME/.gemini" ] || command -v agy >/dev/null 2>&1; then
+  python3 "$HWF/scripts/agy-scheduler-guard.py" install-hooks
+  echo "[已安装] agy 调度者 Hooks → ~/.gemini/config/hooks.json（仅对 delivery-scheduler-* 生效）"
+else
+  echo "[注意]   未检测到 agy / ~/.gemini，跳过 agy Hooks 安装"
 fi
 
 # 4. 成员 skill：链接到所有 Agent 共用的 ~/.agents/skills；Claude Code 只读 ~/.claude/skills，再按其惯例链一层

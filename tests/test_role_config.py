@@ -93,7 +93,7 @@ class RepoConsistencyTests(unittest.TestCase):
         rendered = (HWF_ROOT / "herdr" / "config.yaml").read_text(encoding="utf-8")
         self.assertNotIn("/Users/", rendered)
         self.assertNotIn("/home/", rendered)
-        self.assertIn("~/.hwf/scheduler-omp.yml", rendered)
+        self.assertIn("gemini-4-neon-medium", rendered)
 
         with tempfile.TemporaryDirectory(prefix="hwf-ci-checkout-") as tmp:
             ci_dir = Path(tmp) / "builds" / "team-up"
@@ -203,8 +203,12 @@ services: {}
             )
             self.assertEqual(
                 p["arch"],
-                {"kind": "agy", "args": ["--model", "gemini-4-neon-xhigh", "--effort", "xhigh", "--mode", "auto", "--dangerously-skip-permissions"]},
+                {"kind": "agy", "args": ["--model", "gemini-4-neon-xhigh", "--effort", "xhigh", "--dangerously-skip-permissions"]},
             )
+            trusted = RC.prepare_agy_trusted_args("agy", p["arch"]["args"], "/tmp/demo-repo")
+            self.assertIn("--settings", trusted)
+            settings_payload = json.loads(trusted[trusted.index("--settings") + 1])
+            self.assertIn("/tmp/demo-repo", settings_payload["trustedWorkspaces"])
             self.assertEqual(
                 p["dev"],
                 {

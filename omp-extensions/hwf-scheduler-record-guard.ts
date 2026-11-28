@@ -1,4 +1,4 @@
-// Herdr 调度者记录守卫：~/.hwf/protocol/scheduling.md「任务标识与索引」及 communication.md「通知模式」的机制兜底。
+// Herdr 调度者记录守卫：~/.hwf/PROTOCOL.md 第四节及 protocol/communication.md「通知模式」的机制兜底。
 //
 // 问题：2026-11-15 #483 调度者手写 INDEX 行没加反引号，收件箱找不到负责人；免打扰模式下仍单独发了 4 条阶段进度评论；
 // 先请用户同意合并，之后才发现本账号没有合并权限。这些规则协议里都写了，调度者照样漏。
@@ -22,7 +22,7 @@ const MAX_PROMPT_CHARS = 2500;
 const WAIT_REASON = "等成员不用 herdr agent wait（2026-11-19 #484：成员断网后 herdr 仍报 working，干等了约 2 小时没人发现）。改用：python3 ~/.hwf/scripts/member-wait.py <成员> [--until …] --repo <主仓库> --task <任务标识>，用 bash async: true 后台运行；它每次最多等 10 分钟，会看屏幕判断卡住，并自动更新 issue 正文。";
 
 function promptLengthReason(len) {
-  return `单条派活命令长达 ${len} 字（上限 ${MAX_PROMPT_CHARS} 字）：万字长派活会撑爆调度者与成员上下文。请把长背景、验收清单或代码位置写进 <主仓库>/.hwf/tmp/<任务标识>/dispatch-<角色>.md，herdr agent prompt 里只写本次目标、可写范围和该文件的绝对路径（见 ~/.hwf/protocol/scheduling.md「派活契约」）。`;
+  return `单条派活命令长达 ${len} 字（上限 ${MAX_PROMPT_CHARS} 字）：万字长派活会撑爆调度者与成员上下文。请把长背景、验收清单或代码位置写进 <主仓库>/.hwf/tmp/<任务标识>/dispatch-<角色>.md，herdr agent prompt 里只写本次目标、可写范围和该文件的绝对路径（见 ~/.hwf/PROTOCOL.md 第四节）。`;
 }
 
 // 返回拦截理由；不该拦返回 null。

@@ -387,7 +387,7 @@ def compile_team_profile(
         if thinking:
             args.extend(["--effort", thinking])
         if yolo:
-            args.extend(["--mode", "auto", "--dangerously-skip-permissions"])
+            args.append("--dangerously-skip-permissions")
     elif tool == "omp":
         if omp_config:
             args.extend(["--config", _format_hwf_path(omp_config, home, portable=portable)])
@@ -431,6 +431,37 @@ def compile_team_profile(
 
     args.extend(extra_args)
     return {"kind": tool, "args": args}
+
+
+def prepare_agy_trusted_args(
+    kind: str,
+    args: Sequence[str],
+    cwd: str,
+    repo: Optional[Path] = None,
+) -> list[str]:
+    """为 agy 注入会话级 trustedWorkspaces，避免新仓库或 worktree 卡在启动信任弹窗。"""
+    out = list(args)
+    if kind != "agy":
+        return out
+    if any(a == "--settings" or a.startswith("--settings=") for a in out):
+        return out
+    candidates: list[str] = []
+    for raw in (
+        cwd,
+        os.path.realpath(cwd) if cwd else "",
+        str(repo) if repo else "",
+        os.path.realpath(str(repo)) if repo else "",
+    ):
+        if raw and raw not in candidates:
+            candidates.append(raw)
+    if candidates:
+        out.extend(
+            [
+                "--settings",
+                json.dumps({"trustedWorkspaces": candidates}, ensure_ascii=False, separators=(",", ":")),
+            ]
+        )
+    return out
 
 
 def compile_herdr_config(

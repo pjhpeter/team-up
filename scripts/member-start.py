@@ -201,19 +201,8 @@ def override_model(args: Sequence[str], model: str) -> list[str]:
     raise ClaimError("配置里找不到模型参数，无法替换")
 
 def prepare_launch_args(kind: str, args: Sequence[str], cwd: str, repo: Optional[Path] = None) -> list[str]:
-    """按执行体补齐运行时启动参数。agy 对工作目录做精确信任匹配，用会话级 --settings 信任当前 cwd/主仓避免卡在启动弹窗。"""
-    out = list(args)
-    if kind != "agy":
-        return out
-    if any(a == "--settings" or a.startswith("--settings=") for a in out):
-        return out
-    candidates: list[str] = []
-    for raw in (cwd, os.path.realpath(cwd), str(repo) if repo else "", os.path.realpath(str(repo)) if repo else ""):
-        if raw and raw not in candidates:
-            candidates.append(raw)
-    if candidates:
-        out.extend(["--settings", json.dumps({"trustedWorkspaces": candidates}, ensure_ascii=False, separators=(",", ":"))])
-    return out
+    """按执行体补齐运行时启动参数（复用 role_config 的 agy trustedWorkspaces 注入）。"""
+    return _RC.prepare_agy_trusted_args(kind, args, cwd, repo)
 
 
 def pane_label(profile: str, args: Sequence[str], task: str, issue: str = "") -> str:
@@ -228,6 +217,42 @@ def pane_label(profile: str, args: Sequence[str], task: str, issue: str = "") ->
 
 def registry_path() -> Path:
     return Path(os.environ.get("HWF_STATE_DIR") or Path.home() / ".hwf/state") / "members.json"
+
+
+def role_ledger_path() -> Path:
+    return Path(os.environ.get("HWF_STATE_DIR") or Path.home() / ".hwf/state") / "role-ledger.jsonl"
+
+
+def append_role_ledger(
+    *,
+    issue: str,
+    profile: str,
+    name: str,
+    pane_id: str,
+    session: Optional[str],
+    scheduler: str,
+    cwd: str,
+    task: str,
+) -> None:
+    """记录每次成员领取流水，供 task-record.py delivery-done 做「作者 ≠ 审者 ≠ 真机验者」独立性硬校验。"""
+    entry = {
+        "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "issue": issue or "",
+        "profile": profile,
+        "name": name,
+        "pane_id": pane_id,
+        "session": session or "",
+        "scheduler": scheduler,
+        "cwd": cwd,
+        "task": task,
+    }
+    try:
+        path = role_ledger_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
 
 
 def read_registry() -> dict[str, Any]:
@@ -597,6 +622,16 @@ def claim(profile_name: str, task: str, cwd: str, exclude: Sequence[str], keep_s
         live_panes = {str(p.get("pane_id")) for p in panes_snapshot if p.get("pane_id")} - set(pruned_panes)
 
     record(pane, scheduler["name"], profile_name, drop_panes=pruned_panes, live_panes=live_panes, issue=issue)
+    append_role_ledger(
+        issue=issue,
+        profile=profile_name,
+        name=name,
+        pane_id=pane["pane_id"],
+        session=(agent.get("agent_session") or {}).get("value"),
+        scheduler=scheduler["name"],
+        cwd=cwd,
+        task=task,
+    )
     pruned_set = set(pruned_panes)
     picked_pane = pane["pane_id"] if member is not None else None
     busy = [m["name"] for m in members if m.get("pane_id") != picked_pane and m.get("pane_id") not in pruned_set]

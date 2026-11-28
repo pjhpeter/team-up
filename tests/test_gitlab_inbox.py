@@ -590,7 +590,7 @@ class InboxTests(unittest.TestCase):
         self.assertIn("交付模式", world.prompts[-1])
 
     def assert_debug_delivery_contract(self, text: str) -> None:
-        self.assertIn("protocol/implementation.md", text)
+        self.assertIn("PROTOCOL.md", text)
         for role in ("dev", "dev-fe", "dev-be"):
             self.assertRegex(text, rf"(?<![\w-]){role}(?![\w-])")
         self.assertRegex(text, r"单元测试|单测")
@@ -697,7 +697,7 @@ class InboxTests(unittest.TestCase):
         state["origins"][URL]["mode"] = INBOX.CHAT
         world = FakeWorld([], notes=[note(6) | {"body": "/go 这个不要走debug"}])
         make(world, state).poll()
-        self.assertIn("§0 复杂度判定开始", world.prompts[0])
+        self.assertIn("按 ~/.hwf/PROTOCOL.md 进入自由交付", world.prompts[0])
 
     def test_go_without_live_scheduler_launches_delivery_not_chat(self) -> None:
         state = self.origin_state()
@@ -728,14 +728,28 @@ class InboxTests(unittest.TestCase):
     def test_description_params_start_scheduler_and_stick(self) -> None:
         desc = "需求说明\n/model gpt-6.1-sol\n/thinking HIGH\n"
         world = FakeWorld([todo(description=desc)], notes=[note(5)], owners={URL: ("frontend-web-v1-7", None)})
-        inbox = make(world)
-        inbox.poll()
-        # 模型短名解析成完整 selector；之后调度者退出、由评论走入口接手时沿用同样参数。
-        self.assertEqual(world.params, [("jc-gpt/gpt-6.1-sol", "high")])
-        inbox.state["launched_at"].clear()
-        world.notes.append(note(6))
-        inbox.poll()
-        self.assertEqual(world.params[-1], ("jc-gpt/gpt-6.1-sol", "high"))
+        with patch.object(INBOX.RC, "resolve_team_role", return_value={"tool": "omp"}):
+            inbox = make(world)
+            inbox.poll()
+            # omp 调度者下模型短名解析成完整 selector；之后调度者退出、由评论走入口接手时沿用同样参数。
+            self.assertEqual(world.params, [("jc-gpt/gpt-6.1-sol", "high")])
+            inbox.state["launched_at"].clear()
+            world.notes.append(note(6))
+            inbox.poll()
+            self.assertEqual(world.params[-1], ("jc-gpt/gpt-6.1-sol", "high"))
+
+    def test_agy_scheduler_passes_model_and_validates_thinking(self) -> None:
+        desc = "需求说明\n/model gemini-4-neon-high\n/thinking high\n"
+        world = FakeWorld([todo(description=desc)], notes=[note(5)], owners={URL: ("frontend-web-v1-7", None)})
+        with patch.object(INBOX.RC, "resolve_team_role", return_value={"tool": "agy"}):
+            make(world).poll()
+            self.assertEqual(world.params, [("gemini-4-neon-high", "high")])
+        bad_world = FakeWorld([todo(description="/model gemini-4-neon-high\n/thinking ultra")])
+        with patch.object(INBOX.RC, "resolve_team_role", return_value={"tool": "agy"}):
+            inbox = make(bad_world)
+            inbox.poll()
+            self.assertEqual(bad_world.launched, [])
+            self.assertIn("思考强度", bad_world.comments[0])
 
     def test_thinking_only_is_allowed(self) -> None:
         world = FakeWorld([todo(description="/thinking low")], notes=[note(5)])
@@ -750,15 +764,16 @@ class InboxTests(unittest.TestCase):
     def test_bad_params_wait_and_warn_once(self) -> None:
         cases = {"unknown model": "/model gpt-9", "ambiguous model": "/model claude-opus",
                  "unsupported thinking": "/model gpt-6.1-sol\n/thinking max"}
-        for name, desc in cases.items():
-            with self.subTest(name):
-                world = FakeWorld([todo(description=desc)])
-                inbox = make(world)
-                inbox.poll()
-                inbox.poll()
-                self.assertEqual((world.launched, world.done, inbox.state["origins"]), ([], [], {}))
-                self.assertEqual(len(world.comments), 1)
-                self.assertIn("/model", world.comments[0])
+        with patch.object(INBOX.RC, "resolve_team_role", return_value={"tool": "omp"}):
+            for name, desc in cases.items():
+                with self.subTest(name):
+                    world = FakeWorld([todo(description=desc)])
+                    inbox = make(world)
+                    inbox.poll()
+                    inbox.poll()
+                    self.assertEqual((world.launched, world.done, inbox.state["origins"]), ([], [], {}))
+                    self.assertEqual(len(world.comments), 1)
+                    self.assertIn("/model", world.comments[0])
 
     def test_mention_then_assignment_still_tracks_origin(self) -> None:
         # #362 事故：先 @本账号 走了入口，紧接着指派；指派落在冷却期内也必须登记为发起 issue，
@@ -1425,7 +1440,7 @@ class NaturalGoTest(unittest.TestCase):
         self.assertEqual(state["origins"][URL]["mode"], INBOX.DELIVER)
         self.assertEqual(len(world.prompts), 1)
         self.assertIn("明确开工指令：从对话模式切换到交付流程", world.prompts[0])
-        self.assertIn("按 ~/.hwf/protocol/planning.md 从 §0 复杂度判定开始", world.prompts[0])
+        self.assertIn("按 ~/.hwf/PROTOCOL.md 进入自由交付", world.prompts[0])
         self.assertIn("用户补充：方案没问题，按这个开始写代码交付吧", world.prompts[0])
 
     def test_natural_debug_go_switches_to_debug_flow(self) -> None:

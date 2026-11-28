@@ -1,6 +1,6 @@
 version: v1alpha1
 title: Herdr Issue 交付流程
-description: 复用空闲调度者或创建调度者，按 ~/.hwf/PROTOCOL.md 与当前阶段主题推进 Herdr Issue 交付；阶段、确认点与角色权限以协议为准。
+description: 复用空闲调度者或通过 start-scheduler.py 新建调度者（默认 agy + gemini-4-neon-medium），按 ~/.hwf/PROTOCOL.md 自主编排交付。
 inputs:
   task:
     type: text
@@ -8,79 +8,47 @@ inputs:
     min_length: 1
   model:
     type: text
-    description: 调度者模型，如 jc-gpt/gpt-6.1-sol；留空用 omp 默认模型
+    description: 调度者模型覆盖，如 gemini-4-neon-high；留空用 roles.yaml 默认配置
     default: ""
   thinking:
     type: text
-    description: 调度者思考强度，如 low/medium/high；留空用模型默认
+    description: 调度者思考强度覆盖，如 low/medium/high；留空用 roles.yaml 默认配置
     default: ""
 steps:
-  # 发起 issue 时可指定调度者模型与思考强度。指定任一项就用 start-scheduler.py
-  # 直接以这些参数新开调度者（已有调度者的模型在会话里换不了，所以不复用）；都留空走原来的复用/新建。
-  - id: custom
-    run: [sh, -c, 'printf %s "$1$2"', custom, "{{inputs.model}}", "{{inputs.thinking}}"]
-  # 发现契约见 find-scheduler.py 文件头：
-  #   exit 0 + stdout=pane id → 复用空闲调度者；exit 0 + stdout 空 → 新建（允许多个调度者并行）；
-  #   其他退出码 → 入口失败（fail closed）。
-  # 空闲 = herdr idle/done，且名下没有未收尾任务、也没有用户未关闭的发起 issue。
-  # 复用前先用 reset-session.py 开新会话，不带入之前的对话；
-  # 清空未确认时输出空，改为新建调度者，不把需求发给旧会话。
-  # list argv 不经 shell：显式 sh -c 展开 $HOME；$0 占位为 find-scheduler，"$1" 接 cwd。
+  # 指定了 model 或 thinking 时不复用旧会话（直接输出空，走下一步新开调度者）；
+  # 都留空时查找空闲调度者并经 reset-session.py 清空上下文（agy 走 /clear，omp 走 /new），确认成功才复用。
   - id: scheduler
     run:
       - sh
       - -c
       - |
+        [ -n "$2$3" ] && exit 0
         pane=$(python3 "$HOME/.hwf/scripts/find-scheduler.py" "$1") || exit 1
         if [ -n "$pane" ] && python3 "$HOME/.hwf/scripts/reset-session.py" "$pane" >/dev/null; then
           printf %s "$pane"
         fi
       - find-scheduler
       - "{{context.cwd}}"
+      - "{{inputs.model}}"
+      - "{{inputs.thinking}}"
     timeout: 40s
-    when: '{{steps.custom.stdout}} == ""'
-  # 复用单次调用 API，不进入引擎的接收确认循环；工具调用期间消息会排队。
-  # 新建分支仍用 background，确认接收后结束；后续交付由调度者按协议推进。
+  # 复用空闲调度者：单次 prompt 投递，后台推进。
   - herdr: agent.prompt
     params:
       target: "{{steps.scheduler.stdout}}"
-      text: |
-        你是这项需求的 Herdr 调度者。需求：{{inputs.task}}
+      text: &scheduler_prompt |
+        你是这项需求的 Herdr 调度者（技术负责人）。
+        需求：{{inputs.task}}
         仓库：{{context.cwd}}
-        入口已为你开了新会话，之前的对话不在上下文里。先读 ~/.hwf/PROTOCOL.md，再读 ~/.hwf/protocol/scheduling.md「初始化」；你已登记为调度者，先用 herdr agent get 回读核对登记身份，不要重复改名。确定 issue 编号后，用 python3 ~/.hwf/scripts/name-tab.py <编号|-> <短标题> 重命名 tab（未改名时领取不了成员）。
-        入口已后台提交本条需求、不等待你的回复；进度写入任务记录与 STATE.md。hwf run id 用 hwf runs list --json --checkout-root {{context.cwd}} 取 workflow 为 team-up 的最新一条，查不到写 n/a。
-        按 ~/.hwf/protocol/scheduling.md「任务标识与索引」核对 INDEX 与 STATE；若仍有在途交付，用 task-record.py index-add --queued 记录本需求，不打断现有任务。任务记录、成员复用、派活与等待均执行该主题；你只做调度，不代做成员工作。
-        发通知、拆独立 issue 或收到跨 issue 回复前，读 ~/.hwf/protocol/communication.md「通知模式」「独立需求与飞书话题」「GitLab 收件箱」。需求以「【对话模式】」开头时，只派用户点名角色只读分析（未点名派 arch），原样转贴成员结论；你不分析、不读代码、不判复杂度，直到用户 /go 或明确开工才走交付步骤。
-        debug/修bug/改bug/极简模式由用户明确要求触发，或由 arch 在 ~/.hwf/protocol/planning.md §0 经源码核对判为「极简路径」（≤3 个生产文件的纯局部展示/文案/显隐/样式微调，防风险=不要，无歧义且默认 smoke 可用）后直接转入；按 ~/.hwf/protocol/implementation.md「debug 模式」执行，用普通 dev/dev-fe/dev-be，单测与实现前核验后实现，合 develop 等部署，再由 test 在项目默认 smoke 地址（default 不为 false）真实验收，通过后创建 release MR 交用户（在途追加小改动汇入既有 release）。不得启动本地 Web/开发版 Electron 验收，也不引入独立用例/snippet、整项代码评审、arch 终审或 main 合并；角色模型取 ~/.hwf/roles.yaml，调度者不未经核对自行选择 debug。
-        用户未显式要求 debug 时先派 arch 按 ~/.hwf/protocol/planning.md §0 判定：判「极简路径」经 card-check 后直转 debug 模式；其余非待澄清判定经 §0.1 用户确认后才走对应路径；方案确认、spec、拆分和 issue 标签均按该主题相应章节执行。
-        派测试准备或开发前读 ~/.hwf/protocol/implementation.md §4–6；首次开发（含 debug 首次实现）先过 §6「实现前检查点」：高风险切片与 debug 经独立 code-review 核准后才派生产代码修改，其余切片 dev 自核有效失败后直接实现；进入评审或测试后的回改按 §6「回改打包」由 dev 单趟完成红绿留证与代码修改后一次交审。正常流程进入代码评审或自动化验收前读 ~/.hwf/protocol/review-testing.md §7–8；debug 部署后验收读 §8「debug：部署后验收」，不带入本地服务要求。创建或清理工作树前读 ~/.hwf/protocol/worktrees.md。
-        发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；正常流程按 §9.1 完成最终验收（单仓单步同版本零改动直接复用 §7 结论），debug 只核 implementation 的有限出口。核验剩余工作再决定继续、澄清或收尾，不把阶段通过当作交付完成。
-    when:
-      - '{{steps.custom.stdout}} == ""'
-      - "{{steps.scheduler.stdout}}"
-  # 新建调度者的需求文本；指定模型分支经 env 复用同一段（YAML 锚点），不维护两份。
-  - agent: &new_scheduler_prompt |
-      你是这项需求的 Herdr 调度者。需求：{{inputs.task}}
-      仓库：{{context.cwd}}
-      先读 ~/.hwf/PROTOCOL.md，再按 ~/.hwf/protocol/scheduling.md「初始化」完成第 1、2 步后登记调度者角色；不要把改名作为第一个动作。登记后用 python3 ~/.hwf/scripts/name-tab.py <issue 编号|-> <短标题> 给 tab 起名（未改名时领取不了成员）。
-      入口已后台提交本条需求、不等待你的回复；进度写入任务记录与 STATE.md。hwf run id 取本 pane 环境变量 $HWF_RUN_ID。
-      按 ~/.hwf/protocol/scheduling.md「任务标识与索引」核对 INDEX 与 STATE；任务记录、成员复用、派活与等待均执行该主题；你只做调度，不代做成员工作。
-      发通知、拆独立 issue 或收到跨 issue 回复前，读 ~/.hwf/protocol/communication.md「通知模式」「独立需求与飞书话题」「GitLab 收件箱」。需求以「【对话模式】」开头时，只派用户点名角色只读分析（未点名派 arch），原样转贴成员结论；你不分析、不读代码、不判复杂度，直到用户 /go 或明确开工才走交付步骤。
-      debug/修bug/改bug/极简模式由用户明确要求触发，或由 arch 在 ~/.hwf/protocol/planning.md §0 经源码核对判为「极简路径」（≤3 个生产文件的纯局部展示/文案/显隐/样式微调，防风险=不要，无歧义且默认 smoke 可用）后直接转入；按 ~/.hwf/protocol/implementation.md「debug 模式」执行，用普通 dev/dev-fe/dev-be，单测与实现前核验后实现，合 develop 等部署，再由 test 在项目默认 smoke 地址（default 不为 false）真实验收，通过后创建 release MR 交用户（在途追加小改动汇入既有 release）。不得启动本地 Web/开发版 Electron 验收，也不引入独立用例/snippet、整项代码评审、arch 终审或 main 合并；角色模型取 ~/.hwf/roles.yaml，调度者不未经核对自行选择 debug。
-      用户未显式要求 debug 时先派 arch 按 ~/.hwf/protocol/planning.md §0 判定：判「极简路径」经 card-check 后直转 debug 模式；其余非待澄清判定经 §0.1 用户确认后才走对应路径；方案确认、spec、拆分和 issue 标签均按该主题相应章节执行。
-      派测试准备或开发前读 ~/.hwf/protocol/implementation.md §4–6；首次开发（含 debug 首次实现）先过 §6「实现前检查点」：高风险切片与 debug 经独立 code-review 核准后才派生产代码修改，其余切片 dev 自核有效失败后直接实现；进入评审或测试后的回改按 §6「回改打包」由 dev 单趟完成红绿留证与代码修改后一次交审。正常流程进入代码评审或自动化验收前读 ~/.hwf/protocol/review-testing.md §7–8；debug 部署后验收读 §8「debug：部署后验收」，不带入本地服务要求。创建或清理工作树前读 ~/.hwf/protocol/worktrees.md。
-      发布阶段结果、遇到 MR 冲突、准备结束回合、收到关闭请求或关闭通知时，读 ~/.hwf/protocol/delivery.md §9「完成评论与关闭前核对」「发起 issue 的关闭授权」；正常流程按 §9.1 完成最终验收（单仓单步同版本零改动直接复用 §7 结论），debug 只核 implementation 的有限出口。核验剩余工作再决定继续、澄清或收尾，不把阶段通过当作交付完成。
-    using: scheduler
-    # 每个调度者独占新 tab，不在入口或收件箱旁创建成员；
-    # 它的成员按协议在这个 tab 里分屏，多个交付互不挤占。
-    pane:
-      open: tab
-      focus: false
-    background: true
-    when:
-      - '{{steps.custom.stdout}} == ""'
-      - '{{steps.scheduler.stdout}} == ""'
-  # 指定了模型或思考强度：start-scheduler.py 新开 tab，以登记名启动 omp 并发送同一段需求。
+
+        先读 ~/.hwf/PROTOCOL.md（这是唯一核心交付协议：红线、四道交卷硬门槛、角色资源菜单与运行底座脚本）。
+        1. 身份与环境：确认自己已登记为 delivery-scheduler-*（用 herdr agent get 回读核对，不重复改名），明确 issue 编号后运行 `python3 ~/.hwf/scripts/name-tab.py <编号|-> <短标题>`，用 `task-record.py index-add / state-set` 维护 `.hwf/tmp/INDEX.md` 与 `STATE.md`（若仍有未收尾在途交付，先 `--queued` 登记不打断现有任务）。
+        2. 入口模式：需求以「【对话模式】」开头或未获开工指令时严格只读，派点名角色（默认 arch）分析并原样转达；收到 `/go`（含 `/go debug`）或明确开工指令后进入交付模式。
+        3. 自由编排 + 硬门槛：除显式 debug 外，开工前必须由用户本人确认极简人话验收卡（常规/复杂由 arch 查代码起草，原话已写全验收的极小单由你直接整理）；中间拆解与角色选用自主决定；交卷必须过四道硬门槛（独立性「作者 ≠ 审者 ≠ 真机验者」、semantic-lint、develop 真机录屏逐条对账表、release-check 同源校验），交付由用户本人验收与决定合 main / 关单。
+        4. 运行纪律：所有评论走 `task-record.py note`（默认免打扰，需要查通知/收件箱细则再看 `~/.hwf/protocol/communication.md`）；禁止弹终端提问框或用内置子代理代干活；派活经 `member-start.py`，同轮用 `run_command`（`WaitMsBeforeAsync: 500, IsDaemon: false`；omp 用 `bash async: true`）后台挂 `member-wait.py`，收取走 `member-settle.py`，收尾走 `wrapup.py`。
+    when: "{{steps.scheduler.stdout}}"
+  # 新建调度者（含默认配置与自定义 model/thinking）：统一经 start-scheduler.py 启动，
+  # 读取 roles.yaml + roles.local.yaml，自动为 agy 注入 --settings trustedWorkspaces 并以登记名启动。
   - run:
       - sh
       - -c
@@ -90,9 +58,9 @@ steps:
       - "{{inputs.model}}"
       - "{{inputs.thinking}}"
     env:
-      PROMPT: *new_scheduler_prompt
+      PROMPT: *scheduler_prompt
     timeout: 150s
-    when: "{{steps.custom.stdout}}"
+    when: '{{steps.scheduler.stdout}} == ""'
 on_failure:
   herdr: notification.show
   params:

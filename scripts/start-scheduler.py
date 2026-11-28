@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""用指定模型/思考强度新开一个调度者，供 team-up 入口在 issue 指定了模型时使用。
+"""按 roles.yaml（叠加可选的 issue 指定模型/思考强度）新开一个调度者，供 team-up 入口使用。
 
-    PROMPT=<需求文本> python3 ~/.hwf/scripts/start-scheduler.py <repo> <model> <thinking>
+    PROMPT=<需求文本> python3 ~/.hwf/scripts/start-scheduler.py <repo> [model] [thinking]
 
-model / thinking 可以留空（空串表示用 omp 默认），但不能都为空（都为空时入口走普通 scheduler profile）。
-步骤：在当前 workspace 新开一个 tab → 在它的 shell 里以登记名 `delivery-scheduler-<handle>` 启动 omp
-（--model/--thinking/--config ~/.hwf/scheduler-omp.yml/--approval-mode yolo）→ 发送 PROMPT。直接用登记名启动，调度者不用再改名。
+model / thinking 均可以留空（空串表示沿用 roles.yaml / roles.local.yaml 的 team.scheduler 默认值）。
+步骤：在当前 workspace 新开一个 tab → 在它的 shell 里以登记名 `delivery-scheduler-<handle>` 启动配置的调度者工具
+（如 agy + --settings trustedWorkspaces，或 omp / claude 等）→ 发送 PROMPT。直接用登记名启动，调度者不用再改名。
 任一步失败就关掉刚开的 tab 并以非 0 退出，交给入口的 on_failure 通知；不留下没有调度者的空 tab。
 """
 
@@ -19,7 +19,7 @@ import re
 import subprocess
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 _RC_SPEC = importlib.util.spec_from_file_location("hwf_role_config", Path(__file__).with_name("role_config.py"))
 assert _RC_SPEC is not None and _RC_SPEC.loader is not None
@@ -45,11 +45,18 @@ def handle(pane: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", pane.lower()).strip("-")
 
 
-def resolve_scheduler_launch(model: str, thinking: str, *, hwf_home: Path = HWF_HOME) -> tuple[str, list[str]]:
+def resolve_scheduler_launch(
+    model: str,
+    thinking: str,
+    *,
+    repo: Optional[str] = None,
+    hwf_home: Path = HWF_HOME,
+) -> tuple[str, list[str]]:
     """按 roles.yaml 的 team.scheduler 配置解析调度者工具与参数，并叠加 issue 指定的 model/thinking。"""
     spec = _RC.resolve_team_role("scheduler", hwf_home=hwf_home) or {
-        "tool": "omp",
-        "omp_config": str(hwf_home / "scheduler-omp.yml"),
+        "tool": "agy",
+        "model": "gemini-4-neon-medium",
+        "thinking": "medium",
         "yolo": True,
     }
     merged = dict(spec)
@@ -60,11 +67,28 @@ def resolve_scheduler_launch(model: str, thinking: str, *, hwf_home: Path = HWF_
     compiled = _RC.compile_team_profile(
         "scheduler", merged, hwf_home=hwf_home, write_settings=True, settings_subdir="state"
     )
-    return str(compiled["kind"]), list(compiled["args"])
+    kind = str(compiled["kind"])
+    launch_args = list(compiled["args"])
+    if repo:
+        launch_args = _RC.prepare_agy_trusted_args(kind, launch_args, repo, Path(repo))
+    return kind, launch_args
+
+
+def _effective_label_parts(model: str, thinking: str, launch_args: Sequence[str]) -> tuple[str, str]:
+    eff_model = model
+    eff_thinking = thinking
+    for i, arg in enumerate(launch_args):
+        if not eff_model and arg in ("--model", "-m") and i + 1 < len(launch_args):
+            eff_model = str(launch_args[i + 1]).rsplit("/", 1)[-1]
+        elif not eff_thinking and arg in ("--effort", "--thinking") and i + 1 < len(launch_args):
+            eff_thinking = str(launch_args[i + 1])
+    return eff_model or "default", eff_thinking
 
 
 def start(repo: str, model: str, thinking: str, prompt: str) -> str:
-    args = ["tab", "create", "--cwd", repo, "--label", f"scheduler {model or 'default'} {thinking}".strip(),
+    kind, launch_args = resolve_scheduler_launch(model, thinking, repo=repo)
+    label_model, label_thinking = _effective_label_parts(model, thinking, launch_args)
+    args = ["tab", "create", "--cwd", repo, "--label", f"scheduler {label_model} {label_thinking}".strip(),
             "--no-focus"]
     if os.environ.get("HERDR_WORKSPACE_ID"):
         args[2:2] = ["--workspace", os.environ["HERDR_WORKSPACE_ID"]]
@@ -74,7 +98,6 @@ def start(repo: str, model: str, thinking: str, prompt: str) -> str:
     try:
         if not re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", name):
             raise RuntimeError(f"registration name too long or invalid: {name}")
-        kind, launch_args = resolve_scheduler_launch(model, thinking)
         for attempt in range(SHELL_RETRIES):
             try:
                 herdr("agent", "start", name, "--kind", kind, "--pane", pane, "--timeout", str(START_TIMEOUT_MS),
@@ -84,8 +107,8 @@ def start(repo: str, model: str, thinking: str, prompt: str) -> str:
                 if "shell" not in str(error).lower() or attempt == SHELL_RETRIES - 1:
                     raise
                 time.sleep(1)
-        # 共用的新建提示让调度者自己登记改名；这里已经用登记名启动，提前说明，免得它再改名。
-        note = (f"（入口已用登记名 {name} 启动你，工具 {kind}、模型 {model or '默认'}、思考强度 {thinking or '默认'}；"
+        # 入口已直接用登记名启动，提前说明，免得调度者再改名。
+        note = (f"（入口已用登记名 {name} 启动你，工具 {kind}、模型 {label_model}、思考强度 {label_thinking or '默认'}；"
                 "你已登记，用 herdr agent get 回读核对即可，不要改名。）\n")
         herdr("agent", "prompt", name, note + prompt)
         return name
@@ -95,12 +118,14 @@ def start(repo: str, model: str, thinking: str, prompt: str) -> str:
 
 
 def main(argv: Sequence[str]) -> int:
-    if len(argv) != 3 or not (argv[1] or argv[2]) or not os.environ.get("PROMPT"):
-        print("usage: PROMPT=... start-scheduler.py <repo> <model> <thinking> (model or thinking required)",
+    if len(argv) not in (1, 2, 3) or not argv[0] or not os.environ.get("PROMPT"):
+        print("usage: PROMPT=... start-scheduler.py <repo> [model] [thinking]",
               file=sys.stderr)
         return 1
+    model = argv[1] if len(argv) > 1 else ""
+    thinking = argv[2] if len(argv) > 2 else ""
     try:
-        print(start(argv[0], argv[1], argv[2], os.environ["PROMPT"]))
+        print(start(argv[0], model, thinking, os.environ["PROMPT"]))
         return 0
     except (RuntimeError, ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
         print(f"start scheduler failed: {error}", file=sys.stderr)

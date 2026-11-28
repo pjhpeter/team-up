@@ -36,7 +36,7 @@ todo（要用户处理或授权）必须用 --will 写明用户同意后本账�
 
 退出码：0 成功；1 失败；2 参数错误；3 按规则没发（免打扰拦下、重复、自查不通过）。
 
-card-check：按 ~/.hwf/protocol/planning.md §0 核对 arch 判定里的「需求理解卡」（现状带 file:line、历史与坑不为空、验收条件每条写了证据、验收前提不为空）。
+card-check：按 ~/.hwf/PROTOCOL.md 门槛 1 核对需求理解卡/验收卡（现状带 file:line、历史与坑不为空、验收条件每条写了证据、验收前提不为空）。
 2026-11-15 用户同意：编码前对项目了解不够、验收太粗；只写进协议的要求聊几句就忘，所以由脚本拦。缺项时退出码 3。
 
 progress：根 issue 描述顶部的「进度」维护区只由它写。2026-11-19 #484：进度区手写了 7 小时没更新，代码还没进
@@ -58,6 +58,7 @@ import hashlib
 import html
 import importlib.util
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -1160,6 +1161,165 @@ def acceptance_table_problems(
     return problems
 
 
+DEV_ROLES = frozenset({"dev", "dev-fe", "dev-be"})
+REVIEW_ROLES = frozenset({"code-review", "arch"})
+TEST_ROLES = frozenset({"test", "test-herdr"})
+SELF_VERIFY_CLAIM_RE = re.compile(
+    r"(?:dev|dev-fe|dev-be|开发(?:者|成员|本人)?)\s*(?:自审|自行(?:代码)?评审|自测通过|自行(?:真机|浏览器|端到端)验收)"
+)
+DEBUG_OR_TINY_MODE_RE = re.compile(r"(?:debug\s*模式|极简(?:模式|路径)|/go\s+debug)", re.IGNORECASE)
+ISSUE_IID_RE = re.compile(r"/(?:issues|work_items)/(\d+)\b")
+
+
+def role_ledger_path() -> Path:
+    return Path(os.environ.get("HWF_STATE_DIR") or Path.home() / ".hwf/state") / "role-ledger.jsonl"
+
+
+def _load_task_role_ledger(repo: Optional[str], task: Optional[str], issue_url: str) -> list[dict[str, Any]]:
+    path = role_ledger_path()
+    if not path.is_file():
+        return []
+    m = ISSUE_IID_RE.search(issue_url or "")
+    issue_tag = f"#{m.group(1)}" if m else ""
+    if not issue_tag and task:
+        tm = re.search(r"#(\d+)\b", task)
+        if tm:
+            issue_tag = f"#{tm.group(1)}"
+    repo_real = os.path.realpath(repo) if repo else ""
+    entries: list[dict[str, Any]] = []
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            item = json.loads(raw)
+        except ValueError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        entry_issue = str(item.get("issue") or "").strip()
+        if issue_tag and entry_issue:
+            if entry_issue == issue_tag:
+                entries.append(item)
+            continue
+        # 无 issue 标签的本地任务回退按 repo + task 匹配
+        if task and task in str(item.get("task") or ""):
+            entry_cwd = str(item.get("cwd") or "")
+            if not repo_real or not entry_cwd or os.path.realpath(entry_cwd).startswith(repo_real):
+                entries.append(item)
+    return entries
+
+
+def _identity_tokens(rows: Sequence[dict[str, Any]]) -> dict[str, set[str]]:
+    panes: set[str] = set()
+    sessions: set[str] = set()
+    names: set[str] = set()
+    for r in rows:
+        pid = str(r.get("pane_id") or "").strip()
+        sid = str(r.get("session") or "").strip()
+        name = str(r.get("name") or "").strip()
+        if pid:
+            panes.add(pid)
+        if sid:
+            sessions.add(sid)
+        if name:
+            names.add(name)
+    return {"pane": panes, "session": sessions, "name": names}
+
+
+def _overlap_desc(left: dict[str, set[str]], right: dict[str, set[str]]) -> list[str]:
+    hits: list[str] = []
+    for label, key in (("同窗格", "pane"), ("同会话", "session"), ("同成员", "name")):
+        common = sorted(left[key] & right[key])
+        if common:
+            hits.append(f"{label} {', '.join(common)}")
+    return hits
+
+
+def _body_requires_real_browser_test(body: str, repo: Optional[str], task: Optional[str]) -> bool:
+    if _task_has_recorded_videos(repo, task):
+        return True
+    outer = _strip_folded_and_fences(body)
+    found = _find_acceptance_table(outer)
+    if found is None:
+        return False
+    _, _, ev_cols, rows = found
+    for row in rows:
+        ev = " ".join(row[col] for col in ev_cols)
+        if VIDEO_EMBED_RE.search(ev) or ANY_VIDEO_REF_RE.search(ev) or IMAGE_EMBED_RE.search(ev):
+            return True
+    return False
+
+
+def independence_problems(
+    body: str,
+    *,
+    kind: str,
+    repo: Optional[str],
+    task: Optional[str],
+    issue_url: str,
+) -> list[str]:
+    """整项交卷独立性硬校验：核验「代码作者 ≠ 代码评审者 ≠ 真机验收者」，防止 dev 自审或自测交卷。"""
+    problems: list[str] = []
+    outer = _strip_folded_and_fences(body)
+    claim = SELF_VERIFY_CLAIM_RE.search(outer)
+    if claim:
+        problems.append(
+            f"交卷正文出现违规自审/自测表述「{claim.group(0)}」："
+            "严格执行「代码作者 ≠ 代码评审者 ≠ 真机验收者」，禁止由 dev 自行评审或真机验收"
+        )
+
+    ledger = _load_task_role_ledger(repo, task, issue_url)
+    if not ledger:
+        return problems
+
+    dev_rows = [r for r in ledger if str(r.get("profile") or "") in DEV_ROLES]
+    review_rows = [r for r in ledger if str(r.get("profile") or "") in REVIEW_ROLES]
+    test_rows = [r for r in ledger if str(r.get("profile") or "") in TEST_ROLES]
+
+    dev_ids = _identity_tokens(dev_rows)
+    review_ids = _identity_tokens(review_rows)
+    test_ids = _identity_tokens(test_rows)
+
+    for label, left, right in (
+        ("代码作者（dev）与代码评审者（code-review/arch）", dev_ids, review_ids),
+        ("代码作者（dev）与真机验收者（test）", dev_ids, test_ids),
+        ("代码评审者（code-review/arch）与真机验收者（test）", review_ids, test_ids),
+    ):
+        overlap = _overlap_desc(left, right)
+        if overlap:
+            problems.append(
+                f"成员独立性冲突：{label} 重合（{'；'.join(overlap)}），"
+                "须使用不同成员与独立会话分别完成开发、评审和真机验收"
+            )
+
+    if not dev_rows:
+        return problems
+
+    state_text = ""
+    if repo and task:
+        sp = state_path(repo, task)
+        if sp.is_file():
+            state_text = sp.read_text(encoding="utf-8")
+    is_debug_or_tiny = bool(DEBUG_OR_TINY_MODE_RE.search(state_text) or DEBUG_OR_TINY_MODE_RE.search(outer))
+
+    if not is_debug_or_tiny and not review_rows:
+        dev_names = sorted({str(r.get("name") or r.get("profile")) for r in dev_rows})
+        problems.append(
+            f"常规交付缺少独立代码评审记录（本单仅有开发角色 {', '.join(dev_names)}）："
+            "请先通过 member-start.py 派独立 code-review（或 arch）审过冻结 diff 再交卷"
+        )
+
+    if _body_requires_real_browser_test(body, repo, task) and not test_rows:
+        dev_names = sorted({str(r.get("name") or r.get("profile")) for r in dev_rows})
+        problems.append(
+            f"本单包含真机/界面验收证据，但缺少独立测试角色记录（本单仅有开发角色 {', '.join(dev_names)}）："
+            "请通过 member-start.py 派独立 test（或 test-herdr）完成真机录屏验收，不得由 dev 自测代替"
+        )
+
+    return problems
+
+
 # ---------- 评论 ----------
 
 def format_kind_tag(kind: str) -> str:
@@ -1296,6 +1456,15 @@ def note(repo: str, task: str, issue_url: str, kind: str, body: str, wills: Sequ
         ac_problems = acceptance_table_problems(body, kind=kind, repo=repo, task=task)
         if ac_problems:
             return EXIT_HELD, "没发：交卷评论未满足「验收标准逐条对账表」硬门禁：\n- " + "\n- ".join(ac_problems)
+    needs_independence = kind == "delivery-done" or (
+        kind == "todo"
+        and not has_delivery_done
+        and bool(FINAL_ACCEPTANCE_CLAIM_RE.search(_strip_folded_and_fences(body)))
+    )
+    if needs_independence:
+        ind_problems = independence_problems(body, kind=kind, repo=repo, task=task, issue_url=issue_url)
+        if ind_problems:
+            return EXIT_HELD, "没发：交卷未通过「作者 ≠ 审者 ≠ 真机验者」独立性硬门禁：\n- " + "\n- ".join(ind_problems)
     guard_problems = note_content_guard_problems(body, kind=kind, jev=jev)
     if guard_problems:
         return EXIT_HELD, "没发：评论内容未通过出门安全与可读性把关：\n- " + "\n- ".join(guard_problems)

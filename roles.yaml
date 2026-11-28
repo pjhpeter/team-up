@@ -30,13 +30,12 @@
 default_profile: scheduler
 
 team:
-  # 调度者：默认不固定模型与思考档，按用户发起工作流时的当前会话模型运行；
-  # 仅叠加提前压缩与禁弹框配置（scheduler-omp.yml）。
+  # 调度者：默认使用 agy + gemini-4-neon-medium，由 ~/.gemini/config/hooks.json 的 hwf-scheduler
+  # 提供记录/监听/禁弹框/禁内置子代理硬守卫；本机个人覆盖可写进不入库的 roles.local.yaml。
   scheduler:
-    tool: omp
-    model: null
-    thinking: null
-    omp_config: ~/.hwf/scheduler-omp.yml
+    tool: agy
+    model: gemini-4-neon-medium
+    thinking: medium
 
   # 架构师：复杂度判定、独立方案评审、关键取舍、风险终审与最终验收；不编写方案。
   arch:
